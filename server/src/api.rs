@@ -681,6 +681,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     let locs = crate::site::locations_of(&store.db, &row);
                     let mut item = row.clone();
                     if let Value::Object(map) = &mut item {
+                        map.insert("kind".into(), crate::site::site_kind(&row).into());
                         map.insert("locations".into(), Value::Array(locs.clone()));
                         map.insert(
                             "locationSummary".into(),
@@ -750,20 +751,50 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         }
         "save" => {
             let body = body(req);
-            let domain = field(&body, "domain").trim().to_string();
+            let apply_now = bool_of(&body, "apply", false);
+            let mut row = body.clone();
+            let kind = crate::site::site_kind(&row);
+            let mut domain = field(&body, "domain").trim().to_string();
+            if kind == "forward" && crate::site::safe_domain(&domain).is_none() {
+                let listen = field(&body, "listen");
+                let port = if listen.trim().is_empty() {
+                    "8888"
+                } else {
+                    listen.trim()
+                };
+                domain = format!("forward-{port}");
+            }
             if crate::site::safe_domain(&domain).is_none() {
                 return fail("badDomain");
             }
-            let apply_now = bool_of(&body, "apply", false);
-            let mut row = body.clone();
             if let Value::Object(map) = &mut row {
                 map.insert("domain".into(), domain.clone().into());
+                map.insert("kind".into(), kind.clone().into());
                 map.remove("apply");
-                if map.get("ssl").is_none() {
-                    map.insert("ssl".into(), true.into());
-                }
-                if map.get("http2").is_none() {
-                    map.insert("http2".into(), true.into());
+                if kind == "forward" {
+                    map.insert("ssl".into(), false.into());
+                    map.insert("redirect".into(), false.into());
+                    map.insert("http2".into(), false.into());
+                    map.insert("mode".into(), "forward".into());
+                    let listen_empty = map
+                        .get("listen")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().is_empty())
+                        .unwrap_or(true);
+                    if listen_empty {
+                        map.insert("listen".into(), "8888".into());
+                    }
+                } else {
+                    if map.get("ssl").is_none() {
+                        map.insert("ssl".into(), true.into());
+                    }
+                    if map.get("http2").is_none() {
+                        map.insert("http2".into(), true.into());
+                    }
+                    map.insert(
+                        "mode".into(),
+                        if kind == "reverse" { "proxy" } else { "static" }.into(),
+                    );
                 }
                 if apply_now {
                     map.insert("fromDisk".into(), false.into());
@@ -772,13 +803,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut store = ctx.store.lock().unwrap();
             let locs = crate::site::locations_of(&store.db, &row);
             if let Value::Object(map) = &mut row {
-                map.insert("locations".into(), Value::Array(locs.clone()));
-                let mode = if locs.iter().any(|l| crate::site::loc_type(l) == "proxy") {
-                    "proxy"
-                } else {
-                    "static"
-                };
-                map.insert("mode".into(), mode.into());
+                map.insert("locations".into(), Value::Array(locs));
             }
             let id = store.db.upsert("site", row.clone());
             let saved = store.db.get("site", &id).unwrap_or(row);

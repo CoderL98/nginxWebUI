@@ -12,10 +12,10 @@
   import * as Alert from '$lib/components/ui/alert/index.js';
   import * as NativeSelect from '$lib/components/ui/native-select/index.js';
 
-  function blankLoc() {
+  function blankLoc(type = 'static') {
     return {
       path: '/',
-      type: 'static',
+      type,
       root: '',
       index: 'index.html',
       proxy: '',
@@ -26,7 +26,20 @@
     };
   }
 
+  function inferKind(s) {
+    if (s.kind === 'forward' || s.kind === 'reverse' || s.kind === 'static') return s.kind;
+    if (s.mode === 'forward') return 'forward';
+    if (s.mode === 'proxy') return 'reverse';
+    const locs = s.locations || [];
+    if (locs.some((l) => l.type === 'proxy' || l.type === '0' || l.type === 'upstream' || l.type === '2')) {
+      return 'reverse';
+    }
+    if (s.proxy) return 'reverse';
+    return 'static';
+  }
+
   let site = $state({
+    kind: 'static',
     domain: '',
     listen: '80',
     ssl: true,
@@ -36,7 +49,11 @@
     certName: '',
     descr: '',
     enable: true,
-    locations: [blankLoc()]
+    proxy: '',
+    websocket: false,
+    resolver: '223.5.5.5 8.8.8.8',
+    allow: '',
+    locations: [blankLoc('static')]
   });
   let preview = $state('');
   let matched = $state('');
@@ -77,18 +94,28 @@
         site = {
           ...site,
           ...s,
+          kind: inferKind(s),
           ssl: s.ssl !== false && s.ssl !== 0 && s.ssl !== 'false',
           http2: s.http2 !== false && s.http2 !== 0 && s.http2 !== 'false',
           redirect: s.redirect !== false && s.redirect !== 0 && s.redirect !== 'false',
           ipv6: !!Number(s.ipv6),
+          websocket: !!Number(s.websocket),
+          proxy: s.proxy || '',
+          resolver: s.resolver || '223.5.5.5 8.8.8.8',
+          allow: s.allow || '',
           locations: (s.locations && s.locations.length ? s.locations : []).map(normalizeLoc)
         };
         if (!site.locations.length) {
-          if (s.mode === 'proxy') {
-            site.locations = [normalizeLoc({ path: '/', type: 'proxy', proxy: s.proxy, websocket: s.websocket })];
-          } else {
+          if (site.kind === 'reverse') {
+            site.locations = [normalizeLoc({ path: '/', type: 'proxy', proxy: site.proxy, websocket: site.websocket })];
+          } else if (site.kind === 'static') {
             site.locations = [normalizeLoc({ path: '/', type: 'static', root: s.root })];
           }
+        }
+        const rootProxy = site.locations.find((l) => l.path === '/' && l.type === 'proxy');
+        if (rootProxy) {
+          site.proxy = site.proxy || rootProxy.proxy;
+          site.websocket = site.websocket || rootProxy.websocket;
         }
       }
       preview = data.preview || '';
@@ -99,6 +126,10 @@
       sslFiles = (c.obj || {}).sslFiles || [];
       const w = await api.www.list();
       webRoot = (w.obj || {}).webRoot || webRoot;
+      const kindParam = $page.url.searchParams.get('kind') || 'static';
+      if (kindParam === 'reverse' || kindParam === 'forward' || kindParam === 'static') {
+        setKind(kindParam);
+      }
     }
   });
 
@@ -114,7 +145,7 @@
   }
 
   async function showPreview() {
-    const r = await api.site.preview(site);
+    const r = await api.site.preview(payload(false));
     if (r.success) {
       preview = (r.obj || {}).conf || '';
       error = '';
@@ -123,13 +154,63 @@
     }
   }
 
+  function setKind(kind) {
+    site.kind = kind;
+    if (kind === 'static') {
+      site.ssl = true;
+      site.redirect = true;
+      site.http2 = true;
+      if (!site.listen || site.listen === '8888') site.listen = '80';
+      const extras = site.locations.filter((l) => l.path !== '/');
+      site.locations = [blankLoc('static'), ...extras];
+    } else if (kind === 'reverse') {
+      site.ssl = true;
+      site.redirect = true;
+      site.http2 = true;
+      if (!site.listen || site.listen === '8888') site.listen = '80';
+      if (!site.proxy) site.proxy = '8080';
+      const extras = site.locations.filter((l) => l.path !== '/');
+      site.locations = [
+        normalizeLoc({ path: '/', type: 'proxy', proxy: site.proxy, websocket: site.websocket }),
+        ...extras
+      ];
+    } else if (kind === 'forward') {
+      site.ssl = false;
+      site.redirect = false;
+      site.http2 = false;
+      if (!site.listen || site.listen === '80') site.listen = '8888';
+      if (!site.domain) site.domain = 'forward-' + site.listen;
+      if (!site.resolver) site.resolver = '223.5.5.5 8.8.8.8';
+    }
+  }
+
+  function payload(apply) {
+    const s = { ...site, apply };
+    if (s.kind === 'reverse') {
+      const rest = (s.locations || []).filter((l) => !(l.path === '/' && l.type === 'proxy'));
+      s.locations = [
+        { path: '/', type: 'proxy', proxy: s.proxy, websocket: s.websocket },
+        ...rest
+      ];
+      s.mode = 'proxy';
+    }
+    if (s.kind === 'forward') {
+      s.ssl = false;
+      s.redirect = false;
+      s.mode = 'forward';
+      s.locations = [];
+    }
+    if (s.kind === 'static') s.mode = 'static';
+    return s;
+  }
+
   async function save(apply) {
     busy = true;
     error = '';
     note = '';
     output = '';
     try {
-      const r = await api.site.save({ ...site, apply });
+      const r = await api.site.save(payload(apply));
       if (r.success) {
         note = $tt('saved');
         output = (r.obj || {}).output || '';
@@ -154,7 +235,8 @@
   }
 
   function addLoc() {
-    site.locations = [...site.locations, blankLoc()];
+    const type = site.kind === 'reverse' ? 'proxy' : 'static';
+    site.locations = [...site.locations, { ...blankLoc(type), path: '/extra' }];
   }
 
   function removeLoc(i) {
@@ -194,17 +276,52 @@
 
 <Card.Root class="mb-4">
   <Card.Content class="grid gap-4 pt-6">
+    <div class="grid gap-1.5">
+      <Label>{$tt('siteKind')}</Label>
+      <div class="grid gap-2 sm:grid-cols-3">
+        <button
+          type="button"
+          class="rounded-lg border p-3 text-left text-sm {site.kind === 'static' ? 'border-primary bg-primary/5' : 'border-border'}"
+          onclick={() => setKind('static')}
+        >
+          <div class="font-medium">{$tt('staticSite')}</div>
+          <p class="text-muted-foreground mt-1 text-xs">{$tt('staticHint')}</p>
+        </button>
+        <button
+          type="button"
+          class="rounded-lg border p-3 text-left text-sm {site.kind === 'reverse' ? 'border-primary bg-primary/5' : 'border-border'}"
+          onclick={() => setKind('reverse')}
+        >
+          <div class="font-medium">{$tt('reverseProxy')}</div>
+          <p class="text-muted-foreground mt-1 text-xs">{$tt('reverseHint')}</p>
+        </button>
+        <button
+          type="button"
+          class="rounded-lg border p-3 text-left text-sm {site.kind === 'forward' ? 'border-primary bg-primary/5' : 'border-border'}"
+          onclick={() => setKind('forward')}
+        >
+          <div class="font-medium">{$tt('forwardProxy')}</div>
+          <p class="text-muted-foreground mt-1 text-xs">{$tt('forwardHint')}</p>
+        </button>
+      </div>
+    </div>
+
     <div class="grid gap-3 sm:grid-cols-3">
       <div class="grid gap-1.5">
         <Label>{$tt('listenDomain')}</Label>
-        <Input bind:value={site.domain} placeholder="www.example.com" onblur={lookupCert} />
+        <Input
+          bind:value={site.domain}
+          placeholder={site.kind === 'forward' ? 'forward-8888' : 'www.example.com'}
+          onblur={lookupCert}
+        />
       </div>
-      {#if !site.ssl}
+      {#if site.kind === 'forward' || !site.ssl}
       <div class="grid gap-1.5">
-        <Label>{$tt('listen')}</Label>
-        <Input bind:value={site.listen} placeholder="80" />
+        <Label>{site.kind === 'forward' ? $tt('forwardListen') : $tt('listen')}</Label>
+        <Input bind:value={site.listen} placeholder={site.kind === 'forward' ? '8888' : '80'} />
       </div>
       {/if}
+      {#if site.kind !== 'forward' && site.ssl}
       <div class="grid gap-1.5">
         <Label>{$tt('selectCert')} {matched ? `(${$tt('matchedCert')}: ${matched})` : ''}</Label>
         <NativeSelect.Root bind:value={site.certName} class="w-full">
@@ -214,14 +331,45 @@
           {/each}
         </NativeSelect.Root>
       </div>
+      {/if}
     </div>
 
+    {#if site.kind === 'reverse'}
+      <div class="grid gap-3 sm:grid-cols-2">
+        <div class="grid gap-1.5">
+          <Label>{$tt('proxyTarget')}</Label>
+          <Input bind:value={site.proxy} placeholder="8080 或 http://127.0.0.1:8080" />
+        </div>
+        <label class="flex items-center gap-2 self-end text-sm"><Switch bind:checked={site.websocket} /> {$tt('websocket')}</label>
+      </div>
+    {/if}
+
+    {#if site.kind === 'forward'}
+      <div class="grid gap-3 sm:grid-cols-2">
+        <div class="grid gap-1.5">
+          <Label>{$tt('forwardResolver')}</Label>
+          <Input bind:value={site.resolver} placeholder="223.5.5.5 8.8.8.8" />
+        </div>
+        <div class="grid gap-1.5">
+          <Label>{$tt('forwardAllow')}</Label>
+          <Textarea bind:value={site.allow} rows={3} placeholder="10.0.0.0/8" />
+          <p class="text-muted-foreground text-xs">{$tt('forwardAllowHint')}</p>
+        </div>
+      </div>
+    {/if}
+
+    {#if site.kind !== 'forward'}
     <div class="flex flex-wrap gap-5">
       <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.ssl} /> {$tt('enableSsl')}</label>
       <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.http2} /> {$tt('http2')}</label>
       <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.redirect} /> {$tt('redirectHttps')}</label>
       <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.ipv6} /> {$tt('ipv6')}</label>
     </div>
+    {:else}
+    <div class="flex flex-wrap gap-5">
+      <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.ipv6} /> {$tt('ipv6')}</label>
+    </div>
+    {/if}
 
     <div class="grid gap-1.5">
       <Label>{$tt('remark')}</Label>
@@ -230,13 +378,15 @@
   </Card.Content>
 </Card.Root>
 
+{#if site.kind !== 'forward'}
 <Card.Root class="mb-4">
   <Card.Header class="flex-row items-center justify-between">
-    <Card.Title>{$tt('location')}</Card.Title>
+    <Card.Title>{site.kind === 'reverse' ? $tt('extraLocation') : $tt('location')}</Card.Title>
     <Button size="sm" variant="outline" onclick={addLoc}>{$tt('addLocation')}</Button>
   </Card.Header>
   <Card.Content class="space-y-4">
     {#each site.locations as loc, i}
+      {#if !(site.kind === 'reverse' && loc.path === '/' && loc.type === 'proxy')}
       <div class="rounded-lg border p-3">
         <div class="mb-3 grid gap-3 sm:grid-cols-3">
           <div class="grid gap-1.5">
@@ -311,15 +461,18 @@
           </div>
         {/if}
       </div>
+      {/if}
     {/each}
   </Card.Content>
-  <Card.Footer class="flex flex-wrap gap-2">
-    <Button variant="outline" onclick={showPreview} disabled={busy}>{$tt('preview')}</Button>
-    <Button variant="outline" onclick={() => save(false)} disabled={busy}>{$tt('save')}</Button>
-    <Button onclick={() => save(true)} disabled={busy}>{$tt('applySite')}</Button>
-    {#if site.id}<Button variant="destructive" onclick={drop}>{$tt('del')}</Button>{/if}
-  </Card.Footer>
 </Card.Root>
+{/if}
+
+<div class="mb-4 flex flex-wrap gap-2">
+  <Button variant="outline" onclick={showPreview} disabled={busy}>{$tt('preview')}</Button>
+  <Button variant="outline" onclick={() => save(false)} disabled={busy}>{$tt('save')}</Button>
+  <Button onclick={() => save(true)} disabled={busy}>{$tt('applySite')}</Button>
+  {#if site.id}<Button variant="destructive" onclick={drop}>{$tt('del')}</Button>{/if}
+</div>
 
 {#if output}<pre class="code mb-4">{output}</pre>{/if}
 {#if preview}

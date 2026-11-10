@@ -350,16 +350,46 @@ fn site_root(db: &Db, site: &Value, loc: Option<&Value>) -> String {
     web_root_base(db).join(domain).display().to_string()
 }
 
+pub fn site_kind(site: &Value) -> String {
+    let kind = str_of(site, "kind");
+    match kind.as_str() {
+        "forward" | "fwd" => return "forward".into(),
+        "reverse" | "proxy" => return "reverse".into(),
+        "static" | "html" | "substatic" => return "static".into(),
+        _ => {}
+    }
+    match str_of(site, "mode").as_str() {
+        "forward" => return "forward".into(),
+        "proxy" => return "reverse".into(),
+        "static" | "substatic" => return "static".into(),
+        _ => {}
+    }
+    if let Some(arr) = site.get("locations").and_then(|v| v.as_array()) {
+        if arr
+            .iter()
+            .any(|l| matches!(loc_type(l).as_str(), "proxy" | "upstream"))
+        {
+            return "reverse".into();
+        }
+    }
+    if !str_of(site, "proxy").is_empty() {
+        return "reverse".into();
+    }
+    "static".into()
+}
+
 /// Old-project location list, or a single location inferred from mode/root/proxy.
 pub fn locations_of(db: &Db, site: &Value) -> Vec<Value> {
+    if site_kind(site) == "forward" {
+        return Vec::new();
+    }
     if let Some(arr) = site.get("locations").and_then(|v| v.as_array()) {
         if !arr.is_empty() {
             return arr.clone();
         }
     }
-    let mode = str_of(site, "mode");
     let websocket = bool_of(site, "websocket", false);
-    if mode == "proxy" {
+    if site_kind(site) == "reverse" {
         vec![json!({
             "path": "/",
             "type": "proxy",
@@ -375,6 +405,7 @@ pub fn locations_of(db: &Db, site: &Value) -> Vec<Value> {
                 i
             }
         };
+        let mode = str_of(site, "mode");
         let cache = if mode == "substatic" { "sub" } else { "static" };
         vec![json!({
             "path": "/",
@@ -480,8 +511,82 @@ fn emit_static_location(out: &mut String, path: &str, root: &str, index: &str) {
     out.push_str("    }\n");
 }
 
+fn safe_resolver(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return "223.5.5.5 8.8.8.8".into();
+    }
+    let ok = t.split_whitespace().all(|part| {
+        part.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '='))
+    });
+    if ok {
+        t.to_string()
+    } else {
+        "223.5.5.5 8.8.8.8".into()
+    }
+}
+
+fn parse_allow(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c == '\n' || c == ';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '/' | '-'))
+        })
+        .collect()
+}
+
+fn render_forward(db: &Db, site: &Value) -> Result<String, String> {
+    let name = safe_domain(&str_of(site, "domain")).ok_or("badDomain")?;
+    let listen = {
+        let t = str_of(site, "listen");
+        if t.trim().is_empty() {
+            "8888".into()
+        } else {
+            safe_listen(&t)
+        }
+    };
+    let ipv6 = bool_of(site, "ipv6", false);
+    let resolver = safe_resolver(&str_of(site, "resolver"));
+    let allow = parse_allow(&str_of(site, "allow"));
+    let mut out = String::from("server {\n");
+    out.push_str(&format!("    listen {listen};\n"));
+    if ipv6 {
+        out.push_str(&format!("    listen [::]:{listen};\n"));
+    }
+    out.push_str("    server_name _;\n");
+    for cidr in &allow {
+        out.push_str(&format!("    allow {cidr};\n"));
+    }
+    if !allow.is_empty() {
+        out.push_str("    deny all;\n");
+    }
+    out.push_str(&format!("    resolver {resolver} ipv6=off;\n"));
+    out.push_str("    resolver_timeout 5s;\n\n");
+    out.push_str("    location / {\n");
+    out.push_str("        proxy_pass $scheme://$http_host$request_uri;\n");
+    out.push_str("        proxy_set_header Host $http_host;\n");
+    out.push_str("        proxy_set_header X-Real-IP $remote_addr;\n");
+    out.push_str("        proxy_buffers 256 8k;\n");
+    out.push_str("        proxy_max_temp_file_size 0;\n");
+    out.push_str("        proxy_connect_timeout 10s;\n");
+    out.push_str("        proxy_read_timeout 300s;\n");
+    out.push_str("        proxy_send_timeout 300s;\n");
+    out.push_str("    }\n");
+    let log_dir = nginx_path_text(&access_log_dir(db));
+    out.push_str(&format!(
+        "\n    access_log {log_dir}/{name}.access.log;\n    error_log  {log_dir}/{name}.error.log;\n}}\n"
+    ));
+    Ok(out)
+}
+
 /// Render one site file, same shape as the shell scripts.
 pub fn render(db: &Db, site: &Value) -> Result<String, String> {
+    if site_kind(site) == "forward" {
+        return render_forward(db, site);
+    }
     let domain = safe_domain(&str_of(site, "domain")).ok_or("badDomain")?;
     let ssl = bool_of(site, "ssl", true);
     let http2 = bool_of(site, "http2", true);
@@ -664,7 +769,7 @@ pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String
             return kept;
         }
     }
-    if bool_of(site, "ssl", true) {
+    if site_kind(site) != "forward" && bool_of(site, "ssl", true) {
         let mut cert_name = str_of(site, "certName");
         if cert_name.is_empty() {
             cert_name = find_cert(&store.db, &domain).unwrap_or_default();
@@ -882,6 +987,42 @@ mod tests {
         assert!(!text.contains("alias /var/www/mix/;"));
         assert!(text.contains("location /api {"));
         assert!(text.contains("proxy_pass http://127.0.0.1:8080;"));
+    }
+
+    #[test]
+    fn renders_reverse_from_kind_and_proxy_field() {
+        let db = Db::new();
+        let site = json!({
+            "kind": "reverse",
+            "domain": "api.example.com",
+            "ssl": true,
+            "certName": "api.example.com",
+            "proxy": "127.0.0.1:3000",
+            "websocket": true
+        });
+        let text = render(&db, &site).unwrap();
+        assert!(text.contains("proxy_pass http://127.0.0.1:3000;"));
+        assert!(text.contains("proxy_set_header Upgrade"));
+        assert_eq!(site_kind(&site), "reverse");
+    }
+
+    #[test]
+    fn renders_forward_proxy() {
+        let db = Db::new();
+        let site = json!({
+            "kind": "forward",
+            "domain": "forward-8888",
+            "listen": "8888",
+            "resolver": "223.5.5.5 8.8.8.8",
+            "allow": "10.0.0.0/8\n127.0.0.1"
+        });
+        let text = render(&db, &site).unwrap();
+        assert!(text.contains("listen 8888;"));
+        assert!(text.contains("server_name _;"));
+        assert!(text.contains("allow 10.0.0.0/8;"));
+        assert!(text.contains("deny all;"));
+        assert!(text.contains("proxy_pass $scheme://$http_host$request_uri;"));
+        assert!(!text.contains("ssl_certificate"));
     }
 
     #[test]

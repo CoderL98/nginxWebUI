@@ -13,33 +13,38 @@
   let busy = $state(false);
 
   function typeLabel(row) {
+    const kind = row.kind || row.mode;
+    if (kind === 'forward') return 'forwardProxy';
+    if (kind === 'reverse' || kind === 'proxy') return 'reverseProxy';
     const locs = row.locations || [];
     if (locs.length) {
       const t = locs[0].type;
-      if (t === 'proxy' || t === '0') return 'proxySite';
+      if (t === 'proxy' || t === '0') return 'reverseProxy';
       if (t === 'upstream' || t === '2') return 'upstream';
       if (t === 'redirect' || t === '4') return 'locRedirect';
       return 'staticSite';
     }
-    if (row.mode === 'proxy') return 'proxySite';
     if (row.mode === 'substatic') return 'subStatic';
     return 'staticSite';
   }
 
   function targetOf(row) {
+    if ((row.kind || row.mode) === 'forward') {
+      return ':' + (row.listen || '8888');
+    }
     const locs = row.locations || [];
     if (locs.length) {
       return locs
         .map((l) => {
           const p = l.path || '/';
-          if (l.type === 'proxy' || l.type === '0') return p + ' → ' + (l.proxy || '');
+          if (l.type === 'proxy' || l.type === '0') return p + ' → ' + (l.proxy || row.proxy || '');
           if (l.type === 'upstream' || l.type === '2') return p + ' → ' + (l.upstream || '');
           if (l.type === 'redirect' || l.type === '4') return p + ' → ' + (l.returnUrl || '');
           return p + ' → ' + (l.root || row.root || '');
         })
         .join('; ');
     }
-    return row.mode === 'proxy' ? row.proxy : row.root || '';
+    return row.mode === 'proxy' || row.kind === 'reverse' ? row.proxy : row.root || '';
   }
 
   async function load() {
@@ -78,8 +83,10 @@
   <Alert.Root variant="destructive" class="mb-3"><Alert.Title>{error}</Alert.Title></Alert.Root>
 {/if}
 
-<div class="mb-3 flex justify-end">
-  <Button href="/server/edit">{$tt('add')}</Button>
+<div class="mb-3 flex flex-wrap justify-end gap-2">
+  <Button variant="outline" href="/server/edit?kind=static">{$tt('addStatic')}</Button>
+  <Button variant="outline" href="/server/edit?kind=reverse">{$tt('addReverse')}</Button>
+  <Button variant="outline" href="/server/edit?kind=forward">{$tt('addForward')}</Button>
 </div>
 
 <Card.Root class="overflow-hidden py-0">
