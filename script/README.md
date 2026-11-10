@@ -29,7 +29,7 @@ script/linux/deploy-web.sh      # 只构建前端
 script/linux/deploy-server.sh   # 只构建并重启后端
 script/linux/start.sh           # 启动后端
 script/linux/restart.sh         # 重启后端
-script/linux/stop.sh            # 停止后端（以及开发用 Vite）
+script/linux/stop.sh            # 停止后端（以及开发用 Vite）；会清 pid 文件对不上的残留进程
 ```
 
 **不要用 `sudo script/linux/start-server.sh` / `deploy.sh`。** 整个管理进程以 root 跑时，界面被打穿就是整机 root，pid/日志/数据目录也会变成 root 属主。

@@ -174,13 +174,82 @@ sync_web_build() {
     echo "前端已部署: $dst"
 }
 
+pid_alive() {
+    local pid="${1-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [[ -d "/proc/$pid" ]]
+}
+
 is_running() {
     local pid_file="$1"
     [[ -f "$pid_file" ]] || return 1
     local pid
     pid="$(cat "$pid_file" 2>/dev/null || true)"
-    [[ -n "$pid" ]] || return 1
-    kill -0 "$pid" 2>/dev/null
+    pid_alive "$pid"
+}
+
+port_busy() {
+    local port="${1:-$PORT}"
+    [[ -n "$port" ]] || return 1
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnH "sport = :$port" 2>/dev/null | grep -q .
+        return
+    fi
+    if command -v fuser >/dev/null 2>&1; then
+        fuser "${port}/tcp" >/dev/null 2>&1
+        return
+    fi
+    return 1
+}
+
+our_bin_pids() {
+    local want p pid exe
+    [[ -e "$BIN" ]] || return 0
+    want="$(readlink -f "$BIN" 2>/dev/null || printf '%s' "$BIN")"
+    [[ -n "$want" ]] || return 0
+    for p in /proc/[0-9]*; do
+        pid="${p##*/}"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        exe="$(readlink "$p/exe" 2>/dev/null || true)"
+        [[ -n "$exe" ]] || continue
+        if [[ "$exe" == "$want" || "$exe" == "$want (deleted)" ]]; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
+port_hint() {
+    echo "  sudo ss -tlnp | grep \":$PORT\"" >&2
+    echo "  sudo fuser -k ${PORT}/tcp" >&2
+}
+
+stop_one_pid() {
+    local pid="$1"
+    local name="$2"
+    pid_alive "$pid" || return 0
+    echo "停止 $name pid=$pid"
+    if ! kill "$pid" 2>/dev/null; then
+        echo "当前用户杀不了 pid=$pid（多半是以前 sudo 启动留下的）。" >&2
+        echo "请执行: sudo kill $pid" >&2
+        port_hint
+        return 1
+    fi
+    local _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        pid_alive "$pid" || break
+        sleep 0.3
+    done
+    if pid_alive "$pid"; then
+        echo "进程未退出，发送 SIGKILL"
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 0.2
+    fi
+    if pid_alive "$pid"; then
+        echo "pid=$pid 仍在运行，请: sudo kill -9 $pid" >&2
+        port_hint
+        return 1
+    fi
+    return 0
 }
 
 stop_pidfile() {
@@ -193,15 +262,40 @@ stop_pidfile() {
     fi
     local pid
     pid="$(cat "$pid_file")"
-    echo "停止 $name pid=$pid"
-    kill "$pid" 2>/dev/null || true
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.3
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "进程未退出，发送 SIGKILL"
-        kill -9 "$pid" 2>/dev/null || true
+    if stop_one_pid "$pid" "$name"; then
+        rm -f "$pid_file"
+        return 0
     fi
-    rm -f "$pid_file"
+    return 1
+}
+
+stop_backend() {
+    local pid found=0 fail=0
+    if [[ -f "$PID_FILE" ]]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if pid_alive "$pid"; then
+            found=1
+            stop_one_pid "$pid" "后端" || fail=1
+        fi
+        if [[ $fail -eq 0 ]]; then
+            rm -f "$PID_FILE"
+        fi
+    fi
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        found=1
+        stop_one_pid "$pid" "后端(残留)" || fail=1
+    done < <(our_bin_pids || true)
+    if [[ $fail -ne 0 ]]; then
+        return 1
+    fi
+    if port_busy; then
+        echo "端口 $PORT 仍被占用。pid 文件对不上，且当前用户看不到属主（多半是 root 残留）。" >&2
+        port_hint
+        return 1
+    fi
+    if [[ $found -eq 0 ]]; then
+        echo "后端 未在运行"
+    fi
+    return 0
 }

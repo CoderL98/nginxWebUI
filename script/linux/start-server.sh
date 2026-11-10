@@ -9,6 +9,20 @@ if is_running "$PID_FILE"; then
     echo "后端已在运行 pid=$(cat "$PID_FILE")  http://127.0.0.1:$PORT"
     exit 0
 fi
+rm -f "$PID_FILE"
+
+orphans="$(our_bin_pids || true)"
+if [[ -n "$orphans" ]] || port_busy; then
+    echo "发现残留后端或端口 $PORT 仍被占用，先停止"
+    stop_backend
+fi
+if port_busy; then
+    echo "无法绑定 0.0.0.0:$PORT，地址已被占用。" >&2
+    echo "stop.sh 只靠 pid 文件时会漏掉这类进程。" >&2
+    port_hint
+    exit 1
+fi
+
 if [[ ! -x "$BIN" ]]; then
     echo "找不到可执行文件: $BIN" >&2
     echo "请先运行: $(dirname "$0")/deploy-server.sh" >&2
