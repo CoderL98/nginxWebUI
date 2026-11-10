@@ -61,7 +61,7 @@ pub fn ensure_main_includes_sites(db: &Db) -> Result<(), String> {
     if !conf_path.exists() {
         return Ok(());
     }
-    let text = fs::read_to_string(&conf_path).unwrap_or_default();
+    let text = crate::privfs::read_to_string(&conf_path).unwrap_or_default();
     if text.contains("sites-enabled") {
         return Ok(());
     }
@@ -803,7 +803,7 @@ pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String
     crate::privfs::mkdir_all(&enabled)?;
 
     let (avail_path, enabled_path, in_place) = site_write_paths(&store.db, site, &domain);
-    let previous = fs::read_to_string(&avail_path).ok();
+    let previous = crate::privfs::read_to_string(&avail_path).ok();
     let had_link = enabled_path.exists();
 
     let locations = locations_of(&store.db, site);
@@ -852,7 +852,7 @@ pub fn existing_conf_text(_db: &Db, site: &Value) -> Option<String> {
     if conf_path.is_empty() {
         return None;
     }
-    fs::read_to_string(conf_path).ok().filter(|s| !s.trim().is_empty())
+    crate::privfs::read_to_string(Path::new(&conf_path)).ok().filter(|s| !s.trim().is_empty())
 }
 
 fn keep_existing_site(db: &Db, site: &Value) -> Option<Result<(String, String), String>> {

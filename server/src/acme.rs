@@ -252,14 +252,6 @@ pub fn issue_names(domain: &str) -> (String, Vec<String>) {
     }
 }
 
-fn reload_cmd(db: &Db) -> String {
-    let cmd = db.setting("reloadCmd");
-    if !cmd.trim().is_empty() {
-        return cmd;
-    }
-    "sudo systemctl reload nginx 2>/dev/null || true".into()
-}
-
 fn dns_env(db: &Db, plugin: &str, row: &Value) -> Vec<(String, String)> {
     let mut env = parse_env(&str_of(row, "env"));
     let push = |env: &mut Vec<(String, String)>, key: &str| {
@@ -457,16 +449,22 @@ pub fn apply(db: &Db, row: &Value, force: bool) -> (bool, String, Value) {
         return (false, log, row.clone());
     }
 
+    let stage = acme_home(db).join(".nginxwebui-stage").join(&cert_name);
+    if let Err(err) = std::fs::create_dir_all(&stage) {
+        return (false, format!("cannot create {}: {}", stage.display(), err), row.clone());
+    }
+    let stage_cer = stage.join("fullchain.cer");
+    let stage_key = stage.join("cert.key");
     let mut install = vec![
         "--install-cert".into(),
         "-d".into(),
         cert_name.clone(),
         "--fullchain-file".into(),
-        cer.display().to_string(),
+        stage_cer.display().to_string(),
         "--key-file".into(),
-        key.display().to_string(),
+        stage_key.display().to_string(),
         "--reloadcmd".into(),
-        reload_cmd(db),
+        "true".into(),
         "--home".into(),
         acme_home(db).display().to_string(),
     ];
@@ -482,8 +480,26 @@ pub fn apply(db: &Db, row: &Value, force: bool) -> (bool, String, Value) {
         return (false, log, row.clone());
     }
 
-    chmod(&cer, 0o644);
-    chmod(&key, 0o600);
+    let cer_bytes = match std::fs::read(&stage_cer) {
+        Ok(b) => b,
+        Err(err) => return (false, format!("read {}: {}", stage_cer.display(), err), row.clone()),
+    };
+    let key_bytes = match std::fs::read(&stage_key) {
+        Ok(b) => b,
+        Err(err) => return (false, format!("read {}: {}", stage_key.display(), err), row.clone()),
+    };
+    if let Err(err) = crate::privfs::write(&cer, &cer_bytes) {
+        return (false, format!("install cert: {err}"), row.clone());
+    }
+    if let Err(err) = crate::privfs::write(&key, &key_bytes) {
+        return (false, format!("install key: {err}"), row.clone());
+    }
+    let _ = crate::privfs::chmod(&cer, "644");
+    let _ = crate::privfs::chmod(&key, "600");
+    let (rok, rout) = crate::nginx::reload(db);
+    let reload_line = format!("\nreload ok={} {}\n", rok, rout.trim());
+    job_append(&reload_line);
+    log.push_str(&reload_line);
     let info = format!("\n{}", site::openssl_info(&cer));
     job_append(&info);
     log.push_str(&info);
@@ -500,19 +516,6 @@ pub fn apply(db: &Db, row: &Value, force: bool) -> (bool, String, Value) {
         map.insert("lastLog".into(), log.clone().into());
     }
     (true, log, updated)
-}
-
-fn chmod(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            let mut perms = meta.permissions();
-            perms.set_mode(mode);
-            let _ = std::fs::set_permissions(path, perms);
-        }
-    }
-    let _ = (path, mode);
 }
 
 pub fn cron(db: &Db) -> (bool, String) {

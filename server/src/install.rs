@@ -113,8 +113,11 @@ pub fn install_nginx(db: &mut Db) -> Result<String, String> {
     db.set_setting("reloadCmd", "sudo -n systemctl reload nginx");
     layout(db)?;
 
-    let _ = run_shell("systemctl enable nginx");
-    let (start_ok, start_out) = run_shell("systemctl start nginx");
+    let _ = crate::privfs::run_helper("systemctl", &["enable"]);
+    let (start_ok, start_out) = match crate::privfs::run_helper("systemctl", &["start"]) {
+        Ok(text) => (true, text),
+        Err(err) => (false, err),
+    };
     log.push('\n');
     log.push_str(&start_out);
     if !start_ok {
@@ -266,11 +269,11 @@ fn maybe_sudo_env(program: &str, args: &[&str], env: &[(&str, &str)]) -> (bool, 
     }
     if which("sudo").is_some() {
         if env.is_empty() {
-            let mut full = vec![program];
+            let mut full = vec!["-n", program];
             full.extend_from_slice(args);
             return run_env_cmd("sudo", &full, &[]);
         }
-        let mut full: Vec<String> = vec!["env".into()];
+        let mut full: Vec<String> = vec!["-n".into(), "env".into()];
         for (k, v) in env {
             full.push(format!("{k}={v}"));
         }
@@ -332,21 +335,6 @@ fn run_user_shell(script: &str) -> (bool, String) {
     #[cfg(unix)]
     {
         run_env_cmd("sh", &["-c", script], &[])
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = script;
-        (false, "installLinuxOnly".into())
-    }
-}
-
-fn run_shell(script: &str) -> (bool, String) {
-    #[cfg(unix)]
-    {
-        if running_as_root() || which("sudo").is_none() {
-            return run_env_cmd("sh", &["-c", script], &[]);
-        }
-        return run_env_cmd("sudo", &["sh", "-c", script], &[]);
     }
     #[cfg(not(unix))]
     {

@@ -140,19 +140,7 @@ pub fn unzip_bytes(bytes: &[u8], dest: &Path) -> Result<Vec<String>, String> {
 }
 
 pub fn clean_dir(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let p = entry.path();
-        if p.is_dir() {
-            fs::remove_dir_all(&p).map_err(|e| e.to_string())?;
-        } else {
-            fs::remove_file(&p).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
+    crate::privfs::empty_dir(path)
 }
 
 pub fn dir_info(path: &Path) -> Value {

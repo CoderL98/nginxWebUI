@@ -42,15 +42,26 @@ SYSTEMCTL="$(command -v systemctl || true)"
 NGINX_BIN="$(command -v nginx || true)"
 if [[ -n "$SYSTEMCTL" ]]; then
     add_cmd "$SYSTEMCTL reload nginx"
+    add_cmd "$SYSTEMCTL start nginx"
+    add_cmd "$SYSTEMCTL stop nginx"
+    add_cmd "$SYSTEMCTL enable nginx"
 fi
 if [[ -n "$NGINX_BIN" ]]; then
     add_cmd "$NGINX_BIN -t"
     add_cmd "$NGINX_BIN -s reload"
+    add_cmd "$NGINX_BIN -s stop"
+    add_cmd "$NGINX_BIN -s quit"
 fi
 # Debian /usr/bin vs /bin
 [[ -x /usr/bin/systemctl ]] && add_cmd "/usr/bin/systemctl reload nginx"
+[[ -x /usr/bin/systemctl ]] && add_cmd "/usr/bin/systemctl start nginx"
+[[ -x /usr/bin/systemctl ]] && add_cmd "/usr/bin/systemctl stop nginx"
+[[ -x /usr/bin/systemctl ]] && add_cmd "/usr/bin/systemctl enable nginx"
 [[ -x /bin/systemctl ]] && add_cmd "/bin/systemctl reload nginx"
-[[ -x /usr/sbin/nginx ]] && add_cmd "/usr/sbin/nginx -t" && add_cmd "/usr/sbin/nginx -s reload"
+[[ -x /usr/sbin/nginx ]] && add_cmd "/usr/sbin/nginx -t"
+[[ -x /usr/sbin/nginx ]] && add_cmd "/usr/sbin/nginx -s reload"
+[[ -x /usr/sbin/nginx ]] && add_cmd "/usr/sbin/nginx -s stop"
+[[ -x /usr/sbin/nginx ]] && add_cmd "/usr/sbin/nginx -s quit"
 
 TMP="$(mktemp)"
 {

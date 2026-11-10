@@ -38,6 +38,7 @@ in_tree() {
         /etc/nginx|/etc/nginx/*) return 0 ;;
         /var/www|/var/www/*) return 0 ;;
         /var/log/nginx|/var/log/nginx/*) return 0 ;;
+        /run/nginx.pid|/var/run/nginx.pid) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -64,6 +65,16 @@ check_self() {
     mode="$(stat -c '%a' "$EXPECTED")"
     [[ "$uid" == "0" ]] || die "helper must be root-owned"
     [[ $((8#$mode & 022)) -eq 0 ]] || die "helper must not be group/world writable (mode $mode)"
+}
+
+nginx_bin() {
+    if [[ -x /usr/sbin/nginx ]]; then
+        printf '%s' /usr/sbin/nginx
+    elif command -v nginx >/dev/null 2>&1; then
+        command -v nginx
+    else
+        die "nginx not found"
+    fi
 }
 
 check_self
@@ -105,8 +116,77 @@ case "$cmd" in
         fi
         chmod 755 "$p"
         ;;
+    nginx-t)
+        bin="$(nginx_bin)"
+        if [[ -n "${1-}" ]]; then
+            conf="$(require_path follow "$1")"
+            "$bin" -t -c "$conf"
+        else
+            "$bin" -t
+        fi
+        ;;
+    nginx-s)
+        sig="${1-}"
+        case "$sig" in
+            reload|stop|quit) ;;
+            *) die "bad nginx signal: ${sig:-<empty>}" ;;
+        esac
+        "$(nginx_bin)" -s "$sig"
+        ;;
+    nginx-start)
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            systemctl start nginx
+        else
+            "$(nginx_bin)"
+        fi
+        ;;
+    systemctl)
+        act="${1-}"
+        case "$act" in
+            start|stop|reload|enable|status) ;;
+            *) die "bad systemctl action: ${act:-<empty>}" ;;
+        esac
+        systemctl "$act" nginx
+        ;;
+    read)
+        p="$(require_path follow "${1-}")"
+        [[ -f "$p" ]] || die "not a file: $p"
+        cat -- "$p"
+        ;;
+    tail)
+        p="$(require_path follow "${1-}")"
+        n="${2-65536}"
+        [[ "$n" =~ ^[0-9]+$ ]] || die "bad tail size"
+        if (( n < 1 )); then n=1; fi
+        if (( n > 1048576 )); then n=1048576; fi
+        [[ -f "$p" ]] || die "not a file: $p"
+        tail -c "$n" -- "$p"
+        ;;
+    ls)
+        p="$(require_path follow "${1-}")"
+        [[ -d "$p" ]] || die "not a directory: $p"
+        ls -1A -- "$p"
+        ;;
+    empty-dir)
+        p="$(require_path follow "${1-}")"
+        case "$p" in
+            /var/www/*) ;;
+            *) die "empty-dir only under /var/www/<site>" ;;
+        esac
+        [[ "$p" != /var/www && "$p" != /var/www/ ]] || die "refusing to empty /var/www"
+        find "$p" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        ;;
+    chmod)
+        p="$(require_path follow "${1-}")"
+        mode="${2-}"
+        case "$mode" in
+            644|640|600|755|750) ;;
+            *) die "bad mode: ${mode:-<empty>}" ;;
+        esac
+        chmod "$mode" "$p"
+        ;;
     *)
-        echo "usage: nginxwebui-priv mkdir|write|rm|ln|cp|chown-www ..." >&2
+        echo "usage: nginxwebui-priv mkdir|write|rm|ln|cp|chown-www|nginx-t|nginx-s|nginx-start|systemctl|read|tail|ls|empty-dir|chmod ..." >&2
         exit 1
         ;;
 esac

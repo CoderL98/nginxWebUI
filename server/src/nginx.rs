@@ -5,7 +5,6 @@
 use crate::conf;
 use crate::store::{now_ms, str_of, Db, Store};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -111,7 +110,7 @@ pub fn write_conf(store: &mut Store) -> Result<Vec<String>, String> {
     let mut written: Vec<String> = Vec::new();
 
     // backup the current file before overwriting it
-    let previous = fs::read_to_string(&main_path).unwrap_or_default();
+    let previous = crate::privfs::read_to_string(&main_path).unwrap_or_default();
     if !previous.trim().is_empty() && !previous.contains(conf::GENERATED_MARK) {
         return Err(
             "refuseOverwriteNginxConf".into(),
@@ -159,7 +158,7 @@ pub fn write_conf(store: &mut Store) -> Result<Vec<String>, String> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if is_managed(&name) && !wanted.contains(&name) {
-                let _ = fs::remove_file(entry.path());
+                let _ = crate::privfs::remove_file(&entry.path());
             }
         }
     }
@@ -200,30 +199,133 @@ fn nginx_args(db: &Db, extra: &[&str]) -> Vec<String> {
     args
 }
 
+fn looks_like_priv_fail(out: &str) -> bool {
+    let t = out.to_ascii_lowercase();
+    t.contains("permission denied")
+        || t.contains("operation not permitted")
+        || t.contains("a password is required")
+        || t.contains("a terminal is required")
+        || t.contains("not allowed to execute")
+        || t.contains("sudo -n failed")
+        || t.contains("no root-owned nginxwebui-priv")
+}
+
+fn setup_sudo_hint() -> &'static str {
+    "请运行 sudo script/linux/setup-sudo.sh 后重启本服务。nginx -t / reload 需要免密 sudo。"
+}
+
+fn resolve_nginx_abs(db: &Db) -> String {
+    let exe = nginx_exe(db);
+    if Path::new(&exe).is_file() {
+        return exe;
+    }
+    if Path::new("/usr/sbin/nginx").is_file() {
+        return "/usr/sbin/nginx".into();
+    }
+    exe
+}
+
+fn merge_out(first: &str, second: &str) -> String {
+    let a = first.trim();
+    let b = second.trim();
+    if a.is_empty() {
+        b.to_string()
+    } else if b.is_empty() {
+        a.to_string()
+    } else {
+        format!("{a}\n{b}")
+    }
+}
+
+enum NginxPriv {
+    Test,
+    Reload,
+    Stop,
+    Quit,
+    Start,
+}
+
+fn priv_nginx(db: &Db, op: NginxPriv) -> (bool, String) {
+    if !cfg!(unix) {
+        return (false, "sudo nginx is unix-only".into());
+    }
+    let conf = nginx_path(db);
+    let conf_s = conf.display().to_string();
+    let helper = match op {
+        NginxPriv::Test if conf_s.starts_with("/etc/nginx/") && conf_s != "/etc/nginx/nginx.conf" => {
+            crate::privfs::run_helper("nginx-t", &[&conf_s])
+        }
+        NginxPriv::Test => crate::privfs::run_helper("nginx-t", &[]),
+        NginxPriv::Reload => crate::privfs::run_helper("nginx-s", &["reload"])
+            .or_else(|_| crate::privfs::run_helper("systemctl", &["reload"])),
+        NginxPriv::Stop => crate::privfs::run_helper("nginx-s", &["stop"])
+            .or_else(|_| crate::privfs::run_helper("systemctl", &["stop"])),
+        NginxPriv::Quit => crate::privfs::run_helper("nginx-s", &["quit"]),
+        NginxPriv::Start => crate::privfs::run_helper("nginx-start", &[])
+            .or_else(|_| crate::privfs::run_helper("systemctl", &["start"])),
+    };
+    match helper {
+        Ok(text) => (true, text),
+        Err(err) => {
+            let exe = resolve_nginx_abs(db);
+            let direct = match op {
+                NginxPriv::Test => crate::privfs::sudo_n(&[&exe, "-t"]),
+                NginxPriv::Reload => crate::privfs::sudo_n(&[&exe, "-s", "reload"]),
+                NginxPriv::Stop => crate::privfs::sudo_n(&[&exe, "-s", "stop"]),
+                NginxPriv::Quit => crate::privfs::sudo_n(&[&exe, "-s", "quit"]),
+                NginxPriv::Start => crate::privfs::sudo_n(&[&exe]),
+            };
+            match direct {
+                Ok(text) => (true, merge_out(&err, &text)),
+                Err(err2) => (
+                    false,
+                    merge_out(&merge_out(&err, &err2), setup_sudo_hint()),
+                ),
+            }
+        }
+    }
+}
+
+fn run_or_priv(db: &Db, extra: &[&str], op: NginxPriv) -> (bool, String) {
+    let (ok, out) = run(&nginx_exe(db), &nginx_args(db, extra), &nginx_dir(db));
+    if ok {
+        return (true, out);
+    }
+    if cfg!(unix) && looks_like_priv_fail(&out) {
+        let (ok2, out2) = priv_nginx(db, op);
+        return (ok2, merge_out(&out, &out2));
+    }
+    (ok, out)
+}
+
 pub fn test_conf(db: &Db) -> (bool, String) {
-    run(&nginx_exe(db), &nginx_args(db, &["-t"]), &nginx_dir(db))
+    run_or_priv(db, &["-t"], NginxPriv::Test)
 }
 
 pub fn reload(db: &Db) -> (bool, String) {
     let cmd = db.setting("reloadCmd");
     if !cmd.trim().is_empty() {
-        return run_command(db, cmd.trim());
+        let (ok, out) = run_command(db, cmd.trim());
+        if ok {
+            return (true, out);
+        }
+        if cfg!(unix) && looks_like_priv_fail(&out) {
+            let (ok2, out2) = priv_nginx(db, NginxPriv::Reload);
+            return (ok2, merge_out(&out, &out2));
+        }
+        return (ok, out);
     }
-    run(
-        &nginx_exe(db),
-        &nginx_args(db, &["-s", "reload"]),
-        &nginx_dir(db),
-    )
+    run_or_priv(db, &["-s", "reload"], NginxPriv::Reload)
 }
 
 pub fn signal(db: &Db, action: &str) -> (bool, String) {
     match action {
-        "start" => run(&nginx_exe(db), &nginx_args(db, &[]), &nginx_dir(db)),
-        "stop" => run(&nginx_exe(db), &nginx_args(db, &["-s", "stop"]), &nginx_dir(db)),
-        "quit" => run(&nginx_exe(db), &nginx_args(db, &["-s", "quit"]), &nginx_dir(db)),
+        "start" => run_or_priv(db, &[], NginxPriv::Start),
+        "stop" => run_or_priv(db, &["-s", "stop"], NginxPriv::Stop),
+        "quit" => run_or_priv(db, &["-s", "quit"], NginxPriv::Quit),
         "restart" => {
-            let (ok, out) = run(&nginx_exe(db), &nginx_args(db, &["-s", "stop"]), &nginx_dir(db));
-            let (ok2, out2) = run(&nginx_exe(db), &nginx_args(db, &[]), &nginx_dir(db));
+            let (ok, out) = run_or_priv(db, &["-s", "stop"], NginxPriv::Stop);
+            let (ok2, out2) = run_or_priv(db, &[], NginxPriv::Start);
             (ok || ok2, format!("{}\n{}", out, out2))
         }
         _ => (false, "unknown action".to_string()),
@@ -240,18 +342,23 @@ pub fn running(db: &Db) -> bool {
         PathBuf::from("/usr/local/nginx/logs/nginx.pid"),
     ];
     for pid_file in &candidates {
-        if let Ok(text) = fs::read_to_string(pid_file) {
-            let pid = text.trim();
-            if pid.is_empty() {
-                continue;
+        let text = match fs::read_to_string(pid_file) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                crate::privfs::read_to_string(pid_file).unwrap_or_default()
             }
-            if Path::new("/proc").is_dir() {
-                if Path::new(&format!("/proc/{}", pid)).exists() {
-                    return true;
-                }
-            } else {
+            Err(_) => continue,
+        };
+        let pid = text.trim();
+        if pid.is_empty() {
+            continue;
+        }
+        if Path::new("/proc").is_dir() {
+            if Path::new(&format!("/proc/{}", pid)).exists() {
                 return true;
             }
+        } else {
+            return true;
         }
     }
     proc_named_nginx()
@@ -329,21 +436,57 @@ pub fn run_command(db: &Db, command: &str) -> (bool, String) {
             *arg = arg.replace("nginx.conf", &conf_path.display().to_string());
         }
     }
-    run(&program, &full, &nginx_dir(db))
+    let (ok, out) = run(&program, &full, &nginx_dir(db));
+    if ok {
+        return (true, out);
+    }
+    if cfg!(unix) && looks_like_priv_fail(&out) {
+        if let Some(op) = infer_nginx_priv(&program, &full) {
+            let (ok2, out2) = priv_nginx(db, op);
+            return (ok2, merge_out(&out, &out2));
+        }
+    }
+    (ok, out)
+}
+
+fn infer_nginx_priv(program: &str, args: &[String]) -> Option<NginxPriv> {
+    let mut tokens: Vec<&str> = Vec::new();
+    if program != "sudo" && program != "-n" {
+        tokens.push(program);
+    }
+    for a in args {
+        if a != "sudo" && a != "-n" {
+            tokens.push(a);
+        }
+    }
+    let has = |n: &str| tokens.iter().any(|t| *t == n);
+    if has("-t") {
+        return Some(NginxPriv::Test);
+    }
+    if has("reload") {
+        return Some(NginxPriv::Reload);
+    }
+    if has("quit") {
+        return Some(NginxPriv::Quit);
+    }
+    if has("stop") {
+        return Some(NginxPriv::Stop);
+    }
+    if has("start") {
+        return Some(NginxPriv::Start);
+    }
+    if has("-s") {
+        return Some(NginxPriv::Reload);
+    }
+    None
 }
 
 /// Tail of a log file: read only the last part, so a huge log cannot eat memory.
 pub fn tail(path: &Path, max_bytes: u64, max_lines: usize) -> String {
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
+    let text = match crate::privfs::tail(path, max_bytes) {
+        Ok(text) => text,
         Err(err) => return format!("cannot read {}: {}", path.display(), err),
     };
-    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let start = size.saturating_sub(max_bytes);
-    let _ = file.seek(SeekFrom::Start(start));
-    let mut buffer = Vec::new();
-    let _ = file.read_to_end(&mut buffer);
-    let text = String::from_utf8_lossy(&buffer);
     let lines: Vec<&str> = text.lines().collect();
     let from = lines.len().saturating_sub(max_lines);
     lines[from..].join("\n")
@@ -501,5 +644,34 @@ mod tests {
         assert!(command_is_safe("sudo systemctl reload nginx"));
         assert!(!command_is_safe("sudo systemctl reload nginx || true"));
         assert!(!command_is_safe("rm -rf / | nginx"));
+    }
+
+    #[test]
+    fn nginx_t_permission_denied_is_priv_fail() {
+        let out = r#"nginx: [alert] could not open error log file: open() "/var/log/nginx/error.log" failed (13: Permission denied)
+nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
+nginx: [emerg] open() "/run/nginx.pid" failed (13: Permission denied)
+nginx: configuration file /etc/nginx/nginx.conf test failed"#;
+        assert!(looks_like_priv_fail(out));
+        assert!(!looks_like_priv_fail(
+            "nginx: [emerg] unexpected end of file, expecting \";\" or \"}\""
+        ));
+    }
+
+    #[test]
+    fn infers_nginx_priv_from_argv() {
+        assert!(matches!(
+            infer_nginx_priv("nginx", &["-t".into()]),
+            Some(NginxPriv::Test)
+        ));
+        assert!(matches!(
+            infer_nginx_priv("sudo", &["-n".into(), "systemctl".into(), "reload".into(), "nginx".into()]),
+            Some(NginxPriv::Reload)
+        ));
+        assert!(matches!(
+            infer_nginx_priv("systemctl", &["start".into(), "nginx".into()]),
+            Some(NginxPriv::Start)
+        ));
+        assert!(infer_nginx_priv("systemctl", &["restart".into(), "nginx".into()]).is_none());
     }
 }

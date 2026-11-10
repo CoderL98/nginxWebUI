@@ -3,7 +3,7 @@
 //! `/usr/local/sbin/nginxwebui-priv`. No unrestricted `sudo mkdir`/`install`.
 
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -84,6 +84,14 @@ fn sudo_helper(verb: &str, args: &[&str], stdin_data: Option<&[u8]>) -> Result<S
     let mut full: Vec<&str> = vec![&helper_s, verb];
     full.extend_from_slice(args);
     sudo_output(&full, stdin_data)
+}
+
+pub fn run_helper(verb: &str, args: &[&str]) -> Result<String, String> {
+    sudo_helper(verb, args, None)
+}
+
+pub fn sudo_n(args: &[&str]) -> Result<String, String> {
+    sudo_output(args, None)
 }
 
 fn sudo_mkdir(path: &Path) -> Result<(), String> {
@@ -185,6 +193,129 @@ pub fn link_or_copy(from: &Path, to: &Path) -> Result<(), String> {
     }
 }
 
+pub fn read_to_string(path: &Path) -> Result<String, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(err) if denied(&err) => {
+            if cfg!(unix) {
+                sudo_helper("read", &[&path_text(path)], None)
+                    .map_err(|e| hint(path, &err.to_string(), &e))
+            } else {
+                Err(format!("{}: {}", path.display(), err))
+            }
+        }
+        Err(err) => Err(format!("{}: {}", path.display(), err)),
+    }
+}
+
+pub fn tail(path: &Path, max_bytes: u64) -> Result<String, String> {
+    match fs::File::open(path) {
+        Ok(mut file) => {
+            let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let start = size.saturating_sub(max_bytes);
+            let _ = file.seek(SeekFrom::Start(start));
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer).map_err(|e| format!("{}: {}", path.display(), e))?;
+            Ok(String::from_utf8_lossy(&buffer).into_owned())
+        }
+        Err(err) if denied(&err) => {
+            if cfg!(unix) {
+                let n = max_bytes.clamp(1, 1024 * 1024).to_string();
+                let p = path_text(path);
+                sudo_helper("tail", &[&p, &n], None).map_err(|e| hint(path, &err.to_string(), &e))
+            } else {
+                Err(format!("{}: {}", path.display(), err))
+            }
+        }
+        Err(err) => Err(format!("{}: {}", path.display(), err)),
+    }
+}
+
+pub fn list_names(dir: &Path) -> Result<Vec<String>, String> {
+    match fs::read_dir(dir) {
+        Ok(entries) => Ok(entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect()),
+        Err(err) if denied(&err) => {
+            if cfg!(unix) {
+                let text = sudo_helper("ls", &[&path_text(dir)], None)
+                    .map_err(|e| hint(dir, &err.to_string(), &e))?;
+                Ok(text
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect())
+            } else {
+                Err(format!("{}: {}", dir.display(), err))
+            }
+        }
+        Err(err) => Err(format!("{}: {}", dir.display(), err)),
+    }
+}
+
+pub fn empty_dir(path: &Path) -> Result<(), String> {
+    match fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let result = if p.is_dir() {
+                    fs::remove_dir_all(&p)
+                } else {
+                    fs::remove_file(&p)
+                };
+                if let Err(err) = result {
+                    if denied(&err) && cfg!(unix) {
+                        return sudo_helper("empty-dir", &[&path_text(path)], None)
+                            .map(|_| ())
+                            .map_err(|e| hint(path, &err.to_string(), &e));
+                    }
+                    return Err(format!("{}: {}", p.display(), err));
+                }
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) if denied(&err) => {
+            if cfg!(unix) {
+                sudo_helper("empty-dir", &[&path_text(path)], None)
+                    .map(|_| ())
+                    .map_err(|e| hint(path, &err.to_string(), &e))
+            } else {
+                Err(format!("{}: {}", path.display(), err))
+            }
+        }
+        Err(err) => Err(format!("{}: {}", path.display(), err)),
+    }
+}
+
+pub fn chmod(path: &Path, mode: &str) -> Result<(), String> {
+    match mode {
+        "644" | "640" | "600" | "755" | "750" => {}
+        _ => return Err(format!("bad mode {mode}")),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(path) {
+            let mut perms = meta.permissions();
+            let parsed = u32::from_str_radix(mode, 8).unwrap_or(0);
+            perms.set_mode(parsed);
+            if fs::set_permissions(path, perms).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    if cfg!(unix) {
+        let p = path_text(path);
+        sudo_helper("chmod", &[&p, mode], None)
+            .map(|_| ())
+            .map_err(|e| hint(path, "chmod", &e))
+    } else {
+        Ok(())
+    }
+}
+
 pub fn mkdir_www(path: &Path) -> Result<(), String> {
     match fs::create_dir_all(path) {
         Ok(()) => Ok(()),
@@ -222,5 +353,16 @@ mod tests {
         assert!(text.contains("setup-sudo.sh"));
         assert!(text.contains("Permission denied"));
         assert!(text.contains("不要用 sudo 启动"));
+    }
+
+    #[test]
+    fn empty_dir_in_temp() {
+        let dir = std::env::temp_dir().join(format!("nginxwebui-empty-{}", std::process::id()));
+        let nested = dir.join("a");
+        write(&nested.join("b.txt"), "x").unwrap();
+        empty_dir(&dir).unwrap();
+        assert!(dir.exists());
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

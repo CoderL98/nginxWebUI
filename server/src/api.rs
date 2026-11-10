@@ -371,7 +371,7 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let store = ctx.store.lock().unwrap();
             let preview = nginx::preview(&store.db);
             let live_path = nginx::nginx_path(&store.db);
-            let live = std::fs::read_to_string(&live_path).unwrap_or_default();
+            let live = crate::privfs::read_to_string(&live_path).unwrap_or_default();
             ok(json!({
                 "conf": live,
                 "generated": preview.conf,
@@ -404,7 +404,7 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             store.db.set_setting("decompose", if decompose { "true" } else { "false" });
             // keep a backup so the previous configuration can be restored
             let main_path = nginx::nginx_path(&store.db);
-            if let Ok(previous) = std::fs::read_to_string(&main_path) {
+            if let Ok(previous) = crate::privfs::read_to_string(&main_path) {
                 if !previous.trim().is_empty() {
                     let time = now_ms().to_string();
                     let mut bak = Map::new();
@@ -576,9 +576,8 @@ fn log(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         "names" => {
             let mut names: Vec<String> = Vec::new();
             for dir in &dirs {
-                if let Ok(entries) = std::fs::read_dir(dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
+                if let Ok(entries) = crate::privfs::list_names(dir) {
+                    for name in entries {
                         if name.ends_with(".log") && !names.contains(&name) {
                             names.push(name);
                         }

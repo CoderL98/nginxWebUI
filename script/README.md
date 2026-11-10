@@ -34,7 +34,7 @@ script/linux/stop.sh            # 停止后端（以及开发用 Vite）；会�
 
 **不要用 `sudo script/linux/start-server.sh` / `deploy.sh`。** 整个管理进程以 root 跑时，界面被打穿就是整机 root，pid/日志/数据目录也会变成 root 属主。
 
-正确做法：进程用当前用户启动。`setup-sudo.sh` 安装 root 属主的 `/usr/local/sbin/nginxwebui-priv`（只允许改 `/etc/nginx`、`/var/www`、`/var/log/nginx`），并给该用户免密执行助手、`systemctl reload nginx`、`nginx -t`。启动脚本若检测到 EUID=0 会退出（容器或 `NGINXWEBUI_ALLOW_ROOT=1` 除外）；若写不了 `/etc/nginx` 且助手未就绪也会退出。
+正确做法：进程用当前用户启动。`setup-sudo.sh` 安装 root 属主的 `/usr/local/sbin/nginxwebui-priv`（只允许改 `/etc/nginx`、`/var/www`、`/var/log/nginx`，以及 `nginx -t` / 启停 reload、读日志）。并给该用户免密执行助手、`systemctl start|stop|reload|enable nginx`、`nginx -t`。普通用户直接跑 `nginx -t` 会因打不开 `/run/nginx.pid` 而误报失败。启动脚本若检测到 EUID=0 会退出（容器或 `NGINXWEBUI_ALLOW_ROOT=1` 除外）；若写不了 `/etc/nginx` 且助手未就绪也会退出。
 
 ## Windows
 
