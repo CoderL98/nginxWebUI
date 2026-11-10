@@ -4,6 +4,8 @@ set -euo pipefail
 # shellcheck source=env.sh
 source "$(cd "$(dirname "$0")" && pwd)/env.sh"
 
+require_not_root
+
 cd "$ROOT/server"
 cargo build --release
 cp "$ROOT/server/target/release/nginxwebui" "$BIN"

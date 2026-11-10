@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const SSL_PARAMS: &str = r#"ssl_protocols TLSv1.2 TLSv1.3;
+pub const SSL_PARAMS: &str = r#"ssl_protocols TLSv1.2 TLSv1.3;
 ssl_prefer_server_ciphers off;
 ssl_session_timeout 1d;
 ssl_session_cache shared:SSL:10m;

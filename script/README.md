@@ -23,16 +23,18 @@ web_dir = .run-home/web
 
 ```bash
 chmod +x script/linux/*.sh
-script/linux/deploy.sh          # 前后端一起构建并启动
+sudo script/linux/setup-sudo.sh # 一次性：助手 + sudoers（不要 sudo 启动 UI）
+script/linux/deploy.sh          # 前后端一起构建并启动（普通用户）
 script/linux/deploy-web.sh      # 只构建前端
 script/linux/deploy-server.sh   # 只构建并重启后端
 script/linux/start.sh           # 启动后端
 script/linux/restart.sh         # 重启后端
 script/linux/stop.sh            # 停止后端（以及开发用 Vite）
-sudo script/linux/setup-sudo.sh # 允许运行用户写入 /etc/nginx 和 /var/www
 ```
 
-普通用户启动时写不了 `/etc/nginx/sites-available`。新增站点前先跑一次 `setup-sudo.sh`，会安装 root 属主的 `/usr/local/sbin/nginxwebui-priv` 并写入 sudoers。
+**不要用 `sudo script/linux/start-server.sh` / `deploy.sh`。** 整个管理进程以 root 跑时，界面被打穿就是整机 root，pid/日志/数据目录也会变成 root 属主。
+
+正确做法：进程用当前用户启动。`setup-sudo.sh` 安装 root 属主的 `/usr/local/sbin/nginxwebui-priv`（只允许改 `/etc/nginx`、`/var/www`、`/var/log/nginx`），并给该用户免密执行助手、`systemctl reload nginx`、`nginx -t`。启动脚本若检测到 EUID=0 会退出（容器或 `NGINXWEBUI_ALLOW_ROOT=1` 除外）；若写不了 `/etc/nginx` 且助手未就绪也会退出。
 
 ## Windows
 

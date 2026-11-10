@@ -123,7 +123,7 @@
   async function save() {
     busy = true;
     error = '';
-    const r = await api.cert.save(editing);
+    const r = await api.cert.save($state.snapshot(editing));
     if (r.success) {
       open = false;
       await load();

@@ -366,7 +366,7 @@ pub fn apply(db: &Db, row: &Value, force: bool) -> (bool, String, Value) {
     }
 
     let ssl = site::ssl_dir(db);
-    if let Err(err) = std::fs::create_dir_all(&ssl) {
+    if let Err(err) = crate::privfs::mkdir_all(&ssl) {
         return (false, format!("cannot create {}: {}", ssl.display(), err), row.clone());
     }
 

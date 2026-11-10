@@ -79,8 +79,59 @@ PID_FILE="${NGINXWEBUI_PID:-${CONF_PID:-$HOME_DIR/nginxwebui.pid}}"
 LOG_FILE="${NGINXWEBUI_LOG:-${CONF_LOG:-$HOME_DIR/logs/nginxwebui.log}}"
 VITE_PID_FILE="${NGINXWEBUI_VITE_PID:-$HOME_DIR/vite.pid}"
 THREADS="${NGINXWEBUI_THREADS:-${CONF_THREADS:-1}}"
+PRIV_HELPER="${NGINXWEBUI_PRIV:-/usr/local/sbin/nginxwebui-priv}"
 
-mkdir -p "$HOME_DIR/logs" "$BIN_DIR"
+in_docker() {
+    [[ -f /.dockerenv ]] && return 0
+    grep -qE '(docker|lxc|containerd|/kubepods)' /proc/1/cgroup 2>/dev/null
+}
+
+# 不要用 sudo 启动整个进程。数据目录、pid、日志会变成 root 属主；
+# 管理界面一旦被打穿就是整机 root。写 nginx 配置走白名单助手。
+require_not_root() {
+    if [[ ${EUID} -ne 0 ]]; then
+        return 0
+    fi
+    if [[ "${NGINXWEBUI_ALLOW_ROOT:-}" == "1" ]] || in_docker; then
+        echo "以 root 运行（容器或 NGINXWEBUI_ALLOW_ROOT=1）"
+        return 0
+    fi
+    echo "不要用 sudo 启动 nginxWebUI。" >&2
+    echo "进程用普通用户跑；写 /etc/nginx 只授权助手：" >&2
+    echo "  sudo $ROOT/script/linux/setup-sudo.sh" >&2
+    echo "若以前用 root 启动过，先把数据目录改回当前用户：" >&2
+    echo "  sudo chown -R \"\$USER:\$USER\" $HOME_DIR" >&2
+    echo "容器或排障才设 NGINXWEBUI_ALLOW_ROOT=1" >&2
+    exit 1
+}
+
+require_nginx_write() {
+    local sites=/etc/nginx/sites-available
+    if [[ ! -d /etc/nginx ]]; then
+        return 0
+    fi
+    if [[ -d "$sites" && -w "$sites" ]]; then
+        echo "站点配置可直接写入 $sites"
+        return 0
+    fi
+    if [[ -d /etc/nginx && -w /etc/nginx ]]; then
+        echo "站点配置可直接写入 /etc/nginx"
+        return 0
+    fi
+    if [[ -x "$PRIV_HELPER" ]] && sudo -n "$PRIV_HELPER" mkdir "$sites" >/dev/null 2>&1; then
+        echo "站点配置将通过 sudo -n $PRIV_HELPER 写入 /etc/nginx"
+        return 0
+    fi
+    echo "当前用户写不了 /etc/nginx，且免密助手未就绪。" >&2
+    echo "请先运行: sudo $ROOT/script/linux/setup-sudo.sh" >&2
+    echo "不要用 sudo $0 启动本进程。" >&2
+    exit 1
+}
+
+# setup-sudo.sh 以 root 引用本文件，不能在那时建数据目录。
+if [[ ${EUID} -ne 0 ]] || [[ "${NGINXWEBUI_ALLOW_ROOT:-}" == "1" ]] || in_docker; then
+    mkdir -p "$HOME_DIR/logs" "$BIN_DIR"
+fi
 
 # Vite 写到仓库 web/build；deploy 再同步到配置的 web_dir。
 BUILD_DIR="$ROOT/web/build"

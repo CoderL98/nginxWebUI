@@ -447,16 +447,13 @@ pub fn md5_crypt(pass: &str, salt: &str, magic: &str) -> String {
 }
 
 pub fn write_password_file(_store: &Store, path: &Path, user: &str, pass: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let value = if cfg!(windows) {
         format!("{}:{}", user, pass)
     } else {
         let salt = crate::auth::random_token(8);
         format!("{}:{}", user, apr1(pass, &salt))
     };
-    fs::write(path, value)
+    crate::privfs::write(path, value).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
 
 #[cfg(test)]

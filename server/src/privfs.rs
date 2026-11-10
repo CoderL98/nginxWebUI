@@ -1,5 +1,6 @@
 //! Writes that may need `sudo -n` when the process is not root.
-//! Direct I/O first; on EACCES retry the root-owned helper, then raw sudo.
+//! Direct I/O first; on EACCES retry only the root-owned helper at
+//! `/usr/local/sbin/nginxwebui-priv`. No unrestricted `sudo mkdir`/`install`.
 
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -22,7 +23,7 @@ fn path_text(path: &Path) -> String {
 
 fn hint(path: &Path, direct: &str, sudo: &str) -> String {
     format!(
-        "无法写入 {}：{}\n已尝试 sudo -n：{}\n请运行 sudo script/linux/setup-sudo.sh，或给 {} 免密 sudo，或用 root 启动本服务。",
+        "无法写入 {}：{}\n已尝试 sudo -n 助手：{}\n请运行 sudo script/linux/setup-sudo.sh（给 {} 免密执行 nginxwebui-priv）。不要用 sudo 启动本服务。",
         path.display(),
         direct,
         sudo.trim(),
@@ -30,26 +31,21 @@ fn hint(path: &Path, direct: &str, sudo: &str) -> String {
     )
 }
 
-#[cfg(unix)]
-fn is_root_owned(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    path.metadata().map(|m| m.uid() == 0).unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_root_owned(_path: &Path) -> bool {
-    false
-}
-
 fn helper_path() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("/usr/local/sbin/nginxwebui-priv")];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("nginxwebui-priv"));
-            candidates.push(dir.join("nginxwebui-priv.sh"));
-        }
+    #[cfg(not(unix))]
+    {
+        return None;
     }
-    candidates.into_iter().find(|p| p.is_file() && is_root_owned(p))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let p = PathBuf::from("/usr/local/sbin/nginxwebui-priv");
+        let meta = p.symlink_metadata().ok()?;
+        if meta.file_type().is_symlink() || meta.uid() != 0 {
+            return None;
+        }
+        p.is_file().then_some(p)
+    }
 }
 
 fn sudo_output(args: &[&str], stdin_data: Option<&[u8]>) -> Result<String, String> {
@@ -92,50 +88,24 @@ fn sudo_helper(verb: &str, args: &[&str], stdin_data: Option<&[u8]>) -> Result<S
 
 fn sudo_mkdir(path: &Path) -> Result<(), String> {
     let p = path_text(path);
-    match sudo_helper("mkdir", &[&p], None) {
-        Ok(_) => Ok(()),
-        Err(_) => sudo_output(&["mkdir", "-p", &p], None).map(|_| ()),
-    }
+    sudo_helper("mkdir", &[&p], None).map(|_| ())
 }
 
 fn sudo_write(path: &Path, data: &[u8]) -> Result<(), String> {
     let p = path_text(path);
-    match sudo_helper("write", &[&p], Some(data)) {
-        Ok(_) => return Ok(()),
-        Err(err) => {
-            let tmp = std::env::temp_dir().join(format!(
-                "nginxwebui-{}-{}.tmp",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            fs::write(&tmp, data).map_err(|e| e.to_string())?;
-            let src = tmp.display().to_string();
-            let result = sudo_output(&["install", "-m", "644", &src, &p], None);
-            let _ = fs::remove_file(&tmp);
-            result.map(|_| ()).map_err(|e2| format!("{err}; {e2}"))
-        }
-    }
+    sudo_helper("write", &[&p], Some(data)).map(|_| ())
 }
 
 fn sudo_rm(path: &Path) -> Result<(), String> {
     let p = path_text(path);
-    match sudo_helper("rm", &[&p], None) {
-        Ok(_) => Ok(()),
-        Err(_) => sudo_output(&["rm", "-f", &p], None).map(|_| ()),
-    }
+    sudo_helper("rm", &[&p], None).map(|_| ())
 }
 
 #[cfg(unix)]
 fn sudo_ln(from: &Path, to: &Path) -> Result<(), String> {
     let a = path_text(from);
     let b = path_text(to);
-    match sudo_helper("ln", &[&a, &b], None) {
-        Ok(_) => Ok(()),
-        Err(_) => sudo_output(&["ln", "-sfn", &a, &b], None).map(|_| ()),
-    }
+    sudo_helper("ln", &[&a, &b], None).map(|_| ())
 }
 
 pub fn mkdir_all(path: &Path) -> Result<(), String> {
@@ -207,12 +177,9 @@ pub fn link_or_copy(from: &Path, to: &Path) -> Result<(), String> {
         Err(err) if denied(&err) => {
             let a = path_text(from);
             let b = path_text(to);
-            match sudo_helper("cp", &[&a, &b], None) {
-                Ok(_) => Ok(()),
-                Err(_) => sudo_output(&["cp", "-a", &a, &b], None)
-                    .map(|_| ())
-                    .map_err(|e| hint(to, &err.to_string(), &e)),
-            }
+            sudo_helper("cp", &[&a, &b], None)
+                .map(|_| ())
+                .map_err(|e| hint(to, &err.to_string(), &e))
         }
         Err(err) => Err(format!("{}: {}", to.display(), err)),
     }
@@ -254,5 +221,6 @@ mod tests {
         assert!(text.contains("/etc/nginx/sites-available/x.conf"));
         assert!(text.contains("setup-sudo.sh"));
         assert!(text.contains("Permission denied"));
+        assert!(text.contains("不要用 sudo 启动"));
     }
 }

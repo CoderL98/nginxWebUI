@@ -6,6 +6,7 @@
   import { Input } from '$lib/components/ui/input/index.js';
   import { Label } from '$lib/components/ui/label/index.js';
   import { Switch } from '$lib/components/ui/switch/index.js';
+  import { flagClass, flagOn } from '$lib/flag.js';
   import * as Card from '$lib/components/ui/card/index.js';
   import * as Alert from '$lib/components/ui/alert/index.js';
 
@@ -59,7 +60,7 @@
       CF_Token: await get('CF_Token'),
       CF_Account_ID: await get('CF_Account_ID'),
       GCORE_Key: await get('GCORE_Key'),
-      autoInstall: (monitor.autoInstall !== false)
+      autoInstall: flagOn(monitor.autoInstall, true)
     };
   });
 
@@ -83,8 +84,9 @@
   async function save() {
     busy = true;
     message = '';
-    const r = await api.conf.saveCmd({ ...form, autoInstall: form.autoInstall ? 'true' : 'false' });
-    await api.install.auto(form.autoInstall);
+    const snap = $state.snapshot(form);
+    const r = await api.conf.saveCmd({ ...snap, autoInstall: flagOn(snap.autoInstall, true) ? 'true' : 'false' });
+    await api.install.auto(flagOn(form.autoInstall, true));
     message = r.success ? $tt('saved') : $tt('failed');
     busy = false;
   }
@@ -182,10 +184,10 @@
       <Label>/var/www</Label>
       <Input bind:value={form.webRoot} />
     </div>
-    <div class="flex items-center gap-2 sm:col-span-2">
+    <label class="{flagClass(form.autoInstall)} sm:col-span-2 w-fit">
       <Switch bind:checked={form.autoInstall} />
-      <Label>{$tt('autoInstall')}</Label>
-    </div>
+      {$tt('autoInstall')}
+    </label>
     {#if monitor.nginxFound === false}
       <div class="sm:col-span-2">
         {#if monitor.canInstall}

@@ -7,6 +7,7 @@
   import { Input } from '$lib/components/ui/input/index.js';
   import { Label } from '$lib/components/ui/label/index.js';
   import { Switch } from '$lib/components/ui/switch/index.js';
+  import { flagClass, flagOn } from '$lib/flag.js';
   import * as Card from '$lib/components/ui/card/index.js';
   import * as Alert from '$lib/components/ui/alert/index.js';
   import * as NativeSelect from '$lib/components/ui/native-select/index.js';
@@ -50,8 +51,11 @@
     note = '';
     try {
       const r = await api.upstream.save(
-        { ...upstream, name: (upstream.name || '').trim(), enable: Number(upstream.enable ?? 1) },
-        nodes.map((node) => ({ ...node, enable: Number(node.enable), weight: Number(node.weight) }))
+        { ...$state.snapshot(upstream), name: (upstream.name || '').trim(), enable: flagOn(upstream.enable, true) ? 1 : 0 },
+        nodes.map((node) => {
+          const n = $state.snapshot(node);
+          return { ...n, enable: flagOn(n.enable, true) ? 1 : 0, weight: Number(n.weight) };
+        })
       );
       if (r.success) {
         note = $tt('saved');
@@ -132,10 +136,10 @@
             <NativeSelect.Option value="backup">backup</NativeSelect.Option>
           </NativeSelect.Root>
         </div>
-        <div class="flex items-center gap-2 sm:col-span-3">
-          <Switch checked={!!Number(node.enable)} onCheckedChange={(v) => (node.enable = v ? 1 : 0)} />
-          <Label>{$tt('enable')}</Label>
-        </div>
+        <label class="{flagClass(flagOn(node.enable, true))} sm:col-span-3 w-fit">
+          <Switch checked={flagOn(node.enable, true)} onCheckedChange={(v) => (node.enable = v ? 1 : 0)} />
+          {$tt('enable')}
+        </label>
         <Button variant="destructive" size="sm" onclick={() => (nodes = nodes.filter((n) => n !== node))}>{$tt('del')}</Button>
       </div>
     {:else}

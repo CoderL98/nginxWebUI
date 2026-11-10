@@ -11,6 +11,7 @@
   import * as Card from '$lib/components/ui/card/index.js';
   import * as Alert from '$lib/components/ui/alert/index.js';
   import * as NativeSelect from '$lib/components/ui/native-select/index.js';
+  import { flagOn, flagClass } from '$lib/flag.js';
 
   function blankLoc(type = 'static') {
     return {
@@ -77,7 +78,7 @@
       ...blankLoc(),
       ...loc,
       type,
-      websocket: !!Number(loc.websocket)
+      websocket: flagOn(loc.websocket, false)
     };
   }
 
@@ -95,11 +96,11 @@
           ...site,
           ...s,
           kind: inferKind(s),
-          ssl: s.ssl !== false && s.ssl !== 0 && s.ssl !== 'false',
-          http2: s.http2 !== false && s.http2 !== 0 && s.http2 !== 'false',
-          redirect: s.redirect !== false && s.redirect !== 0 && s.redirect !== 'false',
-          ipv6: !!Number(s.ipv6),
-          websocket: !!Number(s.websocket),
+          ssl: flagOn(s.ssl, true),
+          http2: flagOn(s.http2, true),
+          redirect: flagOn(s.redirect, true),
+          ipv6: flagOn(s.ipv6, false),
+          websocket: flagOn(s.websocket, false),
           proxy: s.proxy || '',
           resolver: s.resolver || '223.5.5.5 8.8.8.8',
           allow: s.allow || '',
@@ -138,7 +139,10 @@
     const r = await api.site.findCert(site.domain);
     matched = (r.obj || {}).certName || '';
     sslFiles = (r.obj || {}).sslFiles || [];
-    if (matched && !site.certName) site.certName = matched;
+    if (matched && !site.certName) {
+      site.certName = matched;
+      if (site.kind !== 'forward') site.ssl = true;
+    }
     if (!site.locations[0]?.root && site.locations[0]?.type === 'static') {
       site.locations[0].root = defaultRoot(site.domain);
     }
@@ -184,11 +188,6 @@
     }
   }
 
-  function flagOn(v, fallback = false) {
-    if (v === undefined || v === null || v === '') return fallback;
-    return v !== false && v !== 0 && v !== 'false' && v !== '0';
-  }
-
   function payload(apply) {
     const snap = $state.snapshot(site);
     const s = { ...snap, apply };
@@ -197,6 +196,11 @@
     s.redirect = flagOn(s.redirect, true);
     s.ipv6 = flagOn(s.ipv6, false);
     s.websocket = flagOn(s.websocket, false);
+    s.certName = s.certName || '';
+    s.locations = (s.locations || []).map((l) => ({
+      ...l,
+      websocket: flagOn(l.websocket, false)
+    }));
     if (s.kind === 'reverse') {
       const rest = (s.locations || []).filter((l) => !(l.path === '/' && l.type === 'proxy'));
       s.locations = [
@@ -244,15 +248,6 @@
     if (!site.id || !confirm($tt('confirmDel'))) return;
     await api.site.remove(site.id);
     location.href = '/server';
-  }
-
-  function flagClass(on) {
-    return (
-      'inline-flex cursor-pointer select-none items-center gap-2 rounded-lg border px-3 py-2 text-sm shadow-sm transition-colors ' +
-      (on
-        ? 'border-primary bg-primary/10'
-        : 'border-foreground/25 bg-background hover:bg-muted')
-    );
   }
 
   function addLoc() {

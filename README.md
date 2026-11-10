@@ -36,7 +36,8 @@ Linux：
 
 ```bash
 chmod +x script/linux/*.sh
-script/linux/deploy.sh
+sudo script/linux/setup-sudo.sh   # 一次性：给当前用户免密写 nginx，不要 sudo 启动 UI
+script/linux/deploy.sh            # 普通用户
 ```
 
 Windows：

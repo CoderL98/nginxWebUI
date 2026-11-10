@@ -1,12 +1,39 @@
 #!/usr/bin/env bash
 # Privileged helper for nginxWebUI. Mutates only nginx / www / log paths.
 # Installed root-owned at /usr/local/sbin/nginxwebui-priv by setup-sudo.sh.
+# Must run as root via sudo -n; never world-writable; paths go through realpath.
 set -euo pipefail
 
-allowed_path() {
+EXPECTED="/usr/local/sbin/nginxwebui-priv"
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+canonical() {
     local p="${1-}"
     [[ "$p" == /* ]] || return 1
-    [[ "$p" != *..* ]] || return 1
+    realpath -m -- "$p" 2>/dev/null
+}
+
+# Follow existing last-component symlink (write/mkdir/chown/cp).
+canonical_follow() {
+    canonical "${1-}"
+}
+
+# Keep last component so ln/rm can replace a symlink instead of its target.
+canonical_last() {
+    local p="${1-}" dir base
+    [[ "$p" == /* ]] || return 1
+    dir="$(canonical "$(dirname -- "$p")")" || return 1
+    base="$(basename -- "$p")"
+    [[ -n "$base" && "$base" != / && "$base" != . && "$base" != .. ]] || return 1
+    printf '%s/%s' "$dir" "$base"
+}
+
+in_tree() {
+    local p="${1-}"
     case "$p" in
         /etc/nginx|/etc/nginx/*) return 0 ;;
         /var/www|/var/www/*) return 0 ;;
@@ -15,42 +42,68 @@ allowed_path() {
     esac
 }
 
+require_path() {
+    local mode="${1-}" raw="${2-}" p
+    [[ "$raw" == /* ]] || die "path not allowed: ${raw:-<empty>}"
+    case "$mode" in
+        follow) p="$(canonical_follow "$raw")" || die "path not allowed: $raw" ;;
+        last) p="$(canonical_last "$raw")" || die "path not allowed: $raw" ;;
+        *) die "internal: bad resolve mode" ;;
+    esac
+    in_tree "$p" || die "path not allowed: $raw -> $p"
+    printf '%s' "$p"
+}
+
+check_self() {
+    [[ ${EUID} -eq 0 ]] || die "nginxwebui-priv must run as root via sudo"
+    local self uid mode
+    self="$(readlink -f -- "$0" 2>/dev/null || canonical "$0")"
+    [[ "$self" == "$EXPECTED" ]] || die "helper must be $EXPECTED"
+    [[ ! -L "$EXPECTED" ]] || die "helper must not be a symlink"
+    uid="$(stat -c '%u' "$EXPECTED")"
+    mode="$(stat -c '%a' "$EXPECTED")"
+    [[ "$uid" == "0" ]] || die "helper must be root-owned"
+    [[ $((8#$mode & 022)) -eq 0 ]] || die "helper must not be group/world writable (mode $mode)"
+}
+
+check_self
+
 cmd="${1-}"
 shift || true
 
 case "$cmd" in
     mkdir)
-        allowed_path "${1-}" || { echo "path not allowed: ${1-}" >&2; exit 1; }
-        mkdir -p "$1"
+        p="$(require_path follow "${1-}")"
+        mkdir -p "$p"
         ;;
     write)
-        allowed_path "${1-}" || { echo "path not allowed: ${1-}" >&2; exit 1; }
-        cat > "$1"
+        p="$(require_path follow "${1-}")"
+        cat > "$p"
         ;;
     rm)
-        allowed_path "${1-}" || { echo "path not allowed: ${1-}" >&2; exit 1; }
-        rm -f "$1"
+        p="$(require_path last "${1-}")"
+        rm -f "$p"
         ;;
     ln)
-        allowed_path "${1-}" || { echo "path not allowed: ${1-}" >&2; exit 1; }
-        allowed_path "${2-}" || { echo "path not allowed: ${2-}" >&2; exit 1; }
-        ln -sfn "$1" "$2"
+        target="$(require_path follow "${1-}")"
+        link="$(require_path last "${2-}")"
+        ln -sfn "$target" "$link"
         ;;
     cp)
-        allowed_path "${1-}" || { echo "path not allowed: ${1-}" >&2; exit 1; }
-        allowed_path "${2-}" || { echo "path not allowed: ${2-}" >&2; exit 1; }
-        cp -a "$1" "$2"
+        src="$(require_path follow "${1-}")"
+        dst="$(require_path follow "${2-}")"
+        cp -a "$src" "$dst"
         ;;
     chown-www)
-        allowed_path "${1-}" || { echo "path not allowed: ${1-}" >&2; exit 1; }
+        p="$(require_path follow "${1-}")"
         user="${2-}"
-        [[ "$user" =~ ^[a-zA-Z0-9._-]+$ ]] || { echo "bad user" >&2; exit 1; }
+        [[ "$user" =~ ^[a-zA-Z0-9._-]+$ ]] || die "bad user"
         if getent group www-data >/dev/null 2>&1; then
-            chown "$user:www-data" "$1"
+            chown "$user:www-data" "$p"
         else
-            chown "$user" "$1"
+            chown "$user" "$p"
         fi
-        chmod 755 "$1"
+        chmod 755 "$p"
         ;;
     *)
         echo "usage: nginxwebui-priv mkdir|write|rm|ln|cp|chown-www ..." >&2

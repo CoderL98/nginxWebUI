@@ -415,20 +415,26 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
             }
             if let Some(parent) = main_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(err) = crate::privfs::mkdir_all(parent) {
+                    return fail(&err);
+                }
             }
-            if let Err(err) = std::fs::write(&main_path, conf_text) {
-                return fail(&err.to_string());
+            if let Err(err) = crate::privfs::write(&main_path, &conf_text) {
+                return fail(&err);
             }
             if decompose {
                 let conf_d = nginx::nginx_dir(&store.db).join("conf.d");
-                let _ = std::fs::create_dir_all(&conf_d);
+                if let Err(err) = crate::privfs::mkdir_all(&conf_d) {
+                    return fail(&err);
+                }
                 for file in files {
                     let name = field(&file, "name");
                     if name.is_empty() || name.contains('/') || name.contains("..") {
                         continue;
                     }
-                    let _ = std::fs::write(conf_d.join(name), field(&file, "conf"));
+                    if let Err(err) = crate::privfs::write(&conf_d.join(name), field(&file, "conf")) {
+                        return fail(&err);
+                    }
                 }
             }
             let _ = store.flush();
@@ -1316,15 +1322,21 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
             };
             let (cer_path, key_path) = store_paths;
             if let Some(parent) = cer_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(err) = crate::privfs::mkdir_all(parent) {
+                    return fail(&err);
+                }
             }
             let pem = field(&body, "pemContent");
             let key = field(&body, "keyContent");
             if !pem.trim().is_empty() {
-                let _ = std::fs::write(&cer_path, pem);
+                if let Err(err) = crate::privfs::write(&cer_path, pem) {
+                    return fail(&err);
+                }
             }
             if !key.trim().is_empty() {
-                let _ = std::fs::write(&key_path, key);
+                if let Err(err) = crate::privfs::write(&key_path, key) {
+                    return fail(&err);
+                }
             }
             let mut row = body.clone();
             if let Value::Object(map) = &mut row {
@@ -1502,7 +1514,9 @@ fn www(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             };
             drop(store);
             if let Some(parent) = dest.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(err) = crate::privfs::mkdir_www(parent) {
+                    return fail(&err);
+                }
             }
             let mut written: Vec<String> = Vec::new();
             if !zip_bytes.is_empty() {
@@ -1511,7 +1525,9 @@ fn www(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     Err(err) => return fail(&err),
                 }
             } else {
-                let _ = std::fs::create_dir_all(&dest);
+                if let Err(err) = crate::privfs::mkdir_www(&dest) {
+                    return fail(&err);
+                }
             }
             let mut row = fields.clone();
             if let Value::Object(map) = &mut row {

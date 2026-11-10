@@ -5,6 +5,8 @@ set -euo pipefail
 # shellcheck source=env.sh
 source "$(cd "$(dirname "$0")" && pwd)/env.sh"
 
+require_not_root
+
 if is_running "$VITE_PID_FILE"; then
     echo "前端开发服务已在运行 pid=$(cat "$VITE_PID_FILE")  http://127.0.0.1:5173"
     exit 0

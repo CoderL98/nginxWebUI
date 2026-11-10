@@ -26,6 +26,14 @@ pub fn ssl_params(db: &Db) -> PathBuf {
     path_or(db, "sslParams", "/etc/nginx/ssl-params.conf")
 }
 
+pub fn ensure_ssl_params(db: &Db) -> Result<(), String> {
+    let path = ssl_params(db);
+    if path.is_file() {
+        return Ok(());
+    }
+    crate::privfs::write(&path, crate::install::SSL_PARAMS)
+}
+
 pub fn web_root_base(db: &Db) -> PathBuf {
     path_or(db, "webRoot", "/var/www")
 }
@@ -786,6 +794,9 @@ pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String
         }
     }
     let text = render(&store.db, site)?;
+    if site_kind(site) != "forward" && bool_of(site, "ssl", true) {
+        ensure_ssl_params(&store.db)?;
+    }
     let available = sites_available(&store.db);
     let enabled = sites_enabled(&store.db);
     crate::privfs::mkdir_all(&available)?;
