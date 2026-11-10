@@ -16,16 +16,19 @@ if (-not (Test-Path (Join-Path $WebDir 'index.html'))) {
 
 New-Item -ItemType Directory -Force -Path (Split-Path $LogFile) | Out-Null
 $errLog = Join-Path $HomeDir 'logs\nginxwebui.err.log'
-$proc = Start-Process -FilePath $Bin -ArgumentList @(
+$startArgs = @(
     "--server.port=$Port",
     "--project.home=$HomeDir",
     "--web.dir=$WebDir"
-) -WorkingDirectory $HomeDir -RedirectStandardOutput $LogFile -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
+)
+if ($ConfigFile) { $startArgs = @("--config=$ConfigFile") + $startArgs }
+$proc = Start-Process -FilePath $Bin -ArgumentList $startArgs -WorkingDirectory $HomeDir -RedirectStandardOutput $LogFile -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
 Set-Content -Path $PidFile -Value $proc.Id
 Start-Sleep -Milliseconds 400
 if (Test-PidRunning $proc.Id) {
     Write-Host "后端已启动 pid=$($proc.Id)"
     Write-Host "  http://127.0.0.1:$Port"
+    if ($ConfigFile) { Write-Host "  config=$ConfigFile" }
     Write-Host "  home=$HomeDir"
     Write-Host "  log=$LogFile"
 } else {

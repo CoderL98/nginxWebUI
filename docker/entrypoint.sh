@@ -1,11 +1,9 @@
 #!/bin/sh
 set -eu
 
-PORT="${NGINXWEBUI_PORT:-8080}"
 HOME_DIR="${NGINXWEBUI_HOME:-/home/nginxWebUI}"
-WEB_DIR="${NGINXWEBUI_WEB_DIR:-/opt/nginxwebui/web}"
-START_NGINX="${NGINXWEBUI_START_NGINX:-1}"
-export NGINXWEBUI_RELOAD_CMD="${NGINXWEBUI_RELOAD_CMD:-nginx -s reload}"
+DEFAULT_CONF=/opt/nginxwebui/nginxwebui.conf
+USER_CONF="${NGINXWEBUI_CONFIG:-$HOME_DIR/nginxwebui.conf}"
 
 mkdir -p \
   "$HOME_DIR/data" \
@@ -26,6 +24,36 @@ ssl_session_cache shared:SSL:10m;
 ssl_session_tickets off;
 EOF
 fi
+
+if [ ! -f "$USER_CONF" ] && [ -f "$DEFAULT_CONF" ]; then
+  cp "$DEFAULT_CONF" "$USER_CONF"
+fi
+
+PORT=""
+WEB_DIR=""
+START_NGINX="${NGINXWEBUI_START_NGINX:-}"
+if [ -f "$USER_CONF" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    key="${line%%=*}"
+    val="${line#*=}"
+    key=$(printf '%s' "$key" | tr -d ' \t' | tr 'A-Z-' 'a-z_')
+    val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+    case "$key" in
+      port|server.port|server_port) PORT="$val" ;;
+      home|project.home|project_home) HOME_DIR="$val" ;;
+      web_dir|web.dir|web) WEB_DIR="$val" ;;
+      start_nginx) START_NGINX="$val" ;;
+      reload_cmd|reload.cmd|reloadcmd) export NGINXWEBUI_RELOAD_CMD="$val" ;;
+    esac
+  done < "$USER_CONF"
+fi
+
+PORT="${NGINXWEBUI_PORT:-${PORT:-8080}}"
+HOME_DIR="${NGINXWEBUI_HOME:-${HOME_DIR:-/home/nginxWebUI}}"
+WEB_DIR="${NGINXWEBUI_WEB_DIR:-${WEB_DIR:-/opt/nginxwebui/web}}"
+START_NGINX="${NGINXWEBUI_START_NGINX:-${START_NGINX:-1}}"
+export NGINXWEBUI_RELOAD_CMD="${NGINXWEBUI_RELOAD_CMD:-nginx -s reload}"
 
 nginx_running() {
   if [ -f /run/nginx.pid ]; then
@@ -53,9 +81,12 @@ term() {
 }
 trap term TERM INT
 
-/opt/nginxwebui/nginxwebui \
-  --server.port="$PORT" \
-  --project.home="$HOME_DIR" \
-  --web.dir="$WEB_DIR" &
+set -- /opt/nginxwebui/nginxwebui
+if [ -f "$USER_CONF" ]; then
+  set -- "$@" --config="$USER_CONF"
+fi
+set -- "$@" --server.port="$PORT" --project.home="$HOME_DIR" --web.dir="$WEB_DIR"
+
+"$@" &
 child=$!
 wait "$child"

@@ -18,16 +18,20 @@ if [[ ! -f "$WEB_DIR/index.html" ]]; then
     exit 1
 fi
 
-nohup "$BIN" \
-    --server.port="$PORT" \
-    --project.home="$HOME_DIR" \
-    --web.dir="$WEB_DIR" \
-    >>"$LOG_FILE" 2>&1 &
+ARGS=(--server.port="$PORT" --project.home="$HOME_DIR" --web.dir="$WEB_DIR")
+if [[ -n "${CONF_FILE:-}" ]]; then
+    ARGS=(--config="$CONF_FILE" "${ARGS[@]}")
+fi
+if [[ -n "${THREADS:-}" ]]; then
+    ARGS+=(--threads="$THREADS")
+fi
+nohup "$BIN" "${ARGS[@]}" >>"$LOG_FILE" 2>&1 &
 echo $! >"$PID_FILE"
 sleep 0.4
 if is_running "$PID_FILE"; then
     echo "后端已启动 pid=$(cat "$PID_FILE")"
     echo "  http://127.0.0.1:$PORT"
+    [[ -n "${CONF_FILE:-}" ]] && echo "  config=$CONF_FILE"
     echo "  home=$HOME_DIR"
     echo "  log=$LOG_FILE"
 else

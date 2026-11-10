@@ -30,6 +30,8 @@ SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调�
 
 ## 运行
 
+改仓库根目录的 `nginxwebui.conf`（端口、数据目录、前端路径），然后：
+
 Linux：
 
 ```bash
@@ -51,7 +53,7 @@ script\windows\build-linux.ps1
 
 产物在 `dist/linux-x86_64/nginxwebui`。ARM 用 `-Target aarch64-unknown-linux-musl`。说明见 `script/README.md`。
 
-浏览器打开 `http://127.0.0.1:8080`。数据、日志、pid 默认在 `{仓库}/.run-home`。
+浏览器打开配置里的端口（默认 `http://127.0.0.1:8080`）。数据、日志、pid 默认在 `{仓库}/.run-home`。
 
 ## Docker
 
@@ -65,7 +67,7 @@ docker compose up -d --build
 
 管理宿主机已有 nginx 时见 `docker-compose.yml` 底部注释：`network_mode: host` 且 `NGINXWEBUI_START_NGINX=0`。
 
-环境变量：`NGINXWEBUI_PORT`、`NGINXWEBUI_HOME`、`NGINXWEBUI_WEB_DIR`。更细说明见 `script/README.md`。
+改端口或路径：编辑容器数据卷里的 `nginxwebui.conf`。环境变量仍可覆盖配置文件。更细说明见 `script/README.md`。
 
 开发：先起后端，再 `cd web && pnpm install && pnpm run dev`（`/adminPage` 代理到 8080）。
 

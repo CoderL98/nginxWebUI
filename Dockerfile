@@ -28,6 +28,7 @@ RUN apt-get update \
 COPY --from=server /src/server/target/release/nginxwebui /opt/nginxwebui/nginxwebui
 COPY --from=web /src/web/build /opt/nginxwebui/web
 COPY docker/entrypoint.sh /entrypoint.sh
+COPY docker/nginxwebui.conf /opt/nginxwebui/nginxwebui.conf
 RUN chmod 755 /opt/nginxwebui/nginxwebui /entrypoint.sh \
     && mkdir -p /home/nginxWebUI /etc/nginx/ssl /var/www
 

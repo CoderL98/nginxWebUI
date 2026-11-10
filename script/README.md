@@ -9,7 +9,15 @@
 
 数据目录默认 `{仓库}/.run-home`（库、日志、pid、安装的二进制）。
 
-可用环境变量覆盖：`NGINXWEBUI_PORT`、`NGINXWEBUI_HOME`、`NGINXWEBUI_WEB_DIR`。
+**改端口 / 路径：编辑仓库根目录 `nginxwebui.conf`，然后 `restart`。**
+
+```
+port = 9000
+home = .run-home
+web_dir = web/build
+```
+
+相对路径相对于配置文件所在目录。优先顺序：命令行 > 环境变量 > 配置文件 > 默认值。也可设 `NGINXWEBUI_CONFIG` 指向另一份文件。
 
 ## Linux
 
@@ -59,7 +67,8 @@ script\windows\build-linux.ps1 -Target x86_64-unknown-linux-gnu
 
 ```bash
 chmod 755 nginxwebui
-./nginxwebui --port 8080 --project.home /home/nginxWebUI
+# 把 nginxwebui.conf 和二进制放一起，或：
+./nginxwebui --config /etc/nginxwebui.conf
 ```
 
 ## Docker

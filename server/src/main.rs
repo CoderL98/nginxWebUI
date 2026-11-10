@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod compat;
 mod conf;
+mod config;
 mod install;
 mod nginx;
 mod site;
@@ -55,6 +56,8 @@ struct Options {
     home: PathBuf,
     web: Option<PathBuf>,
     threads: usize,
+    reload_cmd: Option<String>,
+    config_path: Option<PathBuf>,
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -66,21 +69,78 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn parse_args() -> Options {
-    let mut options = Options {
-        port: std::env::var("NGINXWEBUI_PORT")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(8080),
-        home: env_path("NGINXWEBUI_HOME")
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        web: env_path("NGINXWEBUI_WEB_DIR"),
-        threads: std::env::var("NGINXWEBUI_THREADS")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(1)
-            .clamp(1, 64),
-    };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("nginxWebUI (Rust backend)");
+        println!("  --config=FILE        配置文件（默认寻找 nginxwebui.conf）");
+        println!("  --server.port=8080   监听端口");
+        println!("  --project.home=DIR   数据目录");
+        println!("  --web.dir=DIR        静态前端目录");
+        println!("  --threads=N          工作线程（默认 1）");
+        println!();
+        println!("优先顺序：命令行 > 环境变量 > 配置文件 > 默认值");
+        std::process::exit(0);
+    }
+
+    let mut options = Options {
+        port: 8080,
+        home: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        web: None,
+        threads: 1,
+        reload_cmd: None,
+        config_path: None,
+    };
+
+    let cli_config = config::cli_config_path(&args);
+    if let Some(path) = config::find(cli_config.as_deref(), &[]) {
+        match config::load(&path) {
+            Ok(file) => {
+                if let Some(port) = file.port {
+                    options.port = port;
+                }
+                if let Some(home) = file.home {
+                    options.home = home;
+                }
+                if let Some(web) = file.web {
+                    options.web = Some(web);
+                }
+                if let Some(threads) = file.threads {
+                    options.threads = threads.clamp(1, 64);
+                }
+                options.reload_cmd = file.reload_cmd;
+                options.config_path = Some(path);
+            }
+            Err(err) => {
+                eprintln!("配置文件无效: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(port) = std::env::var("NGINXWEBUI_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+    {
+        options.port = port;
+    }
+    if let Some(home) = env_path("NGINXWEBUI_HOME") {
+        options.home = home;
+    }
+    if let Some(web) = env_path("NGINXWEBUI_WEB_DIR") {
+        options.web = Some(web);
+    }
+    if let Some(threads) = std::env::var("NGINXWEBUI_THREADS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        options.threads = threads.clamp(1, 64);
+    }
+    if let Ok(cmd) = std::env::var("NGINXWEBUI_RELOAD_CMD") {
+        if !cmd.trim().is_empty() {
+            options.reload_cmd = Some(cmd);
+        }
+    }
+
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -96,6 +156,9 @@ fn parse_args() -> Options {
             args.get(index).cloned()
         };
         match key.as_str() {
+            "--config" | "-c" => {
+                let _ = take(inline);
+            }
             "--server.port" | "--port" | "-p" => {
                 if let Some(value) = take(inline) {
                     options.port = value.trim().parse().unwrap_or(8080);
@@ -115,14 +178,6 @@ fn parse_args() -> Options {
                 if let Some(value) = take(inline) {
                     options.threads = value.trim().parse().unwrap_or(2).clamp(1, 64);
                 }
-            }
-            "--help" | "-h" => {
-                println!("nginxWebUI (Rust backend)");
-                println!("  --server.port=8080   port to listen on");
-                println!("  --project.home=DIR   where nginx.conf, data and logs live");
-                println!("  --web.dir=DIR        folder with the built web pages");
-                println!("  --threads=N          worker threads (default 1)");
-                std::process::exit(0);
             }
             _ => {}
         }
@@ -158,7 +213,7 @@ fn write_default_files(home: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn seed(db: &mut store::Db, home: &Path) {
+fn seed(db: &mut store::Db, home: &Path, reload_cmd: Option<&str>) {
     db.set_setting("home", &home.display().to_string());
     if db.setting("lang").is_empty() {
         db.set_setting("lang", "zh");
@@ -222,14 +277,16 @@ fn seed(db: &mut store::Db, home: &Path) {
         db.set_setting("webRoot", &value);
     }
     if db.setting("reloadCmd").is_empty() {
-        let from_env = std::env::var("NGINXWEBUI_RELOAD_CMD").unwrap_or_default();
-        let cmd = if !from_env.trim().is_empty() {
-            from_env
-        } else if Path::new("/.dockerenv").exists() {
-            "nginx -s reload".into()
-        } else {
-            "sudo systemctl reload nginx".into()
-        };
+        let cmd = reload_cmd
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                if Path::new("/.dockerenv").exists() {
+                    "nginx -s reload".into()
+                } else {
+                    "sudo systemctl reload nginx".into()
+                }
+            });
         db.set_setting("reloadCmd", &cmd);
     }
     if db.setting("decompose").is_empty() {
@@ -536,7 +593,7 @@ fn main() {
     }
 
     let mut store = Store::open(&data_dir);
-    seed(&mut store.db, &home);
+    seed(&mut store.db, &home, options.reload_cmd.as_deref());
     let _ = crate::compat::adopt(&mut store.db);
     let _ = crate::site::ensure_main_includes_sites(&store.db);
     let _ = store.flush();
@@ -544,6 +601,9 @@ fn main() {
     let web_dir = find_web_dir(&options, &exe_dir);
 
     println!("nginxWebUI {} (Rust backend)", VERSION);
+    if let Some(path) = &options.config_path {
+        println!("  config    : {}", path.display());
+    }
     println!("  home      : {}", home.display());
     println!("  web pages : {}", web_dir.display());
     println!(
