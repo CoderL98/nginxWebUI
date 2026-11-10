@@ -2,7 +2,7 @@
 
 生产环境：**前端是静态文件**，由 Rust 后端托管。没有独立的前端常驻进程。
 
-- `deploy-web`：`pnpm run build` → `web/build`
+- `deploy-web`：`pnpm run build`，再把 `web/build` 同步到配置里的 `web_dir`
 - `deploy-server`：`cargo build --release`，拷贝二进制后重启后端
 - `start` / `stop` / `restart`：后端进程（默认端口 8080）
 - `start-web` / `stop-web`：可选的 Vite 开发服务（5173），生产不必用
@@ -14,7 +14,7 @@
 ```
 port = 9000
 home = .run-home
-web_dir = web/build
+web_dir = .run-home/web
 ```
 
 相对路径相对于配置文件所在目录。优先顺序：命令行 > 环境变量 > 配置文件 > 默认值。也可设 `NGINXWEBUI_CONFIG` 指向另一份文件。

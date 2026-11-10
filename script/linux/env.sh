@@ -82,6 +82,47 @@ THREADS="${NGINXWEBUI_THREADS:-${CONF_THREADS:-1}}"
 
 mkdir -p "$HOME_DIR/logs" "$BIN_DIR"
 
+# Vite 写到仓库 web/build；deploy 再同步到配置的 web_dir。
+BUILD_DIR="$ROOT/web/build"
+
+sync_web_build() {
+    if [[ ! -f "$BUILD_DIR/index.html" ]]; then
+        echo "找不到构建结果: $BUILD_DIR/index.html" >&2
+        echo "请先在仓库里成功执行 pnpm run build" >&2
+        return 1
+    fi
+    if [[ -z "$WEB_DIR" || "$WEB_DIR" == "/" ]]; then
+        echo "web_dir 无效: ${WEB_DIR:-<空>}" >&2
+        return 1
+    fi
+    local src dst src_root
+    src="$(cd "$BUILD_DIR" && pwd -P)"
+    src_root="$(cd "$ROOT/web" && pwd -P)"
+    mkdir -p "$WEB_DIR"
+    dst="$(cd "$WEB_DIR" && pwd -P)"
+    if [[ "$dst" == "$src_root" ]]; then
+        echo "web_dir 不能是前端源码目录 $ROOT/web" >&2
+        echo "请在 nginxwebui.conf 里改成安装目录，例如 $HOME_DIR/web" >&2
+        return 1
+    fi
+    if [[ "$src" == "$dst" ]]; then
+        echo "前端已在配置路径: $dst"
+        return 0
+    fi
+    echo "同步前端 $src -> $dst"
+    if command -v rsync >/dev/null 2>&1; then
+        rsync -a --delete "$src"/ "$dst"/
+    else
+        find "$dst" -mindepth 1 -maxdepth 1 -exec rm -rf {} + || true
+        cp -a "$src"/. "$dst"/
+    fi
+    if [[ ! -f "$dst/index.html" ]]; then
+        echo "同步失败，没有 $dst/index.html" >&2
+        return 1
+    fi
+    echo "前端已部署: $dst"
+}
+
 is_running() {
     local pid_file="$1"
     [[ -f "$pid_file" ]] || return 1

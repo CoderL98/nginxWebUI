@@ -18,4 +18,4 @@ if (Test-Path 'pnpm-lock.yaml') {
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 pnpm run build
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host "前端已部署: $WebDir"
+Sync-WebBuild

@@ -63,7 +63,37 @@ $script:LogFile = if ($env:NGINXWEBUI_LOG) { $env:NGINXWEBUI_LOG } elseif ($Conf
 $script:VitePidFile = if ($env:NGINXWEBUI_VITE_PID) { $env:NGINXWEBUI_VITE_PID } else { Join-Path $HomeDir 'vite.pid' }
 $script:ConfigFile = $script:ConfFile
 
+$script:BuildDir = Join-Path $Root 'web\build'
+
 New-Item -ItemType Directory -Force -Path (Join-Path $HomeDir 'logs'), $BinDir | Out-Null
+
+function Sync-WebBuild {
+    $index = Join-Path $BuildDir 'index.html'
+    if (-not (Test-Path $index)) {
+        throw "找不到构建结果: $index`n请先在仓库里成功执行 pnpm run build"
+    }
+    if ([string]::IsNullOrWhiteSpace($WebDir) -or $WebDir -eq '\' -or $WebDir -eq '/') {
+        throw "web_dir 无效: $WebDir"
+    }
+    $srcRoot = (Resolve-Path (Join-Path $Root 'web')).Path
+    New-Item -ItemType Directory -Force -Path $WebDir | Out-Null
+    $src = (Resolve-Path $BuildDir).Path
+    $dst = (Resolve-Path $WebDir).Path
+    if ($dst -eq $srcRoot) {
+        throw "web_dir 不能是前端源码目录 $srcRoot，请改成安装目录，例如 $HomeDir\web"
+    }
+    if ($src -eq $dst) {
+        Write-Host "前端已在配置路径: $dst"
+        return
+    }
+    Write-Host "同步前端 $src -> $dst"
+    Get-ChildItem -LiteralPath $dst -Force | Remove-Item -Recurse -Force
+    Copy-Item -Path (Join-Path $src '*') -Destination $dst -Recurse -Force
+    if (-not (Test-Path (Join-Path $dst 'index.html'))) {
+        throw "同步失败，没有 $dst\index.html"
+    }
+    Write-Host "前端已部署: $dst"
+}
 
 function Get-PidFromFile([string]$Path) {
     if (-not (Test-Path $Path)) { return $null }

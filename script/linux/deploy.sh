@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build frontend + backend and restart the server process.
+# Build frontend + backend, copy web/build to web_dir, install the binary, restart.
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 "$DIR/deploy-web.sh"

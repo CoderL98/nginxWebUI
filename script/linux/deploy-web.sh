@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the static frontend into web/build. The Rust process reads these files
-# from disk, so a running backend picks up a new build without a restart.
+# Build the static frontend into web/build, then copy it to web_dir from
+# nginxwebui.conf. The Rust process serves that install directory.
 set -euo pipefail
 # shellcheck source=env.sh
 source "$(cd "$(dirname "$0")" && pwd)/env.sh"
@@ -21,4 +21,4 @@ else
     pnpm install
 fi
 pnpm run build
-echo "前端已部署: $WEB_DIR"
+sync_web_build

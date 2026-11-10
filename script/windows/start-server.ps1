@@ -11,7 +11,7 @@ if (-not (Test-Path $Bin)) {
     Write-Error "找不到可执行文件: $Bin`n请先运行 deploy-server.ps1"
 }
 if (-not (Test-Path (Join-Path $WebDir 'index.html'))) {
-    Write-Error "找不到前端页面: $WebDir\index.html`n请先运行 deploy-web.ps1"
+    Write-Error "找不到前端页面: $WebDir\index.html`n请先运行 deploy-web.ps1（会把 web\build 同步到配置里的 web_dir）"
 }
 
 New-Item -ItemType Directory -Force -Path (Split-Path $LogFile) | Out-Null

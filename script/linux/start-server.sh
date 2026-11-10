@@ -15,6 +15,7 @@ fi
 if [[ ! -f "$WEB_DIR/index.html" ]]; then
     echo "找不到前端页面: $WEB_DIR/index.html" >&2
     echo "请先运行: $(dirname "$0")/deploy-web.sh" >&2
+    echo "（会把 $ROOT/web/build 同步到配置里的 web_dir）" >&2
     exit 1
 fi
 
