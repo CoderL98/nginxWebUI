@@ -1,0 +1,651 @@
+//! nginxWebUI — Rust backend.
+//!
+//! One small process serves the JSON API and the static web pages that the
+//! SvelteKit build produced. No Java virtual machine, no database server, no
+//! background workers: a handful of threads and a few megabytes of memory.
+
+mod acme;
+mod api;
+mod auth;
+mod compat;
+mod conf;
+mod install;
+mod nginx;
+mod site;
+mod store;
+mod sysinfo;
+mod www;
+
+use api::{Ctx, Req, Reply};
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+use store::Store;
+use tiny_http::{Header, Response, StatusCode};
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static STARTED_AT: OnceLock<u64> = OnceLock::new();
+
+pub fn started_at() -> u64 {
+    *STARTED_AT.get_or_init(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    })
+}
+
+// The default nginx files, taken from the same conf.zip the Java version ships.
+const MIME_TYPES: &str = include_str!("../assets/conf/mime.types");
+const FASTCGI_CONF: &str = include_str!("../assets/conf/fastcgi.conf");
+const FASTCGI_PARAMS: &str = include_str!("../assets/conf/fastcgi_params");
+const SCGI_PARAMS: &str = include_str!("../assets/conf/scgi_params");
+const UWSGI_PARAMS: &str = include_str!("../assets/conf/uwsgi_params");
+const KOI_UTF: &str = include_str!("../assets/conf/koi-utf");
+const KOI_WIN: &str = include_str!("../assets/conf/koi-win");
+const WIN_UTF: &str = include_str!("../assets/conf/win-utf");
+
+const NGINX_CONF_TEMPLATE: &str = "worker_processes  1;\n\nevents {\n    worker_connections  1024;\n}\n";
+
+struct Options {
+    port: u16,
+    home: PathBuf,
+    web: Option<PathBuf>,
+    threads: usize,
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+fn parse_args() -> Options {
+    let mut options = Options {
+        port: std::env::var("NGINXWEBUI_PORT")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(8080),
+        home: env_path("NGINXWEBUI_HOME")
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        web: env_path("NGINXWEBUI_WEB_DIR"),
+        threads: std::env::var("NGINXWEBUI_THREADS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 64),
+    };
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (key, inline) = match arg.split_once('=') {
+            Some((key, value)) => (key.to_string(), Some(value.to_string())),
+            None => (arg.clone(), None),
+        };
+        let mut take = |default: Option<String>| -> Option<String> {
+            if let Some(value) = default {
+                return Some(value);
+            }
+            index += 1;
+            args.get(index).cloned()
+        };
+        match key.as_str() {
+            "--server.port" | "--port" | "-p" => {
+                if let Some(value) = take(inline) {
+                    options.port = value.trim().parse().unwrap_or(8080);
+                }
+            }
+            "--project.home" | "--home" => {
+                if let Some(value) = take(inline) {
+                    options.home = PathBuf::from(value);
+                }
+            }
+            "--web.dir" => {
+                if let Some(value) = take(inline) {
+                    options.web = Some(PathBuf::from(value));
+                }
+            }
+            "--threads" => {
+                if let Some(value) = take(inline) {
+                    options.threads = value.trim().parse().unwrap_or(2).clamp(1, 64);
+                }
+            }
+            "--help" | "-h" => {
+                println!("nginxWebUI (Rust backend)");
+                println!("  --server.port=8080   port to listen on");
+                println!("  --project.home=DIR   where nginx.conf, data and logs live");
+                println!("  --web.dir=DIR        folder with the built web pages");
+                println!("  --threads=N          worker threads (default 1)");
+                std::process::exit(0);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    options
+}
+
+/// Write the small standard nginx files the first time, like the Java version did
+/// when it unpacked conf.zip.
+fn write_default_files(home: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(home)?;
+    let files: [(&str, &str); 8] = [
+        ("mime.types", MIME_TYPES),
+        ("fastcgi.conf", FASTCGI_CONF),
+        ("fastcgi_params", FASTCGI_PARAMS),
+        ("scgi_params", SCGI_PARAMS),
+        ("uwsgi_params", UWSGI_PARAMS),
+        ("koi-utf", KOI_UTF),
+        ("koi-win", KOI_WIN),
+        ("win-utf", WIN_UTF),
+    ];
+    for (name, content) in files {
+        let path = home.join(name);
+        if !path.exists() {
+            std::fs::write(path, content)?;
+        }
+    }
+    let conf_path = home.join("nginx.conf");
+    if !conf_path.exists() {
+        std::fs::write(conf_path, NGINX_CONF_TEMPLATE)?;
+    }
+    Ok(())
+}
+
+fn seed(db: &mut store::Db, home: &Path) {
+    db.set_setting("home", &home.display().to_string());
+    if db.setting("lang").is_empty() {
+        db.set_setting("lang", "zh");
+    }
+    let system_nginx = nginx::unix_is_file("/etc/nginx/nginx.conf");
+    if db.setting("nginxPath").is_empty() {
+        if system_nginx {
+            db.set_setting("nginxPath", "/etc/nginx/nginx.conf");
+        } else {
+            db.set_setting("nginxPath", &home.join("nginx.conf").display().to_string());
+        }
+    }
+    if db.setting("nginxDir").is_empty() {
+        if system_nginx {
+            db.set_setting("nginxDir", "/etc/nginx");
+        } else {
+            db.set_setting("nginxDir", &home.display().to_string());
+        }
+    }
+    let fallback = |name: &str| home.join(name).display().to_string();
+    if db.setting("sitesAvailable").is_empty() {
+        let value = if nginx::unix_is_dir("/etc/nginx/sites-available") {
+            "/etc/nginx/sites-available".to_string()
+        } else {
+            fallback("sites-available")
+        };
+        db.set_setting("sitesAvailable", &value);
+    }
+    if db.setting("sitesEnabled").is_empty() {
+        let value = if nginx::unix_is_dir("/etc/nginx/sites-enabled") {
+            "/etc/nginx/sites-enabled".to_string()
+        } else {
+            fallback("sites-enabled")
+        };
+        db.set_setting("sitesEnabled", &value);
+    }
+    if db.setting("sslDir").is_empty() {
+        let value = if nginx::unix_is_dir("/etc/nginx/ssl") {
+            "/etc/nginx/ssl".to_string()
+        } else {
+            fallback("ssl")
+        };
+        db.set_setting("sslDir", &value);
+    }
+    if db.setting("sslParams").is_empty() {
+        let value = if nginx::unix_is_file("/etc/nginx/ssl-params.conf")
+            || nginx::unix_is_dir("/etc/nginx")
+        {
+            "/etc/nginx/ssl-params.conf".to_string()
+        } else {
+            fallback("ssl-params.conf")
+        };
+        db.set_setting("sslParams", &value);
+    }
+    if db.setting("webRoot").is_empty() {
+        let value = if nginx::unix_is_dir("/var/www") {
+            "/var/www".to_string()
+        } else {
+            fallback("www")
+        };
+        db.set_setting("webRoot", &value);
+    }
+    if db.setting("reloadCmd").is_empty() {
+        let from_env = std::env::var("NGINXWEBUI_RELOAD_CMD").unwrap_or_default();
+        let cmd = if !from_env.trim().is_empty() {
+            from_env
+        } else if Path::new("/.dockerenv").exists() {
+            "nginx -s reload".into()
+        } else {
+            "sudo systemctl reload nginx".into()
+        };
+        db.set_setting("reloadCmd", &cmd);
+    }
+    if db.setting("decompose").is_empty() {
+        db.set_setting("decompose", "false");
+    }
+    if db.setting("denyAllow").is_empty() {
+        db.set_setting("denyAllow", "0");
+    }
+    if db.setting("denyAllowStream").is_empty() {
+        db.set_setting("denyAllowStream", "0");
+    }
+    if db.setting("acmeSh").is_empty() {
+        let found = crate::acme::resolve_bin(db);
+        if found.exists() {
+            db.set_setting("acmeSh", &found.display().to_string());
+        }
+    }
+    if db.setting("autoInstall").is_empty() {
+        db.set_setting("autoInstall", "true");
+    }
+
+    if db.rows("basic").is_empty() {
+        db.upsert(
+            "basic",
+            serde_json::json!({ "name": "worker_processes", "value": "auto", "seq": 1 }),
+        );
+        db.upsert(
+            "basic",
+            serde_json::json!({
+                "name": "events",
+                "value": "{\n    worker_connections  1024;\n    accept_mutex on;\n}",
+                "seq": 2
+            }),
+        );
+    }
+    if db.rows("http").is_empty() {
+        db.upsert(
+            "http",
+            serde_json::json!({ "name": "include", "value": "mime.types", "enable": true, "seq": 0 }),
+        );
+        db.upsert(
+            "http",
+            serde_json::json!({
+                "name": "default_type",
+                "value": "application/octet-stream",
+                "enable": true,
+                "seq": 1
+            }),
+        );
+    }
+}
+
+fn find_web_dir(options: &Options, exe_dir: &Path) -> PathBuf {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(web) = &options.web {
+        candidates.push(web.clone());
+    }
+    if let Ok(env) = std::env::var("NGINXWEBUI_WEB_DIR") {
+        candidates.push(PathBuf::from(env));
+    }
+    candidates.push(exe_dir.join("web"));
+    candidates.push(exe_dir.join("web/build"));
+    candidates.push(exe_dir.join("../web/build"));
+    candidates.push(exe_dir.join("../../web/build"));
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("web/build"));
+        candidates.push(cwd.join("web"));
+    }
+    for candidate in &candidates {
+        if candidate.join("index.html").is_file() {
+            return candidate.clone();
+        }
+    }
+    candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("web/build"))
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "txt" => "text/plain; charset=utf-8",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Map a URL to a prerendered file: `/server/` → `server/index.html`.
+fn resolve_static(web_dir: &Path, url: &str) -> Option<PathBuf> {
+    let path_only = url.split('?').next().unwrap_or("/");
+    let relative = path_only
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .replace('\\', "/");
+    if relative.contains("..") {
+        return None;
+    }
+    if relative.is_empty() {
+        let index = web_dir.join("index.html");
+        return index.is_file().then_some(index);
+    }
+    let direct = web_dir.join(&relative);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let as_dir = direct.join("index.html");
+    if as_dir.is_file() {
+        return Some(as_dir);
+    }
+    if !relative.contains('.') {
+        let as_html = web_dir.join(format!("{relative}.html"));
+        if as_html.is_file() {
+            return Some(as_html);
+        }
+    }
+    None
+}
+
+/// Serve a prerendered page from the built web folder.
+fn serve_static(web_dir: &Path, url: &str) -> Reply {
+    let Some(file_path) = resolve_static(web_dir, url) else {
+        return Reply {
+            status: 404,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            body: format!(
+                "Not found: {}\nThe web pages were not found in {}.\nBuild them with: npm run build",
+                url,
+                web_dir.display()
+            )
+            .into_bytes(),
+            set_cookie: None,
+            extra_headers: Vec::new(),
+        };
+    };
+    match std::fs::read(&file_path) {
+        Ok(bytes) => {
+            let name = file_path.to_string_lossy().replace('\\', "/");
+            let cache = if name.contains("/_app/immutable/") {
+                "public, max-age=31536000, immutable"
+            } else if name.ends_with(".html") {
+                "no-cache"
+            } else {
+                "public, max-age=3600"
+            };
+            Reply {
+                status: 200,
+                content_type: content_type(&file_path).to_string(),
+                body: bytes,
+                set_cookie: None,
+                extra_headers: vec![("Cache-Control".to_string(), cache.to_string())],
+            }
+        }
+        Err(err) => Reply {
+            status: 404,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            body: format!(
+                "Not found: {}\n{}\nThe web pages were not found in {}.\nBuild them with: npm run build",
+                url,
+                err,
+                web_dir.display()
+            )
+            .into_bytes(),
+            set_cookie: None,
+            extra_headers: Vec::new(),
+        },
+    }
+}
+
+fn respond(request: tiny_http::Request, reply: Reply) {
+    let mut response = Response::from_data(reply.body).with_status_code(StatusCode(reply.status));
+    if let Ok(header) = Header::from_bytes(&b"Content-Type"[..], reply.content_type.as_bytes()) {
+        response = response.with_header(header);
+    }
+    if let Some(cookie) = reply.set_cookie {
+        if let Ok(header) = Header::from_bytes(&b"Set-Cookie"[..], cookie.as_bytes()) {
+            response = response.with_header(header);
+        }
+    }
+    for (name, value) in reply.extra_headers {
+        if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response = response.with_header(header);
+        }
+    }
+    let _ = request.respond(response);
+}
+
+fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
+    let url = request.url().to_string();
+    let method = format!("{}", request.method());
+
+    let mut body = Vec::new();
+    {
+        let reader = request.as_reader();
+        let _ = reader.take(16 * 1024 * 1024).read_to_end(&mut body);
+    }
+
+    let (path, query_text) = match url.split_once('?') {
+        Some((path, query)) => (path.to_string(), query.to_string()),
+        None => (url.clone(), String::new()),
+    };
+
+    let mut query: HashMap<String, String> = HashMap::new();
+    for pair in query_text.split('&').filter(|s| !s.is_empty()) {
+        let (key, value) = match pair.split_once('=') {
+            Some((key, value)) => (key.to_string(), value.to_string()),
+            None => (pair.to_string(), String::new()),
+        };
+        query.insert(percent_decode(&key), percent_decode(&value));
+    }
+
+    let mut cookies: HashMap<String, String> = HashMap::new();
+    let mut content_type = String::new();
+    for header in request.headers() {
+        if header.field.equiv("Cookie") {
+            for part in header.value.as_str().split(';') {
+                if let Some((key, value)) = part.trim().split_once('=') {
+                    cookies.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+        }
+        if header.field.equiv("Content-Type") {
+            content_type = header.value.as_str().to_string();
+        }
+    }
+
+    let is_api = path.starts_with("/adminPage/");
+    let reply = if is_api {
+        let req = Req {
+            method,
+            path: path.clone(),
+            query,
+            body,
+            cookies,
+            content_type,
+        };
+        api::handle(app, &req)
+    } else {
+        serve_static(&app.web_dir, &url)
+    };
+    respond(request, reply);
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = &input[index + 1..index + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn main() {
+    let options = parse_args();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let home = options.home.clone();
+    let data_dir = home.join("data");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let _ = std::fs::create_dir_all(home.join("logs"));
+    if !nginx::unix_is_file("/etc/nginx/nginx.conf") {
+        let _ = write_default_files(&home);
+    }
+
+    let mut store = Store::open(&data_dir);
+    seed(&mut store.db, &home);
+    let _ = crate::compat::adopt(&mut store.db);
+    let _ = crate::site::ensure_main_includes_sites(&store.db);
+    let _ = store.flush();
+
+    let web_dir = find_web_dir(&options, &exe_dir);
+
+    println!("nginxWebUI {} (Rust backend)", VERSION);
+    println!("  home      : {}", home.display());
+    println!("  web pages : {}", web_dir.display());
+    println!(
+        "  address   : http://127.0.0.1:{}  (user: admin - set on first visit)",
+        options.port
+    );
+    println!("  sqlite    : {}", store.db_path.display());
+    println!("  memory    : no JVM, local sqlite, {} worker threads", options.threads);
+
+    let app = Arc::new(Ctx {
+        home: home.clone(),
+        web_dir,
+        store: Mutex::new(store),
+        sessions: Mutex::new(auth::Sessions::default()),
+    });
+
+    {
+        let app = app.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2 * 60 * 60));
+            let snapshot = {
+                let store = app.store.lock().unwrap();
+                store.db.clone()
+            };
+            if crate::acme::resolve_bin(&snapshot).as_os_str().is_empty() {
+                continue;
+            }
+            if crate::acme::try_begin("cron", "").is_err() {
+                continue;
+            }
+            let (ok, out) = crate::acme::cron(&snapshot);
+            crate::acme::job_finish(ok, &out);
+            if !out.trim().is_empty() {
+                println!(
+                    "acme.sh --cron (ok={}): {}",
+                    ok,
+                    out.chars().take(400).collect::<String>()
+                );
+            }
+        });
+    }
+
+    let address = format!("0.0.0.0:{}", options.port);
+    let server = match tiny_http::Server::http(&address) {
+        Ok(server) => Arc::new(server),
+        Err(err) => {
+            eprintln!("cannot listen on {}: {}", address, err);
+            std::process::exit(1);
+        }
+    };
+
+    let mut handles = Vec::new();
+    for _ in 0..options.threads {
+        let server = server.clone();
+        let app = app.clone();
+        handles.push(std::thread::spawn(move || loop {
+            match server.recv() {
+                Ok(request) => handle_request(&app, request),
+                Err(_) => break,
+            }
+        }));
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn resolves_directory_index_pages() {
+        let dir = std::env::temp_dir().join("nginxwebui-test-static-pages");
+        let server = dir.join("server");
+        let edit = server.join("edit");
+        let _ = fs::create_dir_all(&edit);
+        fs::write(dir.join("index.html"), "home").unwrap();
+        fs::write(server.join("index.html"), "list").unwrap();
+        fs::write(edit.join("index.html"), "edit").unwrap();
+        fs::write(dir.join("app.js"), "js").unwrap();
+
+        assert!(resolve_static(&dir, "/")
+            .unwrap()
+            .ends_with("index.html"));
+        assert!(resolve_static(&dir, "/server")
+            .unwrap()
+            .ends_with("server\\index.html")
+            || resolve_static(&dir, "/server")
+                .unwrap()
+                .ends_with("server/index.html"));
+        assert!(resolve_static(&dir, "/server/edit?id=abc")
+            .unwrap()
+            .display()
+            .to_string()
+            .contains("edit"));
+        assert!(resolve_static(&dir, "/app.js")
+            .unwrap()
+            .ends_with("app.js"));
+        assert!(resolve_static(&dir, "/missing").is_none());
+        assert!(resolve_static(&dir, "/../secret").is_none());
+    }
+}

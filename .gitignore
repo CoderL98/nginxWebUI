@@ -1,0 +1,50 @@
+# Rust
+server/target/
+**/*.rs.bk
+
+# Frontend
+web/node_modules/
+web/.svelte-kit/
+web/build/
+web/package-lock.json
+web/.pnpm-store/
+pnpm-debug.log*
+npm-debug.log*
+
+# Cross-compiled binaries
+/dist/
+
+# Runtime data (sqlite, pid, local logs)
+.run-home/
+.tmp-verify/
+/logs
+
+# Agent / session leftovers (do not commit)
+investigation.cany/
+capture/
+inbox/
+reference/
+build-activity.log
+feed.json
+craft.json
+transcript.json
+usage.json
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+.project
+.classpath
+.settings
+.DS_Store
+Thumbs.db
+Desktop.ini
+ehthumbs.db

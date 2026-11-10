@@ -1,0 +1,21 @@
+[package]
+name = "nginxwebui"
+version = "1.0.0"
+edition = "2021"
+description = "nginxWebUI server - Rust rewrite of the Java/Solon backend"
+license = "GPL-3.0"
+
+[dependencies]
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+md-5 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

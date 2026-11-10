@@ -1,0 +1,54 @@
+services:
+  nginxwebui:
+    build: .
+    image: nginxwebui:latest
+    container_name: nginxwebui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      - "80:80"
+      - "443:443"
+    environment:
+      NGINXWEBUI_PORT: "8080"
+      NGINXWEBUI_HOME: /home/nginxWebUI
+      NGINXWEBUI_WEB_DIR: /opt/nginxwebui/web
+      NGINXWEBUI_RELOAD_CMD: nginx -s reload
+      NGINXWEBUI_START_NGINX: "1"
+    volumes:
+      - nginxwebui-data:/home/nginxWebUI
+      - nginxwebui-sites-available:/etc/nginx/sites-available
+      - nginxwebui-sites-enabled:/etc/nginx/sites-enabled
+      - nginxwebui-ssl:/etc/nginx/ssl
+      - nginxwebui-www:/var/www
+      - nginxwebui-acme:/root/.acme.sh
+      - nginxwebui-logs:/var/log/nginx
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/adminPage/login/info"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  nginxwebui-data:
+  nginxwebui-sites-available:
+  nginxwebui-sites-enabled:
+  nginxwebui-ssl:
+  nginxwebui-www:
+  nginxwebui-acme:
+  nginxwebui-logs:
+
+# 管理宿主机已有 nginx 时，不要映射 80/443，改成下面这样（与宿主机 nginx 抢端口）：
+#
+# services:
+#   nginxwebui:
+#     network_mode: host
+#     environment:
+#       NGINXWEBUI_START_NGINX: "0"
+#       NGINXWEBUI_RELOAD_CMD: nginx -s reload
+#     volumes:
+#       - nginxwebui-data:/home/nginxWebUI
+#       - /etc/nginx:/etc/nginx
+#       - /var/www:/var/www
+#       - /var/log/nginx:/var/log/nginx
+#       - /root/.acme.sh:/root/.acme.sh
