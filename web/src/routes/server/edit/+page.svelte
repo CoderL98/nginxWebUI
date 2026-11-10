@@ -184,8 +184,19 @@
     }
   }
 
+  function flagOn(v, fallback = false) {
+    if (v === undefined || v === null || v === '') return fallback;
+    return v !== false && v !== 0 && v !== 'false' && v !== '0';
+  }
+
   function payload(apply) {
-    const s = { ...site, apply };
+    const snap = $state.snapshot(site);
+    const s = { ...snap, apply };
+    s.ssl = flagOn(s.ssl, true);
+    s.http2 = flagOn(s.http2, true);
+    s.redirect = flagOn(s.redirect, true);
+    s.ipv6 = flagOn(s.ipv6, false);
+    s.websocket = flagOn(s.websocket, false);
     if (s.kind === 'reverse') {
       const rest = (s.locations || []).filter((l) => !(l.path === '/' && l.type === 'proxy'));
       s.locations = [
@@ -197,6 +208,7 @@
     if (s.kind === 'forward') {
       s.ssl = false;
       s.redirect = false;
+      s.http2 = false;
       s.mode = 'forward';
       s.locations = [];
     }
@@ -232,6 +244,15 @@
     if (!site.id || !confirm($tt('confirmDel'))) return;
     await api.site.remove(site.id);
     location.href = '/server';
+  }
+
+  function flagClass(on) {
+    return (
+      'inline-flex cursor-pointer select-none items-center gap-2 rounded-lg border px-3 py-2 text-sm shadow-sm transition-colors ' +
+      (on
+        ? 'border-primary bg-primary/10'
+        : 'border-foreground/25 bg-background hover:bg-muted')
+    );
   }
 
   function addLoc() {
@@ -324,7 +345,13 @@
       {#if site.kind !== 'forward' && site.ssl}
       <div class="grid gap-1.5">
         <Label>{$tt('selectCert')} {matched ? `(${$tt('matchedCert')}: ${matched})` : ''}</Label>
-        <NativeSelect.Root bind:value={site.certName} class="w-full">
+        <NativeSelect.Root
+          bind:value={site.certName}
+          class="w-full"
+          onchange={() => {
+            if (site.certName) site.ssl = true;
+          }}
+        >
           <NativeSelect.Option value="">auto</NativeSelect.Option>
           {#each sslFiles as file}
             <NativeSelect.Option value={file.name}>{file.name}.cer</NativeSelect.Option>
@@ -340,7 +367,7 @@
           <Label>{$tt('proxyTarget')}</Label>
           <Input bind:value={site.proxy} placeholder="8080 或 http://127.0.0.1:8080" />
         </div>
-        <label class="flex items-center gap-2 self-end text-sm"><Switch bind:checked={site.websocket} /> {$tt('websocket')}</label>
+        <label class="{flagClass(site.websocket)} self-end"><Switch bind:checked={site.websocket} /> {$tt('websocket')}</label>
       </div>
     {/if}
 
@@ -359,15 +386,15 @@
     {/if}
 
     {#if site.kind !== 'forward'}
-    <div class="flex flex-wrap gap-5">
-      <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.ssl} /> {$tt('enableSsl')}</label>
-      <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.http2} /> {$tt('http2')}</label>
-      <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.redirect} /> {$tt('redirectHttps')}</label>
-      <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.ipv6} /> {$tt('ipv6')}</label>
+    <div class="flex flex-wrap gap-2">
+      <label class={flagClass(site.ssl)}><Switch bind:checked={site.ssl} /> {$tt('enableSsl')}</label>
+      <label class={flagClass(site.http2)}><Switch bind:checked={site.http2} /> {$tt('http2')}</label>
+      <label class={flagClass(site.redirect)}><Switch bind:checked={site.redirect} /> {$tt('redirectHttps')}</label>
+      <label class={flagClass(site.ipv6)}><Switch bind:checked={site.ipv6} /> {$tt('ipv6')}</label>
     </div>
     {:else}
-    <div class="flex flex-wrap gap-5">
-      <label class="flex items-center gap-2 text-sm"><Switch bind:checked={site.ipv6} /> {$tt('ipv6')}</label>
+    <div class="flex flex-wrap gap-2">
+      <label class={flagClass(site.ipv6)}><Switch bind:checked={site.ipv6} /> {$tt('ipv6')}</label>
     </div>
     {/if}
 
@@ -414,7 +441,7 @@
               <Label>{$tt('proxyTarget')}</Label>
               <Input bind:value={loc.proxy} placeholder="8080 或 http://127.0.0.1:8080" />
             </div>
-            <label class="flex items-center gap-2 self-end text-sm"><Switch bind:checked={loc.websocket} /> {$tt('websocket')}</label>
+            <label class="{flagClass(loc.websocket)} self-end"><Switch bind:checked={loc.websocket} /> {$tt('websocket')}</label>
           </div>
         {:else if loc.type === 'static'}
           <div class="grid gap-3 sm:grid-cols-2">
@@ -447,7 +474,7 @@
                 {/each}
               </NativeSelect.Root>
             </div>
-            <label class="flex items-center gap-2 self-end text-sm"><Switch bind:checked={loc.websocket} /> {$tt('websocket')}</label>
+            <label class="{flagClass(loc.websocket)} self-end"><Switch bind:checked={loc.websocket} /> {$tt('websocket')}</label>
           </div>
         {:else if loc.type === 'redirect'}
           <div class="grid gap-1.5">

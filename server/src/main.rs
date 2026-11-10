@@ -12,6 +12,7 @@ mod conf;
 mod config;
 mod install;
 mod nginx;
+mod privfs;
 mod site;
 mod store;
 mod sysinfo;
@@ -284,10 +285,12 @@ fn seed(db: &mut store::Db, home: &Path, reload_cmd: Option<&str>) {
                 if Path::new("/.dockerenv").exists() {
                     "nginx -s reload".into()
                 } else {
-                    "sudo systemctl reload nginx".into()
+                    "sudo -n systemctl reload nginx".into()
                 }
             });
         db.set_setting("reloadCmd", &cmd);
+    } else if db.setting("reloadCmd") == "sudo systemctl reload nginx" {
+        db.set_setting("reloadCmd", "sudo -n systemctl reload nginx");
     }
     if db.setting("decompose").is_empty() {
         db.set_setting("decompose", "false");

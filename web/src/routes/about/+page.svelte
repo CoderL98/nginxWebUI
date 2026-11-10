@@ -17,7 +17,7 @@
   let form = $state({
     nginxPath: '/etc/nginx/nginx.conf',
     nginxExe: 'nginx',
-    reloadCmd: 'sudo systemctl reload nginx',
+    reloadCmd: 'sudo -n systemctl reload nginx',
     sitesAvailable: '/etc/nginx/sites-available',
     sitesEnabled: '/etc/nginx/sites-enabled',
     sslDir: '/etc/nginx/ssl',

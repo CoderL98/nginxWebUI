@@ -2,6 +2,8 @@
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
+@custom-variant data-checked (&:is([data-checked], [data-state="checked"]));
+@custom-variant data-unchecked (&:is([data-unchecked], [data-state="unchecked"]));
 
 :root {
   --radius: 0.625rem;

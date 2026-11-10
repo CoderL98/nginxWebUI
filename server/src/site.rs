@@ -69,7 +69,7 @@ pub fn ensure_main_includes_sites(db: &Db) -> Result<(), String> {
             include
         )
     };
-    fs::write(&conf_path, new_text).map_err(|e| e.to_string())?;
+    crate::privfs::write(&conf_path, new_text)?;
     Ok(())
 }
 
@@ -788,8 +788,8 @@ pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String
     let text = render(&store.db, site)?;
     let available = sites_available(&store.db);
     let enabled = sites_enabled(&store.db);
-    fs::create_dir_all(&available).map_err(|e| e.to_string())?;
-    fs::create_dir_all(&enabled).map_err(|e| e.to_string())?;
+    crate::privfs::mkdir_all(&available)?;
+    crate::privfs::mkdir_all(&enabled)?;
 
     let (avail_path, enabled_path, in_place) = site_write_paths(&store.db, site, &domain);
     let previous = fs::read_to_string(&avail_path).ok();
@@ -800,37 +800,26 @@ pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String
         if loc_type(loc) == "static" {
             let root = PathBuf::from(site_root(&store.db, site, Some(loc)));
             if !root.exists() {
-                fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+                crate::privfs::mkdir_www(&root)?;
             }
         }
     }
-    let _ = fs::create_dir_all(access_log_dir(&store.db));
-    let _ = ensure_main_includes_sites(&store.db);
+    let _ = crate::privfs::mkdir_all(&access_log_dir(&store.db));
+    ensure_main_includes_sites(&store.db)?;
 
-    fs::write(&avail_path, &text).map_err(|e| e.to_string())?;
+    crate::privfs::write(&avail_path, &text)?;
     if !in_place && !enabled_path.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            if let Err(err) = symlink(&avail_path, &enabled_path) {
-                let _ = fs::copy(&avail_path, &enabled_path);
-                let _ = err;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = fs::copy(&avail_path, &enabled_path);
-        }
+        crate::privfs::link_or_copy(&avail_path, &enabled_path)?;
     }
 
     let (ok, output) = nginx::test_conf(&store.db);
     if !ok {
         if let Some(prev) = previous {
-            let _ = fs::write(&avail_path, prev);
+            let _ = crate::privfs::write(&avail_path, prev);
         } else {
-            let _ = fs::remove_file(&avail_path);
+            let _ = crate::privfs::remove_file(&avail_path);
             if !had_link {
-                let _ = fs::remove_file(&enabled_path);
+                let _ = crate::privfs::remove_file(&enabled_path);
             }
         }
         return Err(format!("nginx -t failed, rolled back\n{}", output));
@@ -896,8 +885,8 @@ fn site_write_paths(db: &Db, site: &Value, domain: &str) -> (PathBuf, PathBuf, b
 pub fn remove_files(db: &Db, site: &Value) {
     let domain = str_of(site, "domain");
     if let Some(d) = safe_domain(&domain) {
-        let _ = fs::remove_file(sites_enabled(db).join(format!("{}.conf", d)));
-        let _ = fs::remove_file(sites_available(db).join(format!("{}.conf", d)));
+        let _ = crate::privfs::remove_file(&sites_enabled(db).join(format!("{}.conf", d)));
+        let _ = crate::privfs::remove_file(&sites_available(db).join(format!("{}.conf", d)));
     }
     let conf_path = str_of(site, "confPath");
     if conf_path.is_empty() {
@@ -907,7 +896,7 @@ pub fn remove_files(db: &Db, site: &Value) {
     if p == nginx::nginx_path(db) {
         return;
     }
-    let _ = fs::remove_file(&p);
+    let _ = crate::privfs::remove_file(&p);
 }
 
 #[cfg(test)]
@@ -987,6 +976,28 @@ mod tests {
         assert!(!text.contains("alias /var/www/mix/;"));
         assert!(text.contains("location /api {"));
         assert!(text.contains("proxy_pass http://127.0.0.1:8080;"));
+    }
+
+    #[test]
+    fn preview_payload_with_cert_keeps_ssl() {
+        let db = Db::new();
+        let site = json!({
+            "kind": "reverse",
+            "mode": "proxy",
+            "domain": "app.example.com",
+            "listen": "80",
+            "ssl": true,
+            "http2": true,
+            "redirect": true,
+            "certName": "app.example.com",
+            "proxy": "8080",
+            "apply": false
+        });
+        let text = render(&db, &site).unwrap();
+        assert!(text.contains("listen 443 ssl;"), "missing 443 in:\n{text}");
+        assert!(text.contains("ssl_certificate"), "missing cert in:\n{text}");
+        assert!(text.contains("ssl_certificate_key"), "missing key in:\n{text}");
+        assert!(text.contains("return 301 https://$host$request_uri;"));
     }
 
     #[test]

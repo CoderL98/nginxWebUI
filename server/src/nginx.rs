@@ -140,16 +140,16 @@ pub fn write_conf(store: &mut Store) -> Result<Vec<String>, String> {
     }
 
     if let Some(parent) = main_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        crate::privfs::mkdir_all(parent)?;
     }
-    fs::write(&main_path, &conf_text).map_err(|e| e.to_string())?;
+    crate::privfs::write(&main_path, &conf_text)?;
     written.push(main_path.display().to_string());
 
-    fs::create_dir_all(&conf_d).map_err(|e| e.to_string())?;
+    crate::privfs::mkdir_all(&conf_d)?;
     let mut wanted: Vec<String> = Vec::new();
     if split {
         for file in &files {
-            fs::write(conf_d.join(&file.name), &file.conf).map_err(|e| e.to_string())?;
+            crate::privfs::write(&conf_d.join(&file.name), &file.conf)?;
             wanted.push(file.name.clone());
             written.push(conf_d.join(&file.name).display().to_string());
         }

@@ -29,7 +29,10 @@ script/linux/deploy-server.sh   # 只构建并重启后端
 script/linux/start.sh           # 启动后端
 script/linux/restart.sh         # 重启后端
 script/linux/stop.sh            # 停止后端（以及开发用 Vite）
+sudo script/linux/setup-sudo.sh # 允许运行用户写入 /etc/nginx 和 /var/www
 ```
+
+普通用户启动时写不了 `/etc/nginx/sites-available`。新增站点前先跑一次 `setup-sudo.sh`，会安装 root 属主的 `/usr/local/sbin/nginxwebui-priv` 并写入 sudoers。
 
 ## Windows
 

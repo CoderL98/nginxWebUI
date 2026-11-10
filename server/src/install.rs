@@ -110,7 +110,7 @@ pub fn install_nginx(db: &mut Db) -> Result<String, String> {
         db.set_setting("nginxPath", "/etc/nginx/nginx.conf");
         db.set_setting("nginxDir", "/etc/nginx");
     }
-    db.set_setting("reloadCmd", "sudo systemctl reload nginx");
+    db.set_setting("reloadCmd", "sudo -n systemctl reload nginx");
     layout(db)?;
 
     let _ = run_shell("systemctl enable nginx");
@@ -208,17 +208,14 @@ fn layout(db: &mut Db) -> Result<String, String> {
     let enabled = site::sites_enabled(db);
     let ssl = site::ssl_dir(db);
     let www = site::web_root_base(db);
-    std::fs::create_dir_all(&available).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&enabled).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&ssl).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&www).map_err(|e| e.to_string())?;
+    crate::privfs::mkdir_all(&available)?;
+    crate::privfs::mkdir_all(&enabled)?;
+    crate::privfs::mkdir_all(&ssl)?;
+    crate::privfs::mkdir_www(&www)?;
 
     let params = site::ssl_params(db);
     if !params.exists() {
-        if let Some(parent) = params.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(&params, SSL_PARAMS).map_err(|e| e.to_string())?;
+        crate::privfs::write(&params, SSL_PARAMS)?;
     }
 
     if db.setting("sitesAvailable").is_empty() && nginx::unix_is_dir("/etc/nginx/sites-available") {
@@ -233,7 +230,7 @@ fn layout(db: &mut Db) -> Result<String, String> {
     }
 
     let log_dir = site::access_log_dir(db);
-    let _ = std::fs::create_dir_all(&log_dir);
+    let _ = crate::privfs::mkdir_all(&log_dir);
     let _ = site::ensure_main_includes_sites(db);
     Ok("layout ready".into())
 }

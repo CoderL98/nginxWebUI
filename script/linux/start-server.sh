@@ -18,6 +18,16 @@ if [[ ! -f "$WEB_DIR/index.html" ]]; then
     echo "（会把 $ROOT/web/build 同步到配置里的 web_dir）" >&2
     exit 1
 fi
+if [[ -d /etc/nginx/sites-available && ! -w /etc/nginx/sites-available ]]; then
+    if sudo -n /usr/local/sbin/nginxwebui-priv mkdir /etc/nginx/sites-available >/dev/null 2>&1; then
+        echo "站点配置将通过 sudo -n 写入 /etc/nginx"
+    elif sudo -n true >/dev/null 2>&1; then
+        echo "站点配置将尝试 sudo -n 写入 /etc/nginx"
+    else
+        echo "警告: 当前用户写不了 /etc/nginx/sites-available，新增站点会失败。" >&2
+        echo "请先运行: sudo $(dirname "$0")/setup-sudo.sh" >&2
+    fi
+fi
 
 ARGS=(--server.port="$PORT" --project.home="$HOME_DIR" --web.dir="$WEB_DIR")
 if [[ -n "${CONF_FILE:-}" ]]; then

@@ -112,8 +112,8 @@ pub fn safe_zip_name(name: &str) -> Option<PathBuf> {
 }
 
 pub fn unzip_bytes(bytes: &[u8], dest: &Path) -> Result<Vec<String>, String> {
-    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    let dest_canon = fs::canonicalize(dest).map_err(|e| e.to_string())?;
+    crate::privfs::mkdir_www(dest)?;
+    let dest_canon = fs::canonicalize(dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
     let mut written: Vec<String> = Vec::new();
     for i in 0..archive.len() {
@@ -125,14 +125,15 @@ pub fn unzip_bytes(bytes: &[u8], dest: &Path) -> Result<Vec<String>, String> {
             return Err(format!("unsafeZipPath: {}", name));
         }
         if file.is_dir() || name.ends_with('/') {
-            fs::create_dir_all(&dest_path).map_err(|e| e.to_string())?;
+            crate::privfs::mkdir_all(&dest_path)?;
             continue;
         }
         if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            crate::privfs::mkdir_all(parent)?;
         }
-        let mut out = fs::File::create(&dest_path).map_err(|e| e.to_string())?;
-        std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        crate::privfs::write(&dest_path, &buf)?;
         written.push(rel.display().to_string());
     }
     Ok(written)
