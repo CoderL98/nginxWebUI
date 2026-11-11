@@ -48,6 +48,8 @@ Windows：
 script\windows\deploy.ps1
 ```
 
+Windows 上可以启动本面板（界面和 API）。nginx 路径、`nginx -t` / reload、`sites-available` 以及 acme.sh 仍按 Linux 约定（例如 `/etc/nginx`）；本机不会自动安装或管理这些工具。签发证书和写入站点配置请在 Linux 主机或容器中进行。
+
 在 Windows 上交叉编译 Linux 二进制（musl 静态，不经过 WSL）：
 
 ```powershell

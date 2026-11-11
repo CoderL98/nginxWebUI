@@ -56,6 +56,8 @@ script\windows\stop.ps1
 
 或双击 / cmd：`deploy.cmd`、`start.cmd`、`restart.cmd`、`stop.cmd`。
 
+面板（界面和 API）可以在 Windows 上运行；nginx / acme.sh 的路径和操作仍按 Linux 约定，不会在 Windows 上自动安装或管理它们。
+
 ## 在 Windows 上编 Linux 二进制
 
 不经过 WSL。用 Zig 做链接器，默认编 **musl 静态** 包，拷到 Debian / Ubuntu / RHEL 即可跑：

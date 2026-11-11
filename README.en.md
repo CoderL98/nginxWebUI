@@ -18,6 +18,8 @@ sudo script/linux/setup-sudo.sh   # writes nginx as your user; does not grant ap
 script/linux/deploy.sh
 ```
 
+The panel UI can run on Windows; nginx paths, reload, and acme.sh still follow Linux conventions and are not installed or managed on Windows itself.
+
 Docker: `docker compose up -d --build`. The compose file publishes the panel as `127.0.0.1:8080:8080`. The image still binds `0.0.0.0` inside the container so the mapping works. The container runs as root because it also starts nginx (80/443) and acme.sh under `/root/.acme.sh`.
 
 License: [Mulan Permissive Software License, Version 1](LICENSE) (SPDX `MulanPSL-1.0`).
