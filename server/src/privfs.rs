@@ -150,6 +150,52 @@ pub fn write(path: &Path, data: impl AsRef<[u8]>) -> Result<(), String> {
     }
 }
 
+fn copy_limited<R: Read, W: Write>(reader: &mut R, writer: &mut W, max: u64) -> Result<u64, String> {
+    let mut buf = [0u8; 8192];
+    let mut total = 0u64;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max {
+            return Err("zipTooLarge".into());
+        }
+        writer.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    }
+    Ok(total)
+}
+
+/// Stream `reader` onto `path`, refusing more than `max` bytes.
+pub fn write_limited<R: Read>(path: &Path, reader: &mut R, max: u64) -> Result<u64, String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            mkdir_all(parent)?;
+        }
+    }
+    match fs::File::create(path) {
+        Ok(mut file) => match copy_limited(reader, &mut file, max) {
+            Ok(n) => Ok(n),
+            Err(err) => {
+                let _ = fs::remove_file(path);
+                Err(err)
+            }
+        },
+        Err(err) if denied(&err) => {
+            if cfg!(unix) {
+                let mut buf = Vec::new();
+                let n = copy_limited(reader, &mut buf, max)?;
+                sudo_write(path, &buf).map_err(|e| hint(path, &err.to_string(), &e))?;
+                Ok(n)
+            } else {
+                Err(format!("{}: {}", path.display(), err))
+            }
+        }
+        Err(err) => Err(format!("{}: {}", path.display(), err)),
+    }
+}
+
 pub fn remove_file(path: &Path) -> Result<(), String> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),

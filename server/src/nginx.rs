@@ -81,6 +81,77 @@ pub fn decompose(db: &Db) -> bool {
     db.setting("decompose") == "true"
 }
 
+pub fn can_overwrite_conf(live: &str) -> bool {
+    live.trim().is_empty() || live.contains(conf::GENERATED_MARK)
+}
+
+fn temp_conf_path(main: &Path) -> PathBuf {
+    let name = main
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("nginx.conf");
+    main.with_file_name(format!("{name}.webui-tmp"))
+}
+
+pub fn backup_main_conf(store: &mut Store) {
+    let main_path = nginx_path(&store.db);
+    let previous = crate::privfs::read_to_string(&main_path).unwrap_or_default();
+    if previous.trim().is_empty() {
+        return;
+    }
+    let time = now_ms().to_string();
+    let mut bak = serde_json::Map::new();
+    bak.insert("id".into(), time.clone().into());
+    bak.insert("time".into(), time.clone().into());
+    bak.insert("content".into(), previous.into());
+    store.db.upsert("bak", serde_json::Value::Object(bak));
+    let mut ids: Vec<String> = store
+        .db
+        .rows("bak")
+        .iter()
+        .map(|r| str_of(r, "id"))
+        .collect();
+    ids.sort();
+    if ids.len() > 20 {
+        for id in &ids[..ids.len() - 20] {
+            store.db.delete("bak", id);
+        }
+    }
+}
+
+/// Write `conf_text` after `nginx -t` on a sibling temp file. When
+/// `require_generated` is set, refuse to replace a foreign main conf.
+pub fn install_main_conf(
+    store: &mut Store,
+    conf_text: &str,
+    require_generated: bool,
+) -> Result<String, String> {
+    let main_path = nginx_path(&store.db);
+    let previous = crate::privfs::read_to_string(&main_path).unwrap_or_default();
+    if require_generated && !can_overwrite_conf(&previous) {
+        return Err("refuseOverwriteNginxConf".into());
+    }
+    if let Some(parent) = main_path.parent() {
+        crate::privfs::mkdir_all(parent)?;
+    }
+    let temp = temp_conf_path(&main_path);
+    crate::privfs::write(&temp, conf_text)?;
+    let (ok, output) = test_conf_file(&store.db, &temp);
+    if !ok {
+        let _ = crate::privfs::remove_file(&temp);
+        return Err(format!("nginx -t failed\n{output}"));
+    }
+    if !previous.trim().is_empty() {
+        backup_main_conf(store);
+    }
+    if let Err(err) = crate::privfs::write(&main_path, conf_text) {
+        let _ = crate::privfs::remove_file(&temp);
+        return Err(err);
+    }
+    let _ = crate::privfs::remove_file(&temp);
+    Ok(output)
+}
+
 /// The generated text plus the small files it would write, without writing.
 pub fn preview(db: &Db) -> conf::ConfExt {
     conf::build_conf(db, decompose(db))
@@ -109,39 +180,7 @@ pub fn write_conf(store: &mut Store) -> Result<Vec<String>, String> {
 
     let mut written: Vec<String> = Vec::new();
 
-    // backup the current file before overwriting it
-    let previous = crate::privfs::read_to_string(&main_path).unwrap_or_default();
-    if !previous.trim().is_empty() && !previous.contains(conf::GENERATED_MARK) {
-        return Err(
-            "refuseOverwriteNginxConf".into(),
-        );
-    }
-    if !previous.trim().is_empty() {
-        let time = now_ms().to_string();
-        let mut bak = serde_json::Map::new();
-        bak.insert("id".into(), time.clone().into());
-        bak.insert("time".into(), time.clone().into());
-        bak.insert("content".into(), previous.into());
-        store.db.upsert("bak", serde_json::Value::Object(bak));
-        // keep the last 20 backups only, so the data file stays small
-        let mut ids: Vec<String> = store
-            .db
-            .rows("bak")
-            .iter()
-            .map(|r| str_of(r, "id"))
-            .collect();
-        ids.sort();
-        if ids.len() > 20 {
-            for id in &ids[..ids.len() - 20] {
-                store.db.delete("bak", id);
-            }
-        }
-    }
-
-    if let Some(parent) = main_path.parent() {
-        crate::privfs::mkdir_all(parent)?;
-    }
-    crate::privfs::write(&main_path, &conf_text)?;
+    install_main_conf(store, &conf_text, true)?;
     written.push(main_path.display().to_string());
 
     crate::privfs::mkdir_all(&conf_d)?;
@@ -300,6 +339,37 @@ fn run_or_priv(db: &Db, extra: &[&str], op: NginxPriv) -> (bool, String) {
 
 pub fn test_conf(db: &Db) -> (bool, String) {
     run_or_priv(db, &["-t"], NginxPriv::Test)
+}
+
+pub fn test_conf_file(db: &Db, path: &Path) -> (bool, String) {
+    let conf_s = path.display().to_string();
+    let mut extra = vec!["-t".to_string(), "-c".to_string(), conf_s.clone()];
+    let prefix = db.setting("nginxPrefix");
+    if !prefix.trim().is_empty() {
+        extra.push("-p".into());
+        extra.push(format!("{}/", prefix.trim()));
+    }
+    let (ok, out) = run(&nginx_exe(db), &extra, &nginx_dir(db));
+    if ok {
+        return (true, out);
+    }
+    if cfg!(unix) && looks_like_priv_fail(&out) {
+        let helper = if conf_s.starts_with("/etc/nginx/") {
+            crate::privfs::run_helper("nginx-t", &[&conf_s])
+        } else {
+            let exe = resolve_nginx_abs(db);
+            crate::privfs::sudo_n(&[&exe, "-t", "-c", &conf_s])
+        };
+        match helper {
+            Ok(text) => (true, merge_out(&out, &text)),
+            Err(err) => (
+                false,
+                merge_out(&merge_out(&out, &err), setup_sudo_hint()),
+            ),
+        }
+    } else {
+        (ok, out)
+    }
 }
 
 pub fn reload(db: &Db) -> (bool, String) {
@@ -628,6 +698,9 @@ mod tests {
         assert!(!foreign.contains(crate::conf::GENERATED_MARK));
         let ours = format!("{}\nworker_processes auto;\n", crate::conf::GENERATED_MARK);
         assert!(ours.contains(crate::conf::GENERATED_MARK));
+        assert!(can_overwrite_conf(&ours));
+        assert!(!can_overwrite_conf(foreign));
+        assert!(can_overwrite_conf(""));
     }
 
     #[test]
