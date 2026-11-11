@@ -1,7 +1,7 @@
 //! Install nginx and acme.sh when they are missing.
 //! Linux uses the distro package manager and a *pinned* acme.sh GitHub
-//! archive (see `ACME_SH_*` and `script/acme.sh.pin`). Windows reports that
-//! those tools must be installed by hand.
+//! archive (see `ACME_SH_*` and `script/acme.sh.pin`). On Windows the agent
+//! discovers nginx and installs the same pinned acme.sh through Git Bash or WSL.
 
 use crate::acme;
 use crate::nginx;
@@ -34,7 +34,11 @@ pub fn auto_install_enabled(db: &Db) -> bool {
 }
 
 pub fn can_install() -> bool {
-    cfg!(unix)
+    cfg!(unix) || cfg!(windows)
+}
+
+pub fn can_install_acme() -> bool {
+    cfg!(unix) || crate::acme::find_bash().is_some()
 }
 
 pub fn should_ensure(db: &Db) -> bool {
@@ -61,6 +65,7 @@ pub fn status(db: &Db) -> Value {
         "os": std::env::consts::OS,
         "autoInstall": auto_install_enabled(db),
         "linux": cfg!(unix),
+        "windows": cfg!(windows),
         "nginx": {
             "found": nginx_ok,
             "exe": nginx::nginx_exe(db),
@@ -68,6 +73,8 @@ pub fn status(db: &Db) -> Value {
         },
         "acme": acme::summarize(db),
         "canInstall": can_install(),
+        "canInstallAcme": can_install_acme(),
+        "acmeNeedsBash": cfg!(windows) && crate::acme::find_bash().is_none(),
         "acmeShVersion": ACME_SH_VERSION,
     })
 }
@@ -94,6 +101,9 @@ pub fn ensure_acme(db: &mut Db) -> Result<String, String> {
 }
 
 pub fn install_nginx(db: &mut Db) -> Result<String, String> {
+    if cfg!(windows) {
+        return install_nginx_windows(db);
+    }
     if !cfg!(unix) {
         return Err("installLinuxOnly".into());
     }
@@ -139,8 +149,45 @@ pub fn install_nginx(db: &mut Db) -> Result<String, String> {
     Ok(log)
 }
 
+fn install_nginx_windows(db: &mut Db) -> Result<String, String> {
+    if nginx_present(db) {
+        layout(db)?;
+        return Ok("nginx already installed".into());
+    }
+    if let Some(prefix) = crate::seed::discover_windows_prefix() {
+        let home = PathBuf::from(db.setting("home"));
+        crate::seed::seed_with_layout(
+            db,
+            &home,
+            None,
+            prefix.parent().unwrap_or(&prefix),
+            crate::seed::Layout::Windows,
+        );
+        // force paths from the discovered prefix even if earlier defaults exist
+        if prefix.join("nginx.exe").is_file() {
+            db.set_setting("nginxExe", &prefix.join("nginx.exe").display().to_string());
+        }
+        if prefix.join("conf").join("nginx.conf").is_file() {
+            db.set_setting(
+                "nginxPath",
+                &prefix.join("conf").join("nginx.conf").display().to_string(),
+            );
+            db.set_setting("nginxDir", &prefix.display().to_string());
+        }
+        layout(db)?;
+        if nginx_present(db) {
+            return Ok(format!("nginx discovered at {}", prefix.display()));
+        }
+    }
+    Err("nginxWindowsNotFound".into())
+}
+
 pub fn install_acme(db: &mut Db) -> Result<String, String> {
-    if !cfg!(unix) {
+    if cfg!(windows) {
+        if crate::acme::find_bash().is_none() {
+            return Err("acmeNeedsBash".into());
+        }
+    } else if !cfg!(unix) {
         return Err("installLinuxOnly".into());
     }
     if acme_present(db) {
@@ -195,6 +242,13 @@ fn acme_home_target(db: &Db) -> PathBuf {
     }
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".acme.sh");
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return PathBuf::from(home).join(".acme.sh");
+    }
+    let project = db.setting("home");
+    if !project.trim().is_empty() {
+        return PathBuf::from(project).join(".acme.sh");
     }
     PathBuf::from("/root/.acme.sh")
 }
@@ -382,15 +436,7 @@ pub fn install_acme_from_pin(home: &Path, email: &str) -> (bool, String) {
         let _ = std::fs::remove_dir_all(&work);
         return (false, format!("acme.sh archive hash mismatch: {err}"));
     }
-    let (extracted, extract_log) = run_cmd(
-        "tar",
-        &[
-            "-xzf",
-            &archive.display().to_string(),
-            "-C",
-            &work.display().to_string(),
-        ],
-    );
+    let (extracted, extract_log) = extract_tar_gz(&archive, &work);
     if !extracted {
         let _ = std::fs::remove_dir_all(&work);
         return (false, format!("cannot extract acme.sh\n{extract_log}"));
@@ -411,8 +457,8 @@ pub fn install_acme_from_pin(home: &Path, email: &str) -> (bool, String) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
     }
-    let (ok, out) = run_cmd(
-        &script.display().to_string(),
+    let (ok, out) = run_acme_script(
+        &script,
         &[
             "--install",
             "--home",
@@ -429,6 +475,48 @@ pub fn install_acme_from_pin(home: &Path, email: &str) -> (bool, String) {
     log.push_str(&format!("\ninstalled acme.sh {ACME_SH_VERSION}\n"));
     let _ = std::fs::remove_dir_all(&work);
     (ok, log)
+}
+
+fn extract_tar_gz(archive: &Path, work: &Path) -> (bool, String) {
+    let archive_s = archive.display().to_string();
+    let work_s = work.display().to_string();
+    if which("tar").is_some() || which("tar.exe").is_some() {
+        let bin = if which("tar").is_some() {
+            "tar"
+        } else {
+            "tar.exe"
+        };
+        return run_cmd(bin, &["-xzf", &archive_s, "-C", &work_s]);
+    }
+    if let Some(bash) = crate::acme::find_bash() {
+        let cmd = format!("tar -xzf '{}' -C '{}'", archive.display(), work.display());
+        return run_cmd(&bash.display().to_string(), &["-lc", &cmd]);
+    }
+    (false, "tarNotFound".into())
+}
+
+fn run_acme_script(script: &Path, args: &[&str]) -> (bool, String) {
+    if cfg!(windows) {
+        let Some(bash) = crate::acme::find_bash() else {
+            return (false, "acmeNeedsBash".into());
+        };
+        let name = bash.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.eq_ignore_ascii_case("wsl.exe") {
+            let mut full = vec![
+                "-e".to_string(),
+                "bash".into(),
+                crate::acme::to_wsl_path(script),
+            ];
+            full.extend(args.iter().map(|a| a.to_string()));
+            let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
+            return run_cmd(&bash.display().to_string(), &refs);
+        }
+        let mut full = vec![script.display().to_string()];
+        full.extend(args.iter().map(|a| a.to_string()));
+        let refs: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
+        return run_cmd(&bash.display().to_string(), &refs);
+    }
+    run_cmd(&script.display().to_string(), args)
 }
 
 pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> Result<(), String> {

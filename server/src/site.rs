@@ -317,10 +317,34 @@ pub fn peek_sites_include(db: &Db) -> Result<InsertPlanView, String> {
 
 fn path_or(db: &Db, key: &str, fallback: &str) -> PathBuf {
     let setting = db.setting(key);
-    if setting.trim().is_empty() {
-        PathBuf::from(fallback)
+    if !setting.trim().is_empty() {
+        return PathBuf::from(setting.trim());
+    }
+    if crate::seed::is_windows_node(db) {
+        return windows_default(db, key, fallback);
+    }
+    PathBuf::from(fallback)
+}
+
+fn windows_default(db: &Db, key: &str, fallback: &str) -> PathBuf {
+    let dir = crate::nginx::nginx_dir(db);
+    let (prefix, conf_dir) = if dir.file_name().is_some_and(|n| n == "conf") {
+        (
+            dir.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| dir.clone()),
+            dir.clone(),
+        )
     } else {
-        PathBuf::from(setting.trim())
+        (dir.clone(), dir.join("conf"))
+    };
+    match key {
+        "sslDir" => conf_dir.join("ssl"),
+        "sitesAvailable" => conf_dir.join("sites-available"),
+        "sitesEnabled" => conf_dir.join("sites-enabled"),
+        "sslParams" => conf_dir.join("ssl-params.conf"),
+        "webRoot" => prefix.join("html"),
+        _ => PathBuf::from(fallback),
     }
 }
 
@@ -1195,6 +1219,34 @@ pub fn remove_files(db: &Db, site: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_or_windows_fallbacks_do_not_use_unix_paths() {
+        let mut db = Db::new();
+        db.set_setting("osFamily", "windows");
+        db.set_setting("nginxDir", r"C:\nginx");
+        assert_eq!(
+            ssl_dir(&db),
+            PathBuf::from(r"C:\nginx").join("conf").join("ssl")
+        );
+        assert_eq!(
+            sites_available(&db),
+            PathBuf::from(r"C:\nginx")
+                .join("conf")
+                .join("sites-available")
+        );
+        assert_eq!(web_root_base(&db), PathBuf::from(r"C:\nginx").join("html"));
+        assert!(!ssl_dir(&db)
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .contains("/etc/nginx"));
+        assert!(!web_root_base(&db)
+            .display()
+            .to_string()
+            .replace('\\', "/")
+            .contains("/var/www"));
+    }
 
     #[test]
     fn wildcard_san_matches_one_label() {

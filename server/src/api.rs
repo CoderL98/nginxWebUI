@@ -296,17 +296,63 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
     }
 
     let selected = req.node.trim();
-    if !selected.is_empty() && selected != "local" {
+    let reply = if !selected.is_empty() && selected != "local" {
         if crate::rpc::stays_on_panel(kind, action) {
-            // panel-local administration
+            dispatch_local(ctx, kind, action, req)
         } else if let Some((method, params)) = crate::rpc::map_admin(kind, action, req) {
-            return crate::registry::proxy(ctx, req, selected, &method, params);
+            crate::registry::proxy(ctx, req, selected, &method, params)
         } else {
-            return fail("notSupportedOnNode");
+            fail("notSupportedOnNode")
+        }
+    } else {
+        dispatch_local(ctx, kind, action, req)
+    };
+    maybe_replicate(ctx, req, kind, action, &reply);
+    reply
+}
+
+fn reply_succeeded(reply: &Reply) -> bool {
+    if reply.status >= 400 {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&reply.body)
+        .ok()
+        .and_then(|v| v.get("success").and_then(|s| s.as_bool()))
+        .unwrap_or(true)
+}
+
+fn maybe_replicate(ctx: &Arc<Ctx>, req: &Req, kind: &str, action: &str, reply: &Reply) {
+    if crate::groups::current_wave().is_some() || !reply_succeeded(reply) {
+        return;
+    }
+    let node = if req.node.trim().is_empty() {
+        "local"
+    } else {
+        req.node.trim()
+    };
+    let body = body(req);
+    if kind == "site" && (action == "apply" || (action == "save" && bool_of(&body, "apply", false)))
+    {
+        let mut id = field(&body, "id");
+        if id.is_empty() {
+            if let Ok(parsed) = serde_json::from_slice::<Value>(&reply.body) {
+                id = parsed
+                    .get("obj")
+                    .and_then(|o| o.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        if !id.is_empty() {
+            crate::groups::after_success(ctx, node, vec![id], None);
+        }
+    } else if kind == "cert" && (action == "apply" || action == "renew") {
+        let id = field(&body, "id");
+        if !id.is_empty() {
+            crate::groups::after_cert_job(ctx, node, &id);
         }
     }
-
-    dispatch_local(ctx, kind, action, req)
 }
 
 /// Run one API action against this process's own store and nginx, after the
@@ -334,6 +380,8 @@ pub fn dispatch_local(ctx: &Arc<Ctx>, kind: &str, action: &str, req: &Req) -> Re
             crate::sync::handle(ctx, action, req)
         }
         ("node", _) => node_admin(ctx, action, req),
+        ("ssl", _) => crate::ssl::handle(ctx, action, req),
+        ("group", _) => crate::groups::handle(ctx, action, req),
         _ => simple_table(ctx, kind, action, req),
     }
 }
@@ -386,8 +434,12 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                         if let Value::Object(map) = &mut obj {
                             map.insert("token".into(), token.clone().into());
                             map.insert("expires".into(), expires.to_string().into());
-                            map.insert("panelUrl".into(), base.into());
-                            map.insert("installCommand".into(), command.into());
+                            map.insert("panelUrl".into(), base.clone().into());
+                            map.insert("installCommand".into(), command.clone().into());
+                            map.insert(
+                                "installCommandWindows".into(),
+                                install_command_windows(&base, &token).into(),
+                            );
                             map.insert("installWarning".into(), warning.into());
                         }
                     }
@@ -414,6 +466,7 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                         "expires": expires.to_string(),
                         "panelUrl": base,
                         "installCommand": command,
+                        "installCommandWindows": install_command_windows(&base, &token),
                         "installWarning": warning,
                     }))
                 }
@@ -538,6 +591,17 @@ pub fn install_command(panel_base: &str, token: &str) -> (String, String) {
     (
         format!("curl -fsSL {base}/agent/install.sh | sh -s -- --url {base} --token {token}"),
         warning.to_string(),
+    )
+}
+
+pub fn install_command_windows(panel_base: &str, token: &str) -> String {
+    let base = if panel_base.is_empty() {
+        "https://panel.example".to_string()
+    } else {
+        panel_base.trim_end_matches('/').to_string()
+    };
+    format!(
+        "irm {base}/agent/install.ps1 -OutFile $env:TEMP\nginxwebui-agent-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\nginxwebui-agent-install.ps1 -Url {base} -Token {token}"
     )
 }
 

@@ -563,6 +563,18 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
         respond(request, reply);
         return;
     }
+    if let Some(rest) = path.strip_prefix("/healthz/group/") {
+        let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        let reply = match parts.as_slice() {
+            [group_id] => crate::groups::healthz(app, group_id, "local"),
+            [group_id, "node", node_id] => crate::groups::healthz(app, group_id, node_id),
+            _ => {
+                crate::api::json_reply(404, &serde_json::json!({ "ok": false, "msg": "not found" }))
+            }
+        };
+        respond(request, reply);
+        return;
+    }
 
     let proto = if app.secure_cookie || forwarded_https {
         "https"
@@ -592,7 +604,7 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
 
     // unauthenticated agent endpoints: per-IP fixed windows
     let bucket = match path.as_str() {
-        "/agent/install.sh" => Some(("install", 30u32)),
+        "/agent/install.sh" | "/agent/install.ps1" => Some(("install", 30u32)),
         "/agent/download" => Some(("download", 10)),
         "/agent/v1/join" => Some(("join", 10)),
         _ => None,
@@ -617,6 +629,11 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
 
     if path == "/agent/install.sh" {
         let reply = registry::install_script(&req);
+        respond(request, reply);
+        return;
+    }
+    if path == "/agent/install.ps1" {
+        let reply = registry::install_script_ps1(&req);
         respond(request, reply);
         return;
     }
@@ -819,6 +836,7 @@ pub fn run() {
     let app = Arc::new(ctx);
 
     crate::api::spawn_acme_cron(app.clone());
+    crate::groups::spawn_failover(app.clone());
 
     let address = format!("{}:{}", options.bind, options.port);
     let server = match bind_listener(&address, tls) {

@@ -121,6 +121,15 @@ fn default_home() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home).join(".config").join("nginxwebui-agent");
     }
+    if let Ok(data) = std::env::var("PROGRAMDATA") {
+        return PathBuf::from(data).join("nginxwebui-agent");
+    }
+    if let Ok(data) = std::env::var("LOCALAPPDATA").or_else(|_| std::env::var("APPDATA")) {
+        return PathBuf::from(data).join("nginxwebui-agent");
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        return PathBuf::from(home).join("nginxwebui-agent");
+    }
     PathBuf::from(".nginxwebui-agent")
 }
 
@@ -193,6 +202,7 @@ fn print_help() {
     println!("nginxwebui-agent");
     println!("  join --url https://panel.example --token <join-token>");
     println!("  run  [--url https://panel.example]");
+    println!("  service             run as a Windows Service (Service Control Manager)");
     println!("  --home DIR          config/data directory");
     println!("  --tls-ca FILE       trust this PEM CA (in addition to webpki roots)");
     println!("  --tls-fingerprint   pin SHA-256 of the panel leaf cert (hex, optional colons)");
@@ -315,6 +325,9 @@ pub fn open_node_context(home: &Path) -> Arc<Ctx> {
 }
 
 fn do_run(agent: &ureq::Agent, cfg: &AgentConfig) -> Result<(), String> {
+    if let Ok(exe) = std::env::current_exe() {
+        crate::upgrade::cleanup_old_binary(&exe);
+    }
     if cfg.credential.is_empty() {
         return Err("not joined; run `nginxwebui-agent join` first".into());
     }
@@ -506,7 +519,98 @@ pub fn run() -> Result<(), String> {
     match cmd.as_str() {
         "join" => do_join(&agent, &mut cfg),
         "run" => do_run(&agent, &cfg),
+        "service" => run_windows_service(cfg),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+fn run_windows_service(cfg: AgentConfig) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows_svc::run(cfg)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cfg;
+        Err("the service command is only available on Windows".into())
+    }
+}
+
+#[cfg(windows)]
+mod windows_svc {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use windows_service::define_windows_service;
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+        ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::service_dispatcher;
+
+    const NAME: &str = "nginxwebui-agent";
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    static CFG: std::sync::OnceLock<AgentConfig> = std::sync::OnceLock::new();
+
+    pub fn run(cfg: AgentConfig) -> Result<(), String> {
+        let _ = CFG.set(cfg);
+        service_dispatcher::start(NAME, ffi_service_main)
+            .map_err(|err| format!("service dispatcher: {err}"))
+    }
+
+    fn service_main(_args: Vec<std::ffi::OsString>) {
+        if let Err(err) = run_service() {
+            eprintln!("nginxwebui-agent service: {err}");
+        }
+    }
+
+    fn run_service() -> windows_service::Result<()> {
+        let (tx, rx) = mpsc::channel();
+        let tx_ctrl = tx.clone();
+        let status = service_control_handler::register(NAME, move |event| match event {
+            ServiceControl::Stop | ServiceControl::Shutdown => {
+                let _ = tx_ctrl.send(());
+                ServiceControlHandlerResult::NoError
+            }
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        })?;
+        status.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+        let cfg = CFG.get().cloned();
+        std::thread::spawn(move || {
+            if let Some(cfg) = cfg {
+                match crate::tls::build_ureq_agent(&cfg.ca_file, &cfg.fingerprint, &cfg.url) {
+                    Ok(agent) => {
+                        if let Err(err) = do_run(&agent, &cfg) {
+                            eprintln!("nginxwebui-agent service: {err}");
+                        }
+                    }
+                    Err(err) => eprintln!("nginxwebui-agent service: {err}"),
+                }
+            }
+        });
+        let _ = rx.recv();
+        let _ = status.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        });
+        Ok(())
     }
 }
 

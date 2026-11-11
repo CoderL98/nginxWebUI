@@ -824,6 +824,7 @@ pub fn proxy(ctx: &Ctx, req: &Req, node_id: &str, method: &str, params: Value) -
 }
 
 const INSTALL_SCRIPT: &str = include_str!("../assets/agent-install.sh");
+const INSTALL_SCRIPT_PS1: &str = include_str!("../assets/agent-install.ps1");
 
 pub fn install_script(req: &Req) -> Reply {
     let base = if req.panel_base.is_empty() || !crate::api::valid_panel_url(&req.panel_base) {
@@ -835,6 +836,22 @@ pub fn install_script(req: &Req) -> Reply {
     Reply {
         status: 200,
         content_type: "text/x-shellscript; charset=utf-8".into(),
+        body: script.into_bytes(),
+        set_cookie: None,
+        extra_headers: vec![("Cache-Control".into(), "no-store".into())],
+    }
+}
+
+pub fn install_script_ps1(req: &Req) -> Reply {
+    let base = if req.panel_base.is_empty() || !crate::api::valid_panel_url(&req.panel_base) {
+        "https://panel.example".to_string()
+    } else {
+        req.panel_base.clone()
+    };
+    let script = INSTALL_SCRIPT_PS1.replace("__PANEL__", &base);
+    Reply {
+        status: 200,
+        content_type: "text/plain; charset=utf-8".into(),
         body: script.into_bytes(),
         set_cookie: None,
         extra_headers: vec![("Cache-Control".into(), "no-store".into())],
@@ -869,28 +886,39 @@ pub fn agent_binary_path(
     let arch = normalize_arch(arch);
     let current_os = normalize_os(std::env::consts::OS);
     let current_arch = normalize_arch(std::env::consts::ARCH);
+    fn names_for(os_name: &str) -> [&'static str; 2] {
+        if os_name == "windows" {
+            ["nginxwebui-agent.exe", "nginxwebui-agent"]
+        } else {
+            ["nginxwebui-agent", "nginxwebui-agent.exe"]
+        }
+    }
     if !os.is_empty() && !arch.is_empty() {
-        let pinned = exe_dir
-            .join("agents")
-            .join(format!("{os}-{arch}"))
-            .join("nginxwebui-agent");
-        if pinned.is_file() {
-            return Some(pinned);
+        let dir = exe_dir.join("agents").join(format!("{os}-{arch}"));
+        for name in names_for(&os) {
+            let pinned = dir.join(name);
+            if pinned.is_file() {
+                return Some(pinned);
+            }
         }
     }
     let matches_current =
         (os.is_empty() || os == current_os) && (arch.is_empty() || arch == current_arch);
     if matches_current {
-        let fallback = exe_dir.join("nginxwebui-agent");
-        if fallback.is_file() {
-            return Some(fallback);
+        for name in names_for(&current_os) {
+            let fallback = exe_dir.join(name);
+            if fallback.is_file() {
+                return Some(fallback);
+            }
         }
-        let pinned = exe_dir
+        let dir = exe_dir
             .join("agents")
-            .join(format!("{current_os}-{current_arch}"))
-            .join("nginxwebui-agent");
-        if pinned.is_file() {
-            return Some(pinned);
+            .join(format!("{current_os}-{current_arch}"));
+        for name in names_for(&current_os) {
+            let pinned = dir.join(name);
+            if pinned.is_file() {
+                return Some(pinned);
+            }
         }
     }
     None
@@ -930,16 +958,6 @@ pub fn download_agent(ctx: &Ctx, req: &Req) -> Reply {
     let arch = req.query.get("arch").cloned().unwrap_or_default();
     let os_n = normalize_os(&os);
     let arch_n = normalize_arch(&arch);
-    if os_n == "windows" {
-        return Reply {
-            status: 404,
-            content_type: "text/plain; charset=utf-8".into(),
-            body: b"Windows is not a supported managed nginx/acme node; run the agent on Linux."
-                .to_vec(),
-            set_cookie: None,
-            extra_headers: Vec::new(),
-        };
-    }
     let meta = req
         .query
         .get("meta")
@@ -978,7 +996,14 @@ pub fn download_agent(ctx: &Ctx, req: &Req) -> Reply {
                 extra_headers: vec![
                     (
                         "Content-Disposition".into(),
-                        "attachment; filename=nginxwebui-agent".into(),
+                        format!(
+                            "attachment; filename={}",
+                            if os_n == "windows" {
+                                "nginxwebui-agent.exe"
+                            } else {
+                                "nginxwebui-agent"
+                            }
+                        ),
                     ),
                     ("X-Checksum-Sha256".into(), sum),
                 ],
@@ -1330,6 +1355,24 @@ mod tests {
         let native = agent_binary_path(&dir, std::env::consts::OS, std::env::consts::ARCH).unwrap();
         assert_eq!(std::fs::read(&native).unwrap(), b"native-agent");
         assert!(agent_binary_path(&dir, "linux", "riscv64").is_none());
+        let win = dir.join("agents").join("windows-x86_64");
+        std::fs::create_dir_all(&win).unwrap();
+        std::fs::write(win.join("nginxwebui-agent.exe"), b"win-agent").unwrap();
+        let got = agent_binary_path(&dir, "windows", "x86_64").unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), b"win-agent");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_ps1_is_served_and_mentions_windows_service() {
+        let req = agent_req("/agent/install.ps1", Value::Null, "");
+        let reply = install_script_ps1(&req);
+        assert_eq!(reply.status, 200);
+        let text = String::from_utf8_lossy(&reply.body);
+        assert!(text.contains("nginxwebui-agent.exe"), "{text}");
+        assert!(text.contains("New-Service"), "{text}");
+        assert!(text.contains("os=windows"), "{text}");
+        assert!(!text.contains("__PANEL__"), "{text}");
+        assert!(text.contains("https://panel.example"), "{text}");
     }
 }

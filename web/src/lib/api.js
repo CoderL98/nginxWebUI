@@ -188,6 +188,12 @@ export const api = {
     syncPreview: (body) => post('/adminPage/node/syncPreview', body),
     sync: (body) => post('/adminPage/node/sync', body)
   },
+  group: {
+    list: () => get('/adminPage/group/list'),
+    save: (row) => post('/adminPage/group/save', row),
+    remove: (id) => post('/adminPage/group/del', { id }),
+    promote: (id, nodeId) => post('/adminPage/group/promote', { id, nodeId })
+  },
   setting: {
     get: (key) => get('/adminPage/setting/get', { key }),
     set: (key, value) => post('/adminPage/setting/set', { key, value })

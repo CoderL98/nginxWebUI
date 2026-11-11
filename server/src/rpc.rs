@@ -76,6 +76,9 @@ pub const ROUTES: &[Route] = &[
     r("install.nginx", "install", "nginx", "POST", true),
     r("install.acme", "install", "acme", "POST", true),
     r("install.auto", "install", "auto", "POST", true),
+    r("ssl.list", "ssl", "list", "GET", false),
+    r("ssl.get", "ssl", "get", "POST", false),
+    r("ssl.put", "ssl", "put", "POST", true),
 ];
 
 /// Older method names (agent ≤ 1.0 / panel ≤ 1.0) accepted by the agent.
@@ -167,7 +170,7 @@ pub fn map_admin(kind: &str, action: &str, req: &Req) -> Option<(String, Value)>
 pub fn stays_on_panel(kind: &str, action: &str) -> bool {
     matches!(
         kind,
-        "login" | "admin" | "node" | "setting" | "export" | "bak"
+        "login" | "admin" | "node" | "setting" | "export" | "bak" | "group"
     ) || (kind == "log" && action == "operate")
 }
 
@@ -453,5 +456,31 @@ mod tests {
         assert_eq!(params["query"]["name"], "error.log");
         let (query, _) = split_params(&params);
         assert_eq!(query.get("lines").map(String::as_str), Some("50"));
+    }
+
+    #[test]
+    fn ssl_put_rejects_path_traversal() {
+        let ctx = ctx();
+        let (method, _) = map_admin(
+            "ssl",
+            "put",
+            &admin_req("ssl", "put", &[], json!({ "files": [] })),
+        )
+        .unwrap();
+        assert_eq!(method, "ssl.put");
+        let reply = execute(
+            &ctx,
+            "ssl.put",
+            &json!({
+                "query": {},
+                "body": { "files": [{ "name": "../escape.key", "content": "SECRET" }] }
+            }),
+        )
+        .unwrap();
+        assert_eq!(reply["success"], false, "{reply}");
+        assert_eq!(reply["msg"], "badSslName");
+        let home = ctx.home.clone();
+        assert!(!home.join("escape.key").exists());
+        assert!(!home.join("..").join("escape.key").exists());
     }
 }

@@ -21,6 +21,22 @@ fn path_text(path: &Path) -> String {
     path.display().to_string()
 }
 
+fn use_unix_helper() -> bool {
+    cfg!(unix)
+}
+
+fn denied_hint(path: &Path, direct: &str) -> String {
+    if use_unix_helper() {
+        hint(path, direct, "not tried")
+    } else {
+        format!(
+            "无法写入 {}：{}。请以对 nginx 目录有写权限的账户运行 nginxwebui-agent 服务（服务安装时选择有权限的用户）。不要期望本进程在 Windows 上升级权限。",
+            path.display(),
+            direct
+        )
+    }
+}
+
 fn hint(path: &Path, direct: &str, sudo: &str) -> String {
     format!(
         "无法写入 {}：{}\n已尝试 sudo -n 助手：{}\n请运行 sudo script/linux/setup-sudo.sh（给 {} 免密执行 nginxwebui-priv）。不要用 sudo 启动本服务。",
@@ -124,7 +140,7 @@ pub fn mkdir_all(path: &Path) -> Result<(), String> {
             if cfg!(unix) {
                 sudo_mkdir(path).map_err(|e| hint(path, &err.to_string(), &e))
             } else {
-                Err(format!("{}: {}", path.display(), err))
+                Err(denied_hint(path, &err.to_string()))
             }
         }
         Err(err) => Err(format!("{}: {}", path.display(), err)),
@@ -144,7 +160,7 @@ pub fn write(path: &Path, data: impl AsRef<[u8]>) -> Result<(), String> {
             if cfg!(unix) {
                 sudo_write(path, data).map_err(|e| hint(path, &err.to_string(), &e))
             } else {
-                Err(format!("{}: {}", path.display(), err))
+                Err(denied_hint(path, &err.to_string()))
             }
         }
         Err(err) => Err(format!("{}: {}", path.display(), err)),
@@ -194,7 +210,7 @@ pub fn write_limited<R: Read>(path: &Path, reader: &mut R, max: u64) -> Result<u
                 sudo_write(path, &buf).map_err(|e| hint(path, &err.to_string(), &e))?;
                 Ok(n)
             } else {
-                Err(format!("{}: {}", path.display(), err))
+                Err(denied_hint(path, &err.to_string()))
             }
         }
         Err(err) => Err(format!("{}: {}", path.display(), err)),
@@ -209,7 +225,7 @@ pub fn remove_file(path: &Path) -> Result<(), String> {
             if cfg!(unix) {
                 sudo_rm(path).map_err(|e| hint(path, &err.to_string(), &e))
             } else {
-                Err(format!("{}: {}", path.display(), err))
+                Err(denied_hint(path, &err.to_string()))
             }
         }
         Err(err) => Err(format!("{}: {}", path.display(), err)),

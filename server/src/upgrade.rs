@@ -97,19 +97,27 @@ pub fn current_binary_sha256() -> Option<String> {
     sha256_file(&exe)
 }
 
+fn sibling(dest: &Path, suffix: &str) -> PathBuf {
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("nginxwebui-agent");
+    dest.with_file_name(format!("{name}{suffix}"))
+}
+
+/// Remove a previous Windows `.old` image left after a successful upgrade.
+pub fn cleanup_old_binary(dest: &Path) {
+    let old = sibling(dest, ".old");
+    if old.is_file() {
+        let _ = std::fs::remove_file(&old);
+    }
+}
+
 /// Write `bytes` to `dest` atomically (temp file + rename) and chmod 0755.
+/// On Windows a running exe cannot always be overwritten: the current file is
+/// renamed to `.old` and the new bytes become `dest`. The next start deletes `.old`.
 pub fn replace_binary(dest: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let tmp = parent.join(format!(
-        ".{}.upgrade.tmp",
-        dest.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("nginxwebui-agent")
-    ));
+    let tmp = sibling(dest, ".upgrade.tmp");
     let _ = std::fs::remove_file(&tmp);
     {
         use std::io::Write;
@@ -133,10 +141,38 @@ pub fn replace_binary(dest: &Path, bytes: &[u8]) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
     }
-    std::fs::rename(&tmp, dest).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("cannot install new agent at {}: {err}", dest.display())
-    })
+    match std::fs::rename(&tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            #[cfg(windows)]
+            {
+                let _ = err;
+                let old = sibling(dest, ".old");
+                let _ = std::fs::remove_file(&old);
+                if dest.exists() {
+                    std::fs::rename(dest, &old).map_err(|e| {
+                        let _ = std::fs::remove_file(&tmp);
+                        format!("cannot move running agent aside: {e}")
+                    })?;
+                }
+                return std::fs::rename(&tmp, dest).map_err(|e| {
+                    if old.exists() {
+                        let _ = std::fs::rename(&old, dest);
+                    }
+                    let _ = std::fs::remove_file(&tmp);
+                    format!("cannot install new agent at {}: {e}", dest.display())
+                });
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = std::fs::remove_file(&tmp);
+                Err(format!(
+                    "cannot install new agent at {}: {err}",
+                    dest.display()
+                ))
+            }
+        }
+    }
 }
 
 pub fn download(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
@@ -173,11 +209,14 @@ pub fn reexec(dest: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let status = std::process::Command::new(dest)
+        // Spawn a replacement and exit so a Windows Service can also be
+        // restarted by SCM after this process stops (or by the child).
+        let child = std::process::Command::new(dest)
             .args(&args)
-            .status()
+            .spawn()
             .map_err(|err| format!("re-exec failed: {err}"))?;
-        std::process::exit(status.code().unwrap_or(1));
+        let _ = child;
+        std::process::exit(0);
     }
 }
 

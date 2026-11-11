@@ -25,6 +25,11 @@
   let selectedTargets = $state({});
   let syncPreview = $state(null);
   let syncResults = $state(null);
+  let groups = $state([]);
+  let groupName = $state('');
+  let groupMode = $state('active-active');
+  let groupMembers = $state({});
+  let groupPrimary = $state('local');
 
   function statusLabel(status) {
     if (status === 'online') return $tt('nodeOnline');
@@ -91,8 +96,9 @@
     load();
     loadConfig();
     loadSyncSites();
+    loadGroups();
     // keep online/offline current without a manual refresh
-    timer = setInterval(load, 10000);
+    timer = setInterval(() => { load(); loadGroups(); }, 10000);
   });
 
   onDestroy(() => {
@@ -297,6 +303,111 @@
       error = $tt('failed');
     }
   }
+
+  function windowsCommandFor(token) {
+    const base = (panelUrl.trim() || detectedUrl || 'https://panel.example').replace(/\/+$/, '');
+    return `irm ${base}/agent/install.ps1 -OutFile $env:TEMP\\nginxwebui-agent-install.ps1; powershell -ExecutionPolicy Bypass -File $env:TEMP\\nginxwebui-agent-install.ps1 -Url ${base} -Token ${token}`;
+  }
+
+  async function loadGroups() {
+    try {
+      const r = await api.group.list();
+      if (r.success === false) return;
+      groups = (r.obj || {}).groups || [];
+    } catch {
+      /* optional */
+    }
+  }
+
+  function memberLabel(id) {
+    const row = rows.find((r) => r.id === id);
+    if (!row) return id;
+    return row.kind === 'local' ? $tt('currentNode') : row.name;
+  }
+
+  async function addGroup() {
+    error = '';
+    note = '';
+    const members = Object.keys(groupMembers).filter((id) => groupMembers[id]);
+    if (!groupName.trim()) {
+      error = $tt('nameRequired');
+      return;
+    }
+    if (members.length < 2) {
+      error = $tt('groupMembersRequired');
+      return;
+    }
+    busy = true;
+    try {
+      const r = await api.group.save({
+        name: groupName.trim(),
+        mode: groupMode,
+        members,
+        primary: groupMode === 'primary-standby' ? groupPrimary : ''
+      });
+      if (r.success) {
+        note = $tt('saved');
+        groupName = '';
+        groupMembers = {};
+        await loadGroups();
+      } else {
+        error = msg(r);
+      }
+    } catch {
+      error = $tt('failed');
+    }
+    busy = false;
+  }
+
+  async function promote(group, nodeId) {
+    if (!confirm($tt('confirmPromote'))) return;
+    busy = true;
+    try {
+      const r = await api.group.promote(group.id, nodeId);
+      if (r.success) {
+        note = $tt('saved');
+        await loadGroups();
+      } else {
+        error = msg(r);
+      }
+    } catch {
+      error = $tt('failed');
+    }
+    busy = false;
+  }
+
+  async function dropGroup(group) {
+    if (!confirm($tt('confirmDeleteGroup'))) return;
+    busy = true;
+    try {
+      const r = await api.group.remove(group.id);
+      if (r.success) {
+        await loadGroups();
+      } else {
+        error = msg(r);
+      }
+    } catch {
+      error = $tt('failed');
+    }
+    busy = false;
+  }
+
+  function syncResultText(r) {
+    if (!r.success) {
+      return (r.msg && $tt(r.msg) !== r.msg ? $tt(r.msg) : r.msg) || $tt('failed');
+    }
+    const bits = [$tt('syncCopied') + (r.sites != null ? ` (${r.sites})` : '')];
+    if (r.filesWritten && r.filesWritten.length) {
+      bits.push($tt('syncFiles') + ` (${r.filesWritten.length})`);
+    }
+    if (r.tested) {
+      bits.push(r.testOk ? $tt('syncTestOk') : $tt('syncTestFail'));
+    }
+    if (r.reloaded) {
+      bits.push(r.reloadOk ? $tt('syncReloadOk') : $tt('syncReloadFail'));
+    }
+    return bits.join(' · ');
+  }
 </script>
 
 <h1 class="mb-1 text-lg font-semibold">{$tt('nodes')}</h1>
@@ -345,10 +456,13 @@
     </Card.Header>
     <Card.Content class="grid gap-2">
       <pre class="bg-muted overflow-x-auto rounded-md p-3 text-xs" aria-label={$tt('installCommand')}>{commandFor(issued.token)}</pre>
+      <p class="text-muted-foreground text-xs">{$tt('installCommandWindows')}</p>
+      <pre class="bg-muted overflow-x-auto rounded-md p-3 text-xs" aria-label={$tt('installCommandWindows')}>{windowsCommandFor(issued.token)}</pre>
       {#if urlWarning()}
         <p class="text-destructive text-xs" role="alert">{$tt(urlWarning())}</p>
       {/if}
       <p class="text-muted-foreground text-xs">{$tt('installModeHint')}</p>
+      <p class="text-muted-foreground text-xs">{$tt('windowsAgentHint')}</p>
       {#if issued.rejoined}
         <p class="text-muted-foreground text-xs">{$tt('rejoinHint')}</p>
       {:else if issued.rotated}
@@ -357,6 +471,7 @@
     </Card.Content>
     <Card.Footer>
       <Button variant="outline" onclick={() => copyText(commandFor(issued.token))}>{$tt('copyCommand')}</Button>
+      <Button variant="outline" onclick={() => copyText(windowsCommandFor(issued.token))}>{$tt('copyWindowsCommand')}</Button>
     </Card.Footer>
   </Card.Root>
 {/if}
@@ -408,6 +523,9 @@
     {#if syncPreview}
       <div class="bg-muted rounded-md p-3 text-xs">
         <p>{$tt('syncPreviewBtn')}: {(syncPreview.sites || []).map((s) => s.domain).join(', ') || '-'}</p>
+        {#if (syncPreview.files || []).length}
+          <p>{$tt('syncFiles')}: {(syncPreview.files || []).map((f) => f.name).join(', ')}</p>
+        {/if}
         {#if syncPreview.dnsCreds && syncPreview.dnsCreds.willCopy}
           <p>{$tt('willCopyDns')}</p>
         {/if}
@@ -420,7 +538,7 @@
       <ul class="grid gap-1 text-sm">
         {#each syncResults as r}
           <li class={r.success ? '' : 'text-destructive'}>
-            {r.target}: {r.success ? $tt('syncCopied') + (r.sites != null ? ` (${r.sites})` : '') : (r.msg && $tt(r.msg) !== r.msg ? $tt(r.msg) : r.msg || $tt('failed'))}
+            {r.target}: {syncResultText(r)}
           </li>
         {/each}
       </ul>
@@ -430,6 +548,92 @@
     <Button variant="outline" onclick={doPreview} disabled={busy}>{$tt('syncPreviewBtn')}</Button>
     <Button onclick={doSync} disabled={busy}>{$tt('syncRun')}</Button>
   </Card.Footer>
+</Card.Root>
+
+<Card.Root class="mb-4">
+  <Card.Header>
+    <Card.Title>{$tt('groupsTitle')}</Card.Title>
+    <Card.Description>{$tt('groupsHint')}</Card.Description>
+  </Card.Header>
+  <Card.Content class="grid gap-3">
+    <div class="grid gap-3 sm:grid-cols-2">
+      <div class="grid gap-1.5">
+        <Label for="group-name">{$tt('groupName')}</Label>
+        <Input id="group-name" bind:value={groupName} autocomplete="off" />
+      </div>
+      <div class="grid gap-1.5">
+        <Label for="group-mode">{$tt('groupMode')}</Label>
+        <select id="group-mode" class="border-input bg-background h-9 rounded-md border px-2 text-sm" bind:value={groupMode}>
+          <option value="active-active">{$tt('modeAA')}</option>
+          <option value="primary-standby">{$tt('modePS')}</option>
+        </select>
+      </div>
+    </div>
+    <fieldset class="grid gap-1.5">
+      <legend class="text-sm font-medium">{$tt('groupMembers')}</legend>
+      <div class="grid gap-1">
+        {#each rows as row}
+          <label class="flex items-center gap-2 text-sm">
+            <input type="checkbox" bind:checked={groupMembers[row.id]} />
+            <span>{row.kind === 'local' ? $tt('currentNode') : row.name}</span>
+          </label>
+        {/each}
+      </div>
+    </fieldset>
+    {#if groupMode === 'primary-standby'}
+      <div class="grid gap-1.5 sm:max-w-sm">
+        <Label for="group-primary">{$tt('groupPrimary')}</Label>
+        <select id="group-primary" class="border-input bg-background h-9 rounded-md border px-2 text-sm" bind:value={groupPrimary}>
+          {#each rows.filter((r) => groupMembers[r.id] || r.id === 'local') as row}
+            <option value={row.id}>{row.kind === 'local' ? $tt('currentNode') : row.name}</option>
+          {/each}
+        </select>
+      </div>
+    {/if}
+    <Button class="w-fit" onclick={addGroup} disabled={busy}>{$tt('addGroup')}</Button>
+    {#each groups as group}
+      <div class="rounded-md border p-3 text-sm">
+        <div class="mb-1 flex flex-wrap items-center justify-between gap-2">
+          <strong>{group.name}</strong>
+          <span class="text-muted-foreground text-xs">{group.mode === 'primary-standby' ? $tt('modePS') : $tt('modeAA')}</span>
+        </div>
+        <ul class="grid gap-1">
+          {#each group.memberViews || group.members || [] as m}
+            {@const mid = m.id || m}
+            {@const view = m.id ? m : (group.memberViews || []).find((v) => v.id === m)}
+            <li class="flex flex-wrap items-center gap-2">
+              <span>{memberLabel(mid)}</span>
+              {#if group.mode === 'primary-standby' && mid === group.primary}
+                <span class="text-xs">{$tt('groupPrimary')}</span>
+              {/if}
+              {#if view && view.shouldReceiveTraffic}
+                <span class="text-emerald-600 dark:text-emerald-400 text-xs">{$tt('shouldReceiveTraffic')}</span>
+              {:else if group.mode === 'primary-standby' && mid !== group.primary}
+                <span class="text-muted-foreground text-xs">{$tt('standby')}</span>
+              {/if}
+              {#if group.mode === 'primary-standby' && mid !== group.primary}
+                <Button variant="outline" size="sm" disabled={busy} onclick={() => promote(group, mid)}>{$tt('promoteNode')}</Button>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+        <p class="text-muted-foreground mt-2 text-xs">{$tt('healthzPath')}: <code class="font-mono">/healthz/group/{group.id}</code></p>
+        {#if group.lastSync}
+          <p class="text-muted-foreground text-xs">{$tt('groupLastSync')}: {group.lastSync.at ? new Date(Number(group.lastSync.at)).toLocaleString() : '-'}
+            {#if group.lastSync.results}
+              · {(group.lastSync.results || []).map((r) => `${r.target}:${r.success ? 'ok' : (r.msg || 'fail')}`).join(', ')}
+            {/if}
+          </p>
+        {/if}
+        {#if group.lastFailover}
+          <p class="text-muted-foreground text-xs">{$tt('groupLastFailover')}: {memberLabel(group.lastFailover.from)} → {memberLabel(group.lastFailover.to)} ({group.lastFailover.reason && $tt(group.lastFailover.reason) !== group.lastFailover.reason ? $tt(group.lastFailover.reason) : (group.lastFailover.reason || '')})</p>
+        {/if}
+        <div class="mt-2">
+          <Button variant="destructive" size="sm" disabled={busy} onclick={() => dropGroup(group)}>{$tt('deleteGroup')}</Button>
+        </div>
+      </div>
+    {/each}
+  </Card.Content>
 </Card.Root>
 
 <div class="overflow-x-auto rounded-md border">

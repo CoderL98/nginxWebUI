@@ -565,7 +565,90 @@ fn run_acme(db: &Db, args: &[&str], extra_env: &[(String, String)]) -> (bool, St
     run_acme_env(db, &owned, extra_env, false)
 }
 
-fn acme_command(bin: &Path) -> Command {
+/// Git Bash, MSYS bash, or WSL — required to run acme.sh on Windows.
+pub fn find_bash() -> Option<PathBuf> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Some(p) = crate::install::which("bash") {
+        cands.push(p);
+    }
+    if let Some(p) = crate::install::which("bash.exe") {
+        cands.push(p);
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        cands.push(Path::new(&pf).join("Git").join("bin").join("bash.exe"));
+        cands.push(
+            Path::new(&pf)
+                .join("Git")
+                .join("usr")
+                .join("bin")
+                .join("bash.exe"),
+        );
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
+        cands.push(Path::new(&pf).join("Git").join("bin").join("bash.exe"));
+    }
+    for p in [
+        PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
+        PathBuf::from(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+        PathBuf::from(r"C:\msys64\usr\bin\bash.exe"),
+        PathBuf::from(r"C:\msys32\usr\bin\bash.exe"),
+    ] {
+        cands.push(p);
+    }
+    for p in cands {
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Some(p) = crate::install::which("wsl.exe") {
+        return Some(p);
+    }
+    let wsl = PathBuf::from(r"C:\Windows\System32\wsl.exe");
+    if wsl.is_file() {
+        return Some(wsl);
+    }
+    None
+}
+
+fn bash_is_wsl(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| n.eq_ignore_ascii_case("wsl.exe"))
+        .unwrap_or(false)
+}
+
+pub fn to_wsl_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        let drive = s.chars().next().unwrap().to_ascii_lowercase();
+        let rest = s[2..].replace('\\', "/");
+        return format!("/mnt/{drive}{rest}");
+    }
+    s.replace('\\', "/")
+}
+
+fn translate_arg(arg: &str, wsl: bool) -> String {
+    if wsl && arg.len() >= 3 && arg.as_bytes()[1] == b':' {
+        to_wsl_path(Path::new(arg))
+    } else {
+        arg.to_string()
+    }
+}
+
+fn acme_command(bin: &Path) -> Result<Command, String> {
+    if cfg!(windows) {
+        let Some(bash) = find_bash() else {
+            return Err("acmeNeedsBash".into());
+        };
+        let mut command = Command::new(&bash);
+        if bash_is_wsl(&bash) {
+            command.arg("-e").arg("bash").arg(to_wsl_path(bin));
+        } else {
+            command.arg(bin);
+        }
+        return Ok(command);
+    }
     #[cfg(unix)]
     {
         let stdbuf = Path::new("/usr/bin/stdbuf");
@@ -573,10 +656,10 @@ fn acme_command(bin: &Path) -> Command {
             let mut command = Command::new(stdbuf);
             command.args(["-oL", "-eL"]);
             command.arg(bin);
-            return command;
+            return Ok(command);
         }
     }
-    Command::new(bin)
+    Ok(Command::new(bin))
 }
 
 fn pump_pipe<R: Read + Send + 'static>(
@@ -618,8 +701,21 @@ fn run_acme_env(
         }
         return (false, msg.into());
     }
-    let mut command = acme_command(&bin);
-    command.args(args);
+    let mut command = match acme_command(&bin) {
+        Ok(c) => c,
+        Err(msg) => {
+            if live {
+                job_append(&msg);
+            }
+            return (false, msg);
+        }
+    };
+    let wsl = find_bash().map(|p| bash_is_wsl(&p)).unwrap_or(false);
+    if wsl {
+        command.args(args.iter().map(|a| translate_arg(a, true)));
+    } else {
+        command.args(args);
+    }
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -688,6 +784,8 @@ pub fn summarize(db: &Db) -> Value {
         "sslDir": site::ssl_dir(db).display().to_string(),
         "hasCf": credentials_ok(db, "dns_cf", &Value::Null),
         "hasGcore": credentials_ok(db, "dns_gcore", &Value::Null),
+        "bash": find_bash().map(|p| p.display().to_string()),
+        "needsBash": cfg!(windows) && find_bash().is_none(),
     })
 }
 
@@ -702,6 +800,14 @@ pub fn as_object(row: Value) -> Map<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_wsl_path_translates_drive() {
+        assert_eq!(
+            to_wsl_path(Path::new(r"C:\nginx\conf\ssl")),
+            "/mnt/c/nginx/conf/ssl"
+        );
+    }
 
     #[test]
     fn wildcard_issue_names() {

@@ -37,7 +37,9 @@ pub fn nginx_dir(db: &Db) -> PathBuf {
 }
 
 pub fn which_nginx() -> Option<PathBuf> {
-    crate::install::which("nginx").or_else(|| crate::install::which("/usr/sbin/nginx"))
+    crate::install::which("nginx")
+        .or_else(|| crate::install::which("nginx.exe"))
+        .or_else(|| crate::install::which("/usr/sbin/nginx"))
 }
 
 /// Read `--conf-path` / `--prefix` / `--sbin-path` from `nginx -V`.
@@ -71,7 +73,11 @@ pub fn parse_nginx_v(text: &str) -> Option<(PathBuf, PathBuf, PathBuf)> {
 pub fn nginx_exe(db: &Db) -> String {
     let exe = db.setting("nginxExe");
     if exe.trim().is_empty() {
-        "nginx".to_string()
+        if crate::seed::is_windows_node(db) {
+            "nginx.exe".to_string()
+        } else {
+            "nginx".to_string()
+        }
     } else {
         exe.trim().to_string()
     }
@@ -399,12 +405,65 @@ pub fn allowed_reload_commands() -> &'static [&'static str] {
     ]
 }
 
+fn split_cmd_parts(cmd: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut buf = String::new();
+    let mut quote: Option<char> = None;
+    for c in cmd.chars() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                buf.push(c);
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+            continue;
+        }
+        if c.is_whitespace() {
+            if !buf.is_empty() {
+                parts.push(std::mem::take(&mut buf));
+            }
+            continue;
+        }
+        buf.push(c);
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !buf.is_empty() {
+        parts.push(buf);
+    }
+    Some(parts)
+}
+
+fn looks_like_nginx_exe(path: &str) -> bool {
+    if path.contains("..") || !command_is_safe(path) {
+        return false;
+    }
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    name.eq_ignore_ascii_case("nginx") || name.eq_ignore_ascii_case("nginx.exe")
+}
+
+/// `nginx -s reload`, `nginx.exe -s reload`, or a quoted path to nginx.exe.
+fn is_nginx_s_reload(cmd: &str) -> bool {
+    if !command_is_safe(cmd) {
+        return false;
+    }
+    let Some(parts) = split_cmd_parts(cmd) else {
+        return false;
+    };
+    parts.len() == 3 && looks_like_nginx_exe(&parts[0]) && parts[1] == "-s" && parts[2] == "reload"
+}
+
 pub fn normalize_reload_cmd(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return Some(String::new());
     }
-    let helper = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let helper = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
     if helper == "nginxwebui-priv reload" || trimmed.ends_with("/nginxwebui-priv reload") {
         return Some(trimmed.to_string());
     }
@@ -415,6 +474,9 @@ pub fn normalize_reload_cmd(cmd: &str) -> Option<String> {
             }
             return Some(trimmed.to_string());
         }
+    }
+    if is_nginx_s_reload(trimmed) {
+        return Some(trimmed.to_string());
     }
     None
 }
@@ -787,6 +849,11 @@ mod tests {
         );
         assert!(normalize_reload_cmd("curl http://evil").is_none());
         assert!(normalize_reload_cmd("nginx -c /tmp/evil.conf").is_none());
+        assert!(normalize_reload_cmd("nginx.exe -s reload").is_some());
+        assert!(normalize_reload_cmd(r"C:\nginx\nginx.exe -s reload").is_some());
+        assert!(normalize_reload_cmd(r#""C:\Program Files\nginx\nginx.exe" -s reload"#).is_some());
+        assert!(normalize_reload_cmd(r"C:\nginx\nginx.exe -s reload && calc").is_none());
+        assert!(normalize_reload_cmd(r"C:\nginx\nginx.exe -c evil.conf").is_none());
     }
 
     #[test]

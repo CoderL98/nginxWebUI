@@ -44,8 +44,9 @@ jobs:
       - name: Build
         run: pnpm run build
 
-  # Release/CI artifacts for /agent/download layout: agents/linux-x86_64 and
-  # agents/linux-aarch64. Windows is not a supported managed nginx node.
+  # Release/CI artifacts for /agent/download layout: agents/linux-x86_64,
+  # agents/linux-aarch64, and agents/windows-x86_64 (.exe). Windows aarch64 is
+  # not cross-compiled here (no practical mingw target on this runner).
   agents:
     runs-on: ubuntu-latest
     strategy:
@@ -53,9 +54,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             artifact: linux-x86_64
+            bin: nginxwebui-agent
           - target: aarch64-unknown-linux-gnu
             artifact: linux-aarch64
             linker: aarch64-linux-gnu-gcc
+            bin: nginxwebui-agent
+          - target: x86_64-pc-windows-gnu
+            artifact: windows-x86_64
+            linker: x86_64-w64-mingw32-gcc
+            bin: nginxwebui-agent.exe
+            mingw: true
     defaults:
       run:
         working-directory: server
@@ -65,6 +73,10 @@ jobs:
         if: matrix.artifact == 'linux-aarch64'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
         working-directory: .
+      - name: Install mingw linker
+        if: matrix.mingw
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        working-directory: .
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -72,7 +84,8 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --bin nginxwebui-agent
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
       - uses: actions/upload-artifact@v4
         with:
           name: nginxwebui-agent-${{ matrix.artifact }}
-          path: server/target/${{ matrix.target }}/release/nginxwebui-agent
+          path: server/target/${{ matrix.target }}/release/${{ matrix.bin }}
