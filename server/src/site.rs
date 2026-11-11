@@ -54,31 +54,265 @@ fn nginx_path_text(path: &Path) -> String {
     path.display().to_string().replace('\\', "/")
 }
 
-/// If the main nginx.conf has no sites-enabled include, add one so apply() works
-/// on a home-prefix install. Debian's stock file already includes it.
-pub fn ensure_main_includes_sites(db: &Db) -> Result<(), String> {
-    let conf_path = nginx::nginx_path(db);
-    if !conf_path.exists() {
-        return Ok(());
+/// Outcome of ensuring `include …/sites-enabled/*.conf;` is present in nginx.conf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SitesIncludeOutcome {
+    AlreadyPresent,
+    Written,
+    NeedsConfirm {
+        include_line: String,
+        preview: String,
+        reason: String,
+    },
+}
+
+/// Comment-aware scan: ignore `#` outside quotes.
+fn strip_hash_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        if c == b'#' {
+            return &line[..i];
+        }
+        i += 1;
     }
-    let text = crate::privfs::read_to_string(&conf_path).unwrap_or_default();
-    if text.contains("sites-enabled") {
-        return Ok(());
+    line
+}
+
+/// Byte offset just after the `{` of the first real `http` block (`http {`, `http{`, or `http` then `{` on the next line).
+fn find_real_http_block(text: &str) -> Option<usize> {
+    let mut code = String::new();
+    let mut map: Vec<usize> = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let stripped = strip_hash_comment(line);
+        for (i, ch) in stripped.char_indices() {
+            let start = code.len();
+            code.push(ch);
+            for _ in start..code.len() {
+                map.push(offset + i);
+            }
+        }
+        offset += line.len();
     }
+    let lower = code.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"http") {
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if before_ok {
+                let mut j = i + 4;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'{' {
+                    return Some(map[j] + 1);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn text_has_commented_http_block(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            return false;
+        }
+        let body = trimmed.trim_start_matches('#').to_ascii_lowercase();
+        body.contains("http {") || body.contains("http{")
+    })
+}
+
+/// Active `include` directives whose argument mentions `marker`.
+fn has_active_include(text: &str, marker: &str) -> bool {
+    if marker.is_empty() {
+        return false;
+    }
+    let marker_norm = marker.replace('\\', "/");
+    for line in text.split_inclusive('\n') {
+        let code = strip_hash_comment(line);
+        let lower = code.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find("include") {
+            let at = from + rel;
+            let before_ok = at == 0
+                || (!code.as_bytes()[at - 1].is_ascii_alphanumeric()
+                    && code.as_bytes()[at - 1] != b'_');
+            let after = at + "include".len();
+            if before_ok && after <= code.len() {
+                let next = code[after..].chars().next();
+                if next
+                    .map(|c| c.is_whitespace() || c == '\'' || c == '"')
+                    .unwrap_or(false)
+                    && code[after..].replace('\\', "/").contains(&marker_norm)
+                {
+                    return true;
+                }
+            }
+            from = after;
+        }
+    }
+    false
+}
+
+fn sites_include_line(db: &Db) -> String {
     let glob = format!("{}/*.conf", nginx_path_text(&sites_enabled(db)));
-    let include = format!("include {};", glob);
-    let new_text = if let Some(idx) = text.find("http {") {
-        let at = idx + 6;
-        format!("{}    {}\n{}", &text[..at], include, &text[at..])
-    } else {
-        format!(
+    format!("include {};", glob)
+}
+
+enum InsertPlan {
+    AlreadyPresent,
+    Ready(String),
+    NeedsConfirm(SitesIncludeOutcome),
+}
+
+/// Plan how (or whether) to insert the sites-enabled include into `text`.
+pub fn plan_sites_include_text(text: &str, include_line: &str) -> InsertPlanView {
+    match plan_insert(text, include_line) {
+        InsertPlan::AlreadyPresent => InsertPlanView::AlreadyPresent,
+        InsertPlan::Ready(new_text) => InsertPlanView::Ready { new_text },
+        InsertPlan::NeedsConfirm(out) => match out {
+            SitesIncludeOutcome::NeedsConfirm {
+                include_line,
+                preview,
+                reason,
+            } => InsertPlanView::NeedsConfirm {
+                include_line,
+                preview,
+                reason,
+            },
+            other => InsertPlanView::NeedsConfirm {
+                include_line: include_line.to_string(),
+                preview: String::new(),
+                reason: format!("{:?}", other),
+            },
+        },
+    }
+}
+
+/// Public view of [`plan_insert`] used by tests and the confirm API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InsertPlanView {
+    AlreadyPresent,
+    Ready {
+        new_text: String,
+    },
+    NeedsConfirm {
+        include_line: String,
+        preview: String,
+        reason: String,
+    },
+}
+
+fn plan_insert(text: &str, include_line: &str) -> InsertPlan {
+    let arg = include_line
+        .trim()
+        .trim_start_matches("include")
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    let path_marker = if arg.is_empty() { "sites-enabled" } else { arg };
+    if has_active_include(text, path_marker) || has_active_include(text, "sites-enabled") {
+        return InsertPlan::AlreadyPresent;
+    }
+    if let Some(at) = find_real_http_block(text) {
+        let new_text = format!("{}    {}\n{}", &text[..at], include_line, &text[at..]);
+        return InsertPlan::Ready(new_text);
+    }
+    if text_has_commented_http_block(text) {
+        // Preview the whole file that would be written after an explicit confirm:
+        // append a real http block rather than inserting into the comment.
+        let preview = format!(
             "{}\n\nhttp {{\n    include mime.types;\n    {}\n}}\n",
             text.trim_end(),
-            include
-        )
-    };
-    crate::privfs::write(&conf_path, new_text)?;
-    Ok(())
+            include_line
+        );
+        return InsertPlan::NeedsConfirm(SitesIncludeOutcome::NeedsConfirm {
+            include_line: include_line.to_string(),
+            preview,
+            reason: "commentedHttpBlock".into(),
+        });
+    }
+    let new_text = format!(
+        "{}\n\nhttp {{\n    include mime.types;\n    {}\n}}\n",
+        text.trim_end(),
+        include_line
+    );
+    InsertPlan::Ready(new_text)
+}
+
+fn inspect_sites_include_file(db: &Db) -> Result<InsertPlan, String> {
+    let conf_path = nginx::nginx_path(db);
+    if !conf_path.exists() {
+        return Ok(InsertPlan::AlreadyPresent);
+    }
+    let text = crate::privfs::read_to_string(&conf_path).unwrap_or_default();
+    Ok(plan_insert(&text, &sites_include_line(db)))
+}
+
+/// If the main nginx.conf has no sites-enabled include, add one so apply() works
+/// on a home-prefix install. Debian's stock file already includes it.
+///
+/// Insertion is comment-aware: a `# http {` in a comment is not treated as the
+/// real http block. When the only match is commented out, the file is left
+/// unchanged and [`SitesIncludeOutcome::NeedsConfirm`] is returned.
+pub fn ensure_main_includes_sites(db: &Db) -> Result<SitesIncludeOutcome, String> {
+    apply_sites_include(db, false)
+}
+
+/// Apply a planned include. When `confirm` is true, a previously ambiguous
+/// insert (commented-only `http {`) writes the previewed new file.
+pub fn apply_sites_include(db: &Db, confirm: bool) -> Result<SitesIncludeOutcome, String> {
+    let conf_path = nginx::nginx_path(db);
+    match inspect_sites_include_file(db)? {
+        InsertPlan::AlreadyPresent => Ok(SitesIncludeOutcome::AlreadyPresent),
+        InsertPlan::Ready(new_text) => {
+            crate::privfs::write(&conf_path, new_text)?;
+            Ok(SitesIncludeOutcome::Written)
+        }
+        InsertPlan::NeedsConfirm(out) => {
+            if confirm {
+                if let SitesIncludeOutcome::NeedsConfirm { preview, .. } = &out {
+                    crate::privfs::write(&conf_path, preview)?;
+                    return Ok(SitesIncludeOutcome::Written);
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Inspect the main nginx.conf without writing it.
+pub fn peek_sites_include(db: &Db) -> Result<InsertPlanView, String> {
+    let conf_path = nginx::nginx_path(db);
+    if !conf_path.exists() {
+        return Ok(InsertPlanView::AlreadyPresent);
+    }
+    let text = crate::privfs::read_to_string(&conf_path).unwrap_or_default();
+    Ok(plan_sites_include_text(&text, &sites_include_line(db)))
 }
 
 fn path_or(db: &Db, key: &str, fallback: &str) -> PathBuf {
@@ -809,6 +1043,13 @@ pub fn render(db: &Db, site: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+fn require_sites_include(db: &Db, confirm: bool) -> Result<(), String> {
+    match apply_sites_include(db, confirm)? {
+        SitesIncludeOutcome::NeedsConfirm { .. } => Err("needsSitesIncludeConfirm".into()),
+        _ => Ok(()),
+    }
+}
+
 pub fn apply(db: &Db, site: &Value) -> Result<(String, String), String> {
     let domain = safe_domain(&str_of(site, "domain")).ok_or("badDomain")?;
     if bool_of(site, "fromDisk", false) {
@@ -855,7 +1096,7 @@ pub fn apply(db: &Db, site: &Value) -> Result<(String, String), String> {
         }
     }
     let _ = crate::privfs::mkdir_all(&access_log_dir(db));
-    ensure_main_includes_sites(db)?;
+    require_sites_include(db, bool_of(site, "confirmInclude", false))?;
 
     crate::privfs::write(&avail_path, &text)?;
     if !in_place && !enabled_path.exists() {
@@ -905,7 +1146,7 @@ fn keep_existing_site(db: &Db, site: &Value) -> Option<Result<(String, String), 
     if !path.is_file() {
         return None;
     }
-    if let Err(err) = ensure_main_includes_sites(db) {
+    if let Err(err) = require_sites_include(db, bool_of(site, "confirmInclude", false)) {
         return Some(Err(err));
     }
     let (ok, output) = nginx::test_conf(db);
@@ -1137,6 +1378,123 @@ mod tests {
     fn proxy_rejects_injection() {
         assert!(proxy_url("8080; return 200").is_err());
         assert_eq!(proxy_url("8080").unwrap(), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn plans_insert_after_real_http_block() {
+        let text = "events { worker_connections 64; }\nhttp {\n    include mime.types;\n}\n";
+        let include = "include /tmp/sites-enabled/*.conf;";
+        match plan_sites_include_text(text, include) {
+            InsertPlanView::Ready { new_text } => {
+                assert!(new_text.contains(include));
+                let http_at = new_text.find("http {").unwrap();
+                let inc_at = new_text.find(include).unwrap();
+                assert!(inc_at > http_at);
+                assert!(
+                    inc_at < new_text.find("include mime.types").unwrap() + 30
+                        || inc_at < new_text.find("}").unwrap()
+                );
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ignores_http_token_inside_comment() {
+        let text = "# example: http {\nevents { worker_connections 64; }\nhttp {\n    include mime.types;\n}\n";
+        let include = "include /tmp/sites-enabled/*.conf;";
+        match plan_sites_include_text(text, include) {
+            InsertPlanView::Ready { new_text } => {
+                // Must not splice into the leading comment.
+                let first_line = new_text.lines().next().unwrap();
+                assert!(first_line.starts_with("# example"));
+                assert!(!first_line.contains("sites-enabled"));
+                let real = new_text.find("http {").unwrap();
+                // skip the commented one
+                let real = new_text[real + 1..]
+                    .find("http {")
+                    .map(|n| n + real + 1)
+                    .unwrap();
+                assert!(new_text[real..].contains(include));
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commented_only_http_block_needs_confirm_and_does_not_write() {
+        let dir = std::env::temp_dir().join("nginxwebui-test-include-comment");
+        let _ = std::fs::create_dir_all(&dir);
+        let conf = dir.join("nginx.conf");
+        let original = "worker_processes 1;\n# http {\n#     include mime.types;\n# }\n";
+        std::fs::write(&conf, original).unwrap();
+        let mut db = Db::new();
+        db.set_setting("nginxPath", &conf.display().to_string());
+        db.set_setting(
+            "sitesEnabled",
+            &dir.join("sites-enabled").display().to_string(),
+        );
+        match ensure_main_includes_sites(&db).unwrap() {
+            SitesIncludeOutcome::NeedsConfirm {
+                include_line,
+                preview,
+                reason,
+            } => {
+                assert!(include_line.contains("sites-enabled"));
+                assert!(preview.contains("http {"));
+                assert!(preview.contains(&include_line));
+                assert_eq!(reason, "commentedHttpBlock");
+            }
+            other => panic!("expected NeedsConfirm, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), original);
+
+        match apply_sites_include(&db, true).unwrap() {
+            SitesIncludeOutcome::Written => {}
+            other => panic!("expected Written after confirm, got {other:?}"),
+        }
+        let written = std::fs::read_to_string(&conf).unwrap();
+        assert!(written.contains(original.trim_end()));
+        assert!(written.contains("http {"));
+        assert!(written.contains("sites-enabled"));
+        // confirm write should not have mutated the comment into an http block
+        assert!(written
+            .lines()
+            .any(|l| l.trim_start().starts_with("# http {")));
+    }
+
+    #[test]
+    fn existing_include_is_not_duplicated() {
+        let text = "http {\n    include /opt/nginx/sites-enabled/*.conf;\n}\n";
+        let include = "include /opt/nginx/sites-enabled/*.conf;";
+        assert_eq!(
+            plan_sites_include_text(text, include),
+            InsertPlanView::AlreadyPresent
+        );
+        // commented include does not count as present
+        let commented =
+            "# include /opt/nginx/sites-enabled/*.conf;\nhttp {\n    include mime.types;\n}\n";
+        match plan_sites_include_text(commented, include) {
+            InsertPlanView::Ready { new_text } => {
+                assert_eq!(new_text.matches("sites-enabled").count(), 2);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_brace_on_following_line_is_found() {
+        let text = "http\n{\n    include mime.types;\n}\n";
+        let include = "include /tmp/sites-enabled/*.conf;";
+        match plan_sites_include_text(text, include) {
+            InsertPlanView::Ready { new_text } => {
+                assert!(new_text.contains(include));
+                let brace = new_text.find('{').unwrap();
+                let inc = new_text.find(include).unwrap();
+                assert!(inc > brace);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 
     #[test]
