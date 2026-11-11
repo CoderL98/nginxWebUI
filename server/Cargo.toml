@@ -3,7 +3,7 @@ name = "nginxwebui"
 version = "1.0.0"
 edition = "2021"
 description = "nginxWebUI server - Rust rewrite of the Java/Solon backend"
-license = "GPL-3.0"
+license = "MulanPSL-1.0"
 
 [dependencies]
 tiny_http = "0.12"

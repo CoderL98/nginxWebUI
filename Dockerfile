@@ -42,4 +42,8 @@ ENV NGINXWEBUI_PORT=8080 \
 EXPOSE 8080 80 443
 VOLUME ["/home/nginxWebUI", "/etc/nginx/sites-available", "/etc/nginx/sites-enabled", "/etc/nginx/ssl", "/var/www", "/root/.acme.sh", "/var/log/nginx"]
 
+# The image starts nginx (80/443) and acme.sh under /root/.acme.sh.
+# Switching to a non-root USER would break that all-in-one model; leave the
+# process as root inside the container. On the host, publish 8080 only to
+# 127.0.0.1 and put HTTPS in front.
 ENTRYPOINT ["/entrypoint.sh"]

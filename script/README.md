@@ -89,7 +89,7 @@ chmod 755 nginxwebui
 docker compose up -d --build
 ```
 
-- 管理端口 8080（镜像默认 `bind = 0.0.0.0` / `NGINXWEBUI_BIND=0.0.0.0`，否则端口映射失效；公网请加 HTTPS 反代）
+- 管理端口：compose 示例为 `127.0.0.1:8080:8080`；镜像内仍绑定 `0.0.0.0` 否则映射失效。公网请加 HTTPS 反代，不要把面板直接暴露出去。容器以 root 跑是因为要在同一镜像里启动 nginx（80/443）和 `/root/.acme.sh`，没有改成非 root。
 - 容器内 nginx 占用 80/443
 - reload：`nginx -s reload`
 - 数据：`nginxwebui-data` 等 named volume

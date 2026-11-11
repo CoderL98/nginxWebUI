@@ -1,5 +1,7 @@
 # nginxWebUI
 
+[English summary](README.en.md). License: [Mulan PSL v1](LICENSE) (SPDX `MulanPSL-1.0`).
+
 SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调用本机 `nginx` / `acme.sh`，不常驻 Node、不内置 ACME。
 
 工作方式对齐服务器上的 `script/add-static-site.sh`、`add-sub-site.sh`、`issue-cert.sh`、`issue-gcore-cert.sh`：站点文件写到 `sites-available`，证书装到 `/etc/nginx/ssl`。
@@ -56,6 +58,8 @@ script\windows\build-linux.ps1
 
 浏览器打开配置里的端口（默认只监听 `http://127.0.0.1:8080`）。远程访问请在 `nginxwebui.conf` 设 `bind = 0.0.0.0`，**不要把面板裸奔在公网**，公网请经 HTTPS 反向代理。数据、日志、pid 默认在 `{仓库}/.run-home`。
 
+进程日志写在 `{home}/logs/nginxwebui.log`。存活检查请打 `GET /healthz`（不返回是否未初始化）。
+
 第一次启动且还没有管理员时，控制台 / 日志会打印一次性初始化令牌（也可用 `NGINXWEBUI_INIT_TOKEN` 指定）。登录页创建管理员必须填写该令牌和验证码。
 
 ## Docker
@@ -66,7 +70,7 @@ script\windows\build-linux.ps1
 docker compose up -d --build
 ```
 
-管理界面：`http://服务器IP:8080`。数据在 named volume 里。ARM 机器同样 `docker compose build`（本机架构）。
+管理界面默认映射为宿主机 `http://127.0.0.1:8080`（compose 使用 `127.0.0.1:8080:8080`）。公网请加 HTTPS 反代，不要把 8080 直接打到 `0.0.0.0`。数据在 named volume 里。ARM 机器同样 `docker compose build`（本机架构）。
 
 管理宿主机已有 nginx 时见 `docker-compose.yml` 底部注释：`network_mode: host` 且 `NGINXWEBUI_START_NGINX=0`。
 
