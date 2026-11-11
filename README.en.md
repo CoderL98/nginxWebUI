@@ -2,7 +2,7 @@
 
 A small Rust process (no JVM, no separate database server) that hosts a SvelteKit static UI and talks to the machine’s `nginx` and `acme.sh`. Site files go to Debian-style `sites-available` / `sites-enabled`; certificates land in `/etc/nginx/ssl`.
 
-This is a simplified rewrite of the original Java/Solon nginxWebUI. See [DIFF.md](DIFF.md) for what was intentionally left out (SSO, mail alerts, extra DNS plugins). Multi-machine management uses an outbound-agent registry ([docs/remote-registry.md](docs/remote-registry.md)); agents need no inbound ports. Agents need nginx and acme.sh preinstalled; set the panel URL on the Devices page, `trusted_proxies` when behind a reverse proxy, and send `X-Requested-With: nginxwebui` when scripting admin write APIs. `--insecure` was removed. Keep panel and agent on the same version.
+This is a simplified rewrite of the original Java/Solon nginxWebUI. See [DIFF.md](DIFF.md) for what was intentionally left out (SSO, mail alerts, extra DNS plugins). Multi-machine management uses an outbound-agent registry ([docs/remote-registry.md](docs/remote-registry.md)); agents need no inbound ports. Set the panel URL on the Devices page, `trusted_proxies` when behind a reverse proxy, and send `X-Requested-With: nginxwebui` when scripting admin write APIs. `--insecure` was removed; `--tls-ca` and `--tls-fingerprint` are enforced. Optional built-in panel TLS is available via `tls_cert` / `tls_key`. Agents may auto-upgrade from `/agent/download` (verified TLS or loopback http). Devices can install a pinned acme.sh release and manually copy sites; there is no automatic failover. Keep panel and agent on the same version. The repo LICENSE is MulanPSL-1.0; GitHub's license badge may still say Other.
 
 ## Run
 
@@ -20,7 +20,7 @@ script/linux/deploy.sh
 
 The panel UI can run on Windows; nginx paths, reload, and acme.sh still follow Linux conventions and are not installed or managed on Windows itself.
 
-Docker: `docker compose up -d --build`. The compose file publishes the panel as `127.0.0.1:8080:8080`. The image still binds `0.0.0.0` inside the container so the mapping works. The container runs as root because it also starts nginx (80/443) and acme.sh under `/root/.acme.sh`.
+Docker: `docker compose up -d --build`. The compose file publishes the panel as `127.0.0.1:8080:8080`. The image still binds `0.0.0.0` inside the container so the mapping works. The panel process runs as user `nginxwebui` with acme.sh under `/home/nginxWebUI/.acme.sh`. The nginx master that binds 80/443 may still be privileged.
 
 License: [Mulan Permissive Software License, Version 1](LICENSE) (SPDX `MulanPSL-1.0`).
 

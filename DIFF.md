@@ -9,7 +9,7 @@
 
 | 原 Java 能力 | 现状 |
 | --- | --- |
-| 远程集群 / 多机管理（原版 `Remote`、creditKey 互控 / SSH） | 现版是**出站 agent 注册中心**（见 `docs/remote-registry.md`）：被控端不开放入站端口，面板不主动 SSH。不是原版那套互控协议。远程复用本机 API 处理器，覆盖站点、证书（含按设备 DNS 凭据）、日志、配置检查/reload；设置、管理员、备份、导出只在面板本地；被控端需预装 nginx/acme.sh |
+| 远程集群 / 多机管理（原版 `Remote`、creditKey 互控 / SSH） | 现版是**出站 agent 注册中心**（见 `docs/remote-registry.md`）：被控端不开放入站端口，面板不主动 SSH。不是原版那套互控协议。远程复用本机 API 处理器，覆盖站点、证书（含按设备 DNS 凭据）、日志、配置检查/reload；设置、管理员、备份、导出只在面板本地；远程也可确认安装 nginx 与钉死版本的 acme.sh；设备页支持手动复制站点（不是自动故障转移） |
 | SSO（`SSOController`） | 无 |
 | 邮件告警（nginx 宕机、上游节点 telnet 探测） | 无 |
 | 检查新版本并提示升级 | 无 |
@@ -89,7 +89,7 @@
 
 ## 现版多出来的（原版没有或很弱）
 
-- 本机没有 nginx / acme.sh 时一键安装（Debian/Ubuntu/RHEL 包 + 官方 acme.sh 脚本），可关自动安装。
+- 本机或远程设备没有 nginx / acme.sh 时一键安装（Debian/Ubuntu/RHEL 包 + 钉死版本的 acme.sh，见 `script/acme.sh.pin`），可关自动安装。
 - 兼容已有 nginx、旧 Java 数据目录里的 acme/证书、certbot、sites-available。
 - Gcore DNS 签发（对齐 `script/issue-gcore-cert.sh`）。
 - 申请证书实时输出。

@@ -2,10 +2,23 @@
 
 ## Unreleased
 
+### Remaining hardening
+
+- A revoked device can be re-joined: "重新接入" issues a new one-time token, clears revoked state, and does not require deleting the row.
+- Agent `--tls-ca` and `--tls-fingerprint` (SHA-256 of the leaf cert, hex with optional colons) are enforced. `--insecure` stays removed.
+- Optional built-in panel HTTPS via `tls_cert` / `tls_key` (config, env, or `--tls-cert` / `--tls-key`). Secure cookies are enabled automatically; a reverse proxy is still the usual production choice.
+- Remote nodes can install nginx and a pinned acme.sh (confirm / `autoInstall` default off). The pin is `script/acme.sh.pin` (currently acme.sh 3.1.6); hash is verified before extract. Docker uses the same pin.
+- `/agent/download` serves `agents/{os}-{arch}/nginxwebui-agent` with a same-arch fallback. CI and packaging can ship linux-x86_64 and linux-aarch64 agents. Windows is not a managed nginx node.
+- Agents may auto-upgrade from the panel after hello (verified TLS or loopback http; disable with `--no-upgrade` / `NGINXWEBUI_AGENT_NO_UPGRADE`). Hash mismatches are refused.
+- Devices page can manually copy selected sites (and linked cert records / local DNS creds) to other nodes. Not automatic failover.
+- Docker: panel runs as `nginxwebui`; acme home is `/home/nginxWebUI/.acme.sh`. nginx may still bind 80/443 as root.
+- Repo LICENSE remains MulanPSL-1.0; GitHub's web license field may still show Other.
+
+
 ### Remote agents (v2 hardening)
 
 - Remote RPC now runs the same API handlers as the local panel (`{query, body}` params). Fixes remote `site/apply` by id wiping the row, partial saves dropping fields, and `conf/check` showing failure. Legacy agent replies (`{ok}`) are normalized.
-- Remote mapping covers sites (incl. save/del/findCert), certs (list/scan/save/del/apply/renew/cron), per-device DNS credentials (`cert/dns`, write-only), log names/tail, nginx status/test/reload/signal, `install/status` (read-only). Panel settings, admins, devices, export and backups always stay local; other areas return `notSupportedOnNode`.
+- Remote mapping covers sites (incl. save/del/findCert), certs (list/scan/save/del/apply/renew/cron), per-device DNS credentials (`cert/dns`, write-only), log names/tail, nginx status/test/reload/signal, `install/status`, and remote nginx/acme.sh install (`install.nginx` / `install.acme` / `install.auto`). Panel settings, admins, devices, export and backups always stay local; other areas return `notSupportedOnNode`.
 - Agents seed nginx paths like the panel, adopt existing sites/certs, run the acme renewal cron, and print effective paths.
 - Offline nodes fail fast with `nodeOfflineErr`; only mutating RPCs are written to the operate log.
 - One waiter per node: a newer poll supersedes the older one, timed-out polls are cleaned up, and a shared credential is flagged as a conflict.

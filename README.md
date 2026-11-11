@@ -1,6 +1,6 @@
 # nginxWebUI
 
-[English summary](README.en.md). License: [Mulan PSL v1](LICENSE) (SPDX `MulanPSL-1.0`).
+[English summary](README.en.md). License: [Mulan PSL v1](LICENSE) (SPDX `MulanPSL-1.0`)。GitHub 网页上的 License 标识可能仍显示 Other，这是平台分类限制，以仓库 LICENSE 为准。
 
 SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调用本机 `nginx` / `acme.sh`，不常驻 Node、不内置 ACME。
 
@@ -16,7 +16,7 @@ SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调�
 | 静态站 / 反代 / 路径规则 | 有（表单对齐原项目；文件写 Debian sites-available，nginx -t 失败回滚） |
 | 静态站 zip 上传 | 有（解压到 /var/www；条目/单文件/合计未压缩大小受限，拒绝 zip-slip） |
 | 证书签发续签 | 有（本机 acme.sh，Cloudflare / Gcore DNS） |
-| nginx / acme.sh 缺失时安装 | 有（默认关闭自动安装；需在设置页二次确认。Linux 包管理器 + 官方 acme.sh 安装脚本） |
+| nginx / acme.sh 缺失时安装 | 有（默认关闭自动安装；需在设置页二次确认。Linux 包管理器 + 钉死版本的 acme.sh，见 `script/acme.sh.pin`；远程设备同样可装） |
 | nginx -t / reload / 启停 | 有（本机 nginx / systemctl） |
 | 日志尾部 | 有 |
 | SQLite | 有（进程内 rusqlite，无独立数据库服务） |
@@ -31,9 +31,11 @@ SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调�
 
 要点（详见文档）：
 
-- 被控端需预装 nginx 与 acme.sh；远程 DNS 凭据按设备保存；agent 自带证书续签。
-- 在「设备」页设置面板地址；安装脚本以 root 安装为 systemd 服务，拒绝非回环 `http://`（`NGINXWEBUI_ALLOW_HTTP=1` 可放行）；`--insecure` 已移除。
-- 面板在反代后面时设置 `trusted_proxies`（默认不信任转发头）；设备多时调大 `agent_threads`。
+- 远程 DNS 凭据按设备保存；agent 自带证书续签。选中远程设备后可在设置页确认安装 nginx / 钉死版本的 acme.sh。
+- 在「设备」页设置面板地址；安装脚本以 root 安装为 systemd 服务，拒绝非回环 `http://`（`NGINXWEBUI_ALLOW_HTTP=1` 可放行）；`--insecure` 已移除。`--tls-ca` / `--tls-fingerprint` 会实际校验。
+- 面板可选内置 HTTPS（`tls_cert` / `tls_key`）；生产环境通常仍建议反代。在反代后面时设置 `trusted_proxies`（默认不信任转发头）；设备多时调大 `agent_threads`。
+- `/agent/download` 按 `agents/{os}-{arch}/` 提供多架构二进制；agent 默认可从面板自动升级（已校验 HTTPS 或回环 http，可 `--no-upgrade` 关闭）。
+- 设备页可手动把站点复制到其它节点，不是自动故障转移。撤销后可「重新接入」，不必删设备。
 - 自写脚本调用后台写接口需带请求头 `X-Requested-With: nginxwebui`。
 - 设备凭证不进导出 / 备份；面板与 agent 请保持同一版本。
 
@@ -71,7 +73,7 @@ script\windows\build-linux.ps1
 
 产物在 `dist/linux-x86_64/nginxwebui`。ARM 用 `-Target aarch64-unknown-linux-musl`。说明见 `script/README.md`。
 
-浏览器打开配置里的端口（默认只监听 `http://127.0.0.1:8080`）。远程访问请在 `nginxwebui.conf` 设 `bind = 0.0.0.0`，**不要把面板裸奔在公网**，公网请经 HTTPS 反向代理。数据、日志、pid 默认在 `{仓库}/.run-home`。
+浏览器打开配置里的端口（默认只监听 `http://127.0.0.1:8080`）。远程访问请在 `nginxwebui.conf` 设 `bind = 0.0.0.0`，**不要把面板裸奔在公网**，公网请经 HTTPS 反向代理（也可设置 `tls_cert` / `tls_key` 启用内置 HTTPS）。数据、日志、pid 默认在 `{仓库}/.run-home`。
 
 进程日志写在 `{home}/logs/nginxwebui.log`。存活检查请打 `GET /healthz`（不返回是否未初始化）。
 
@@ -79,7 +81,7 @@ script\windows\build-linux.ps1
 
 ## Docker
 
-容器内已装 nginx + acme.sh。镜像和 compose **必须**把管理面板绑到 `0.0.0.0`（`bind = 0.0.0.0` / `NGINXWEBUI_BIND=0.0.0.0`），否则端口映射会失效；同时监听 80/443。公网请在前面加 HTTPS 反代。reload 用 `nginx -s reload`。
+容器内已装 nginx + 钉死版本的 acme.sh。镜像和 compose **必须**把管理面板绑到 `0.0.0.0`（`bind = 0.0.0.0` / `NGINXWEBUI_BIND=0.0.0.0`），否则端口映射会失效；同时监听 80/443。公网请在前面加 HTTPS 反代。面板进程以 `nginxwebui` 用户运行，acme 家目录在 `/home/nginxWebUI/.acme.sh`；监听 80/443 的 nginx 主进程仍可能是特权进程。reload 默认 `nginx -s reload`，权限不足时走 `nginxwebui-priv`。
 
 ```bash
 docker compose up -d --build
