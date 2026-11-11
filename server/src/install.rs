@@ -20,7 +20,7 @@ ssl_session_tickets off;
 pub fn auto_install_enabled(db: &Db) -> bool {
     let v = db.setting("autoInstall");
     if v.is_empty() {
-        true
+        false
     } else {
         v != "false" && v != "0"
     }
@@ -377,5 +377,16 @@ mod tests {
     fn quotes_paths_for_shell() {
         assert_eq!(sh_single("/root/.acme.sh"), "'/root/.acme.sh'");
         assert_eq!(sh_single("a'b"), "'a'\"'\"'b'");
+    }
+
+    #[test]
+    fn auto_install_defaults_to_false() {
+        let db = crate::store::Db::new();
+        assert!(!auto_install_enabled(&db));
+        let mut db = crate::store::Db::new();
+        db.set_setting("autoInstall", "true");
+        assert!(auto_install_enabled(&db));
+        db.set_setting("autoInstall", "false");
+        assert!(!auto_install_enabled(&db));
     }
 }
