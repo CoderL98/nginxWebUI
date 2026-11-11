@@ -2,7 +2,7 @@
   import '../app.css';
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
-  import { api, onUnauthorized } from '$lib/api';
+  import { api, onUnauthorized, getCurrentNode, setCurrentNode } from '$lib/api';
   import { tt, toggleLang } from '$lib/i18n';
   import Login from '$lib/Login.svelte';
   import { Button } from '$lib/components/ui/button/index.js';
@@ -15,6 +15,8 @@
   let adminName = $state('');
   let version = $state('');
   let menuOpen = $state(false);
+  let nodes = $state([{ id: 'local', name: 'local' }]);
+  let nodeId = $state(getCurrentNode());
 
   const menu = [
     { href: '/', key: 'dash' },
@@ -25,6 +27,7 @@
     { href: '/log', key: 'log' },
     { href: '/password', key: 'password' },
     { href: '/admins', key: 'admins' },
+    { href: '/nodes', key: 'nodes' },
     { href: '/deny-allow', key: 'denyAllow' },
     { href: '/bak', key: 'bak' },
     { href: '/about', key: 'settings' }
@@ -38,6 +41,19 @@
       needInit = !!info.needInit;
       adminName = info.name || '';
       version = info.version || '';
+      if (signedIn) {
+        try {
+          const nr = await api.node.list();
+          const list = Array.isArray(nr.obj) ? nr.obj : [];
+          nodes = list.length ? list : [{ id: 'local', name: 'local', kind: 'local' }];
+          if (!nodes.some((n) => n.id === nodeId)) {
+            nodeId = 'local';
+            setCurrentNode('local');
+          }
+        } catch {
+          nodes = [{ id: 'local', name: 'local', kind: 'local' }];
+        }
+      }
     } catch {
       signedIn = false;
     }
@@ -75,6 +91,21 @@
       <a href="/" class="text-sm font-semibold">nginxWebUI</a>
       {#if version}<span class="text-muted-foreground text-[11px]">v{version}</span>{/if}
       <div class="flex-1"></div>
+      <label class="text-muted-foreground hidden items-center gap-1 text-xs sm:flex">
+        <span>{$tt('currentNode')}</span>
+        <select
+          class="border-input bg-background h-8 rounded-md border px-2 text-xs"
+          bind:value={nodeId}
+          onchange={() => {
+            setCurrentNode(nodeId);
+            location.reload();
+          }}
+        >
+          {#each nodes as n}
+            <option value={n.id}>{n.name || n.id}{n.kind === 'local' ? '' : n.status ? ` (${n.status})` : ''}</option>
+          {/each}
+        </select>
+      </label>
       <Button variant="ghost" size="sm" onclick={toggleLang}>{$tt('lang')}</Button>
       <span class="text-muted-foreground hidden text-xs sm:inline">{adminName}</span>
       <Button variant="outline" size="sm" onclick={signOut}>{$tt('logout')}</Button>

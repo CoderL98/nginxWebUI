@@ -1,10 +1,32 @@
 /* A thin wrapper over fetch. Every call goes to the Rust server under /adminPage. */
 
 let unauthorized = () => {};
+let currentNode = 'local';
+
+try {
+  if (typeof localStorage !== 'undefined') {
+    currentNode = localStorage.getItem('nginxwebui-node') || 'local';
+  }
+} catch {
+  currentNode = 'local';
+}
 
 /** Called when the server says the session is gone (401 + needLogin). */
 export function onUnauthorized(fn) {
   unauthorized = fn;
+}
+
+export function getCurrentNode() {
+  return currentNode || 'local';
+}
+
+export function setCurrentNode(id) {
+  currentNode = id || 'local';
+  try {
+    localStorage.setItem('nginxwebui-node', currentNode);
+  } catch {
+    /* ignore */
+  }
 }
 
 function query(params) {
@@ -18,8 +40,12 @@ function query(params) {
   return parts.length ? '?' + parts.join('&') : '';
 }
 
-async function call(path, init) {
-  const res = await fetch(path, { credentials: 'same-origin', ...init });
+async function call(path, init = {}) {
+  const headers = { ...(init.headers || {}) };
+  if (currentNode && currentNode !== 'local') {
+    headers['X-NginxWebUI-Node'] = currentNode;
+  }
+  const res = await fetch(path, { credentials: 'same-origin', ...init, headers });
   if (res.status === 401) {
     unauthorized();
     throw new Error('needLogin');
@@ -143,6 +169,13 @@ export const api = {
     operate: () => get('/adminPage/log/operate')
   },
   admin: table('admin'),
+  node: {
+    list: () => get('/adminPage/node/list'),
+    save: (row) => post('/adminPage/node/save', row),
+    token: (id) => post('/adminPage/node/token', { id }),
+    revoke: (id) => post('/adminPage/node/revoke', { id }),
+    remove: (id) => post('/adminPage/node/del', { id })
+  },
   setting: {
     get: (key) => get('/adminPage/setting/get', { key }),
     set: (key, value) => post('/adminPage/setting/set', { key, value })
