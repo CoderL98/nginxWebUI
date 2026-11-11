@@ -18,7 +18,7 @@ sudo script/linux/setup-sudo.sh   # writes nginx as your user; does not grant ap
 script/linux/deploy.sh
 ```
 
-The panel UI can run on Windows; nginx paths, reload, and acme.sh still follow Linux conventions and are not installed or managed on Windows itself.
+The panel UI can run on Windows. A Windows machine can also be a managed agent node: install the nginxwebui-agent Windows service to manage nginx for Windows (paths under the nginx prefix). Certificate issuance uses the pinned acme.sh through Git Bash or WSL. Run the service as an account that can write the nginx directories.
 
 Docker: `docker compose up -d --build`. The compose file publishes the panel as `127.0.0.1:8080:8080`. The image still binds `0.0.0.0` inside the container so the mapping works. The panel process runs as user `nginxwebui` with acme.sh under `/home/nginxWebUI/.acme.sh`. The nginx master that binds 80/443 may still be privileged.
 

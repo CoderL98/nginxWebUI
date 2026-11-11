@@ -63,7 +63,7 @@ Windows：
 script\windows\deploy.ps1
 ```
 
-Windows 上可以启动本面板（界面和 API）。nginx 路径、`nginx -t` / reload、`sites-available` 以及 acme.sh 仍按 Linux 约定（例如 `/etc/nginx`）；本机不会自动安装或管理这些工具。签发证书和写入站点配置请在 Linux 主机或容器中进行。
+Windows 上可以启动本面板（界面和 API），也可以把 Windows 机器作为被控端：安装 `nginxwebui-agent` Windows 服务，管理本机的 Windows 版 nginx（路径按 nginx 前缀下的 `conf\`、`html`、`logs`）。证书签发使用钉死版本的 acme.sh，需安装 Git for Windows（`Git\bin\bash.exe`）或 WSL。请以对 nginx 目录有写权限的账户运行该服务。
 
 在 Windows 上交叉编译 Linux 二进制（musl 静态，不经过 WSL）：
 

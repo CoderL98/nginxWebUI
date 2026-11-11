@@ -83,6 +83,13 @@ trusted_proxies = 127.0.0.1/32, ::1/128
 curl -fsSL https://panel.example/agent/install.sh | sh -s -- --url https://panel.example --token <token>
 ```
 
+Windows（管理员 PowerShell，会安装 Windows 服务）：
+
+```powershell
+irm https://panel.example/agent/install.ps1 -OutFile $env:TEMP\nginxwebui-agent-install.ps1
+powershell -ExecutionPolicy Bypass -File $env:TEMP\nginxwebui-agent-install.ps1 -Url https://panel.example -Token <token>
+```
+
    - 以 root 在 systemd 主机上运行（默认）：安装到 `/usr/local/bin/nginxwebui-agent`，配置在 `/var/lib/nginxwebui-agent`（0700，agent.json 0600），写入并启用 `nginxwebui-agent.service`（`Restart=always`，`UMask=0077`）。默认以 root 运行；可用 `--user NAME` 改为普通用户，此时写配置 / reload 需配好 `nginxwebui-priv`。
    - 非 root 或无 systemd，或加 `--foreground`：下载到当前目录并前台运行。
    - 对非回环的 `http://` 面板，脚本默认拒绝；确需在可信内网使用时设 `NGINXWEBUI_ALLOW_HTTP=1`。
@@ -99,13 +106,19 @@ cd server && cargo build --release --bin nginxwebui-agent
 
 ## Agent 二进制布局与自动升级
 
-`/agent/download?os=&arch=` 优先提供 `agents/{os}-{arch}/nginxwebui-agent`（例如 `agents/linux-x86_64/`、`agents/linux-aarch64/`），没有时再回退到面板同目录、与面板相同架构的 `nginxwebui-agent`。安装脚本会按加入主机的 os/arch 请求。Windows **不是**受支持的被控端（路径和 acme 仍按 Linux 约定）。把其它架构的 agent 拷进 `agents/` 即可由本机面板托管，不必做多架构 Docker 镜像。
+`/agent/download?os=&arch=` 优先提供 `agents/{os}-{arch}/nginxwebui-agent`（例如 `agents/linux-x86_64/`、`agents/linux-aarch64/`），没有时再回退到面板同目录、与面板相同架构的 `nginxwebui-agent`。安装脚本会按加入主机的 os/arch 请求，Windows 提供 `nginxwebui-agent.exe`（`agents/windows-x86_64/`）。把其它架构的 agent 拷进 `agents/` 即可由本机面板托管，不必做多架构 Docker 镜像。Windows 被控端需要 Windows 版 nginx；证书签发通过 Git Bash 或 WSL 运行钉死版本的 acme.sh；请以对 nginx 目录有写权限的账户安装 Windows 服务。自动升级在 Windows 上会先把正在运行的 exe 改名为 `.old` 再写入新文件，服务退出后由 SCM 拉起，下次启动再删除 `.old`。
 
 加入之后，hello 会带上面板侧对应 os/arch 的 agent 版本和 sha256。默认在「已校验的 HTTPS」或「回环 http」时，若版本不同则从同一面板的 `/agent/download` 下载、校验哈希、原子替换二进制并 re-exec（systemd 的 `Restart=always` 也能拉起来）。哈希对不上会拒绝安装。版本已相同则跳过。可用 `--no-upgrade`、`agent.json` 里 `"upgrade": false`，或 `NGINXWEBUI_AGENT_NO_UPGRADE=1` 关闭。**不会**从第三方 URL 下载。
 
-## 手动同步站点
+## 完整同步与同步组
 
-「设备」页可以把选中的站点（以及关联证书记录、本机已有的 DNS 凭据）复制到一个或多个目标节点，有预览和逐台结果。这不是自动故障转移、浮动 IP 或双活集群，请不要当成高可用。源是远程设备时读不到 DNS 密钥（只写不回显），需在目标证书页自行填写。磁盘上的证书文件不会随记录传输。
+「设备」页的手动同步会复制选中站点、关联证书记录、源节点 `sslDir` 下的证书/私钥文件（文件名经过净化，不含路径分隔符），以及本机已有的 DNS 凭据。写入目标后先执行 `nginx -t`，通过才 reload；测试失败时不会让正在运行的残缺配置生效。源是远程设备时也会通过白名单 RPC（`ssl.list` / `ssl.get`）读取证书文件；DNS 密钥仍只写不回显，需在目标证书页自行填写。证书文件内容不会出现在预览、列表接口或操作日志里。
+
+同步组保存在面板的 SQLite 中（不在 agent 上）：
+
+- **双活（active-active）**：任一成员上成功应用站点 / 申请或续签证书 / 完成手动同步后，自动把记录和证书文件同步到其他*在线*成员，并在目标上 `nginx -t` + reload。离线成员会跳过并记入结果。一次同步带有 wave id，避免互相复制形成死循环。
+- **主备（primary-standby）**：只有当前主节点的变更会传到备机（热备）。主节点离线（约 90 秒无心跳；本机始终视为在线）时，自动提升一台健康备机，写入操作日志并在界面显示；也可以手动提升。
+- 负载均衡健康检查（无需登录）：`GET /healthz` 仍只表示面板进程存活。`GET /healthz/group/{id}`（指本机成员）和 `GET /healthz/group/{id}/node/{nodeId}` 仅在该成员**应当接流量**时返回 200（双活：成员在线；主备：该成员是当前主且在线），否则 503，组不存在则 404。请把 nginx / HAProxy / 外部 LB 的后端探活指向这些地址。可选的 advertise IP 仅供展示/文档，本面板**不会**配置或漂移浮动 IP、VRRP 或 ARP。
 
 ## acme.sh 固定版本
 
@@ -115,8 +128,8 @@ cd server && cargo build --release --bin nginxwebui-agent
 
 ## 限制
 
-- Agent 面向 Linux；Windows 可编译面板，但不作为被控端交付（nginx / acme 仍按 Linux 约定）。
-- 不提供自动故障转移、浮动 IP 或双活集群；设备页仅支持手动复制站点。
+- Agent 同时支持 Linux 与 Windows 被控端。Windows 需要 Windows 版 nginx；acme.sh 通过 Git Bash 或 WSL 运行（找不到 bash 时安装/状态会明确提示）。面板仍可在 Windows 上运行。
+- 同步组可自动同步配置和证书文件，并为主备提供自动提升与 LB 健康检查；**不会**移动虚拟 IP / 做 VRRP。
 - `--insecure` 不会恢复。未配置 `tls_cert` / `tls_key` 时面板仍是 HTTP（默认 `127.0.0.1`）；多机生产环境通常仍建议 HTTPS 反代。
 - Docker：面板进程以 `nginxwebui` 用户运行，acme 家目录在 `/home/nginxWebUI/.acme.sh`。监听 80/443 的 nginx 主进程仍可能是特权进程。
 - 仓库根目录 `LICENSE` 是木兰宽松许可证第 1 版（SPDX `MulanPSL-1.0`）。GitHub 网页上的 License 字段可能仍显示 Other / NOASSERTION，因为 GitHub 常用许可证列表往往不含木兰，不要为此改成一个不真实的 license key。

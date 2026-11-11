@@ -56,7 +56,7 @@ script\windows\stop.ps1
 
 或双击 / cmd：`deploy.cmd`、`start.cmd`、`restart.cmd`、`stop.cmd`。
 
-面板（界面和 API）可以在 Windows 上运行；nginx / acme.sh 的路径和操作仍按 Linux 约定，不会在 Windows 上自动安装或管理它们。
+面板（界面和 API）可以在 Windows 上运行。Windows 也可以作为被控端：用 `/agent/install.ps1` 安装 `nginxwebui-agent` Windows 服务，管理本机的 Windows 版 nginx。证书签发需要 Git Bash 或 WSL 运行钉死版本的 acme.sh。
 
 ## 在 Windows 上编 Linux 二进制
 

@@ -104,6 +104,6 @@ if (Test-Path $builtAgent) {
     Copy-Item -Force $builtAgent (Join-Path $slot 'nginxwebui-agent')
     Write-Host "agent 产物: $destAgent"
     Write-Host "多架构目录: $slot\nginxwebui-agent（拷到面板 exe 旁的 agents/linux-$arch/）"
-    Write-Host "Windows 不是受支持的被控端（nginx/acme 仍按 Linux 约定）。"
+    Write-Host "此脚本交叉编译 Linux 面板/agent。Windows 被控端请用面板提供的 /agent/install.ps1（需要 Windows 版 nginx，证书签发需要 Git Bash 或 WSL）。"
 }
 Write-Host "拷到服务器后: chmod 755 nginxwebui nginxwebui-agent && ./nginxwebui"

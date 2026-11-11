@@ -9,7 +9,7 @@
 
 | 原 Java 能力 | 现状 |
 | --- | --- |
-| 远程集群 / 多机管理（原版 `Remote`、creditKey 互控 / SSH） | 现版是**出站 agent 注册中心**（见 `docs/remote-registry.md`）：被控端不开放入站端口，面板不主动 SSH。不是原版那套互控协议。远程复用本机 API 处理器，覆盖站点、证书（含按设备 DNS 凭据）、日志、配置检查/reload；设置、管理员、备份、导出只在面板本地；远程也可确认安装 nginx 与钉死版本的 acme.sh；设备页支持手动复制站点（不是自动故障转移） |
+| 远程集群 / 多机管理（原版 `Remote`、creditKey 互控 / SSH） | 现版是**出站 agent 注册中心**（见 `docs/remote-registry.md`）：被控端不开放入站端口，面板不主动 SSH。不是原版那套互控协议。远程复用本机 API 处理器，覆盖站点、证书（含按设备 DNS 凭据）、日志、配置检查/reload；设置、管理员、备份、导出只在面板本地；远程也可确认安装 nginx 与钉死版本的 acme.sh；设备页支持完整同步（含证书文件与 nginx -t/reload）和同步组（双活 / 主备自动提升，不移动浮动 IP） |
 | SSO（`SSOController`） | 无 |
 | 邮件告警（nginx 宕机、上游节点 telnet 探测） | 无 |
 | 检查新版本并提示升级 | 无 |
@@ -79,7 +79,7 @@
 | 数据库 | H2 文件，可选外部 SQL | rusqlite，无独立数据库进程 |
 | 定时任务 | Solon `@Scheduled` | 证书 cron 线程 + 本机 acme.sh（远程 agent 各自跑） |
 | Docker | Java jar + 外部 nginx 常见 | 镜像内 nginx + acme.sh + webui |
-| Windows | 可跑 Java | 可跑 webui；nginx/acme 仍按 Linux 本机约定，交叉编译出 Linux musl 包 |
+| Windows | 可跑 Java | 可跑面板，也可作为被控端（Windows 版 nginx + Git Bash/WSL 跑 acme.sh）；仍可交叉编译 Linux musl 包 |
 
 ### 登录与安全
 
@@ -102,4 +102,4 @@
 - 库里的证书 DNS 密钥（阿里云等）；Cloudflare Token / Gcore 请在设置页重填，或继续用 `~/.acme.sh/account.conf`。
 - 把 `--project.home` / `NGINXWEBUI_HOME` 指到旧数据目录，只会收养**磁盘文件**（`.acme.sh`、`cert/`、上传的 pem）。
 
-日常管本机站点、证书、reload，用现版即可。多台机器可用出站 agent 注册中心统一管理站点、证书与 reload（不是原版互控集群，无配置同步 / 故障转移）。需要 SSO、邮件告警或阿里云等 DNS 插件时，现版覆盖不了。
+日常管本机站点、证书、reload，用现版即可。多台机器可用出站 agent 注册中心统一管理站点、证书与 reload，并用同步组做配置/证书同步和主备提升（不是原版互控集群，也不会漂移浮动 IP）。需要 SSO、邮件告警或阿里云等 DNS 插件时，现版覆盖不了。

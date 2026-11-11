@@ -2,15 +2,22 @@
 
 ## Unreleased
 
+### Sync groups, complete sync, and Windows agents
+
+- Complete sync includes certificate files and `nginx -t` + reload.
+- Sync groups: active-active and primary-standby (auto-promote, healthz, loop guard).
+- Windows is a first-class managed agent node (`install.ps1`, Windows Service, prefix paths, Git Bash/WSL for acme.sh).
+
 ### Remaining hardening
 
 - A revoked device can be re-joined: "重新接入" issues a new one-time token, clears revoked state, and does not require deleting the row.
 - Agent `--tls-ca` and `--tls-fingerprint` (SHA-256 of the leaf cert, hex with optional colons) are enforced. `--insecure` stays removed.
 - Optional built-in panel HTTPS via `tls_cert` / `tls_key` (config, env, or `--tls-cert` / `--tls-key`). Secure cookies are enabled automatically; a reverse proxy is still the usual production choice.
 - Remote nodes can install nginx and a pinned acme.sh (confirm / `autoInstall` default off). The pin is `script/acme.sh.pin` (currently acme.sh 3.1.6); hash is verified before extract. Docker uses the same pin.
-- `/agent/download` serves `agents/{os}-{arch}/nginxwebui-agent` with a same-arch fallback. CI and packaging can ship linux-x86_64 and linux-aarch64 agents. Windows is not a managed nginx node.
-- Agents may auto-upgrade from the panel after hello (verified TLS or loopback http; disable with `--no-upgrade` / `NGINXWEBUI_AGENT_NO_UPGRADE`). Hash mismatches are refused.
-- Devices page can manually copy selected sites (and linked cert records / local DNS creds) to other nodes. Not automatic failover.
+- `/agent/download` serves `agents/{os}-{arch}/nginxwebui-agent` (including `nginxwebui-agent.exe` for `windows-x86_64`) with a same-arch fallback. CI also cross-compiles the Windows agent via mingw.
+- Agents may auto-upgrade from the panel after hello (verified TLS or loopback http; disable with `--no-upgrade` / `NGINXWEBUI_AGENT_NO_UPGRADE`). Hash mismatches are refused. On Windows the running exe is renamed `.old` then replaced; the service/process restarts and `.old` is removed on the next start.
+- Manual sync copies site and cert records, certificate files from `sslDir`, then runs `nginx -t` and reloads only if the test passes. Sync groups support active-active replication and primary-standby auto-promote, plus `/healthz/group/{id}` for load balancers. Floating IPs are not moved.
+- Windows is a supported managed agent: `nginx.exe` path defaults under the nginx prefix, `/agent/install.ps1` installs a Windows Service, and acme.sh runs through Git Bash or WSL.
 - Docker: panel runs as `nginxwebui`; acme home is `/home/nginxWebUI/.acme.sh`. nginx may still bind 80/443 as root.
 - Repo LICENSE remains MulanPSL-1.0; GitHub's web license field may still show Other.
 
