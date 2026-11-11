@@ -5,6 +5,18 @@ edition = "2021"
 description = "nginxWebUI server - Rust rewrite of the Java/Solon backend"
 license = "MulanPSL-1.0"
 
+[lib]
+name = "nginxwebui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nginxwebui"
+path = "src/main.rs"
+
+[[bin]]
+name = "nginxwebui-agent"
+path = "src/bin/nginxwebui-agent.rs"
+
 [dependencies]
 tiny_http = "0.12"
 serde = { version = "1", features = ["derive"] }
@@ -17,6 +29,8 @@ getrandom = "0.2"
 subtle = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+ureq = { version = "2.12", features = ["json"] }
 
 [profile.release]
 opt-level = "z"

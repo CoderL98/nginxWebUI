@@ -20,6 +20,9 @@ pub struct Ctx {
     pub limits: Mutex<RateLimiter>,
     pub init_token: Mutex<Option<String>>,
     pub secure_cookie: bool,
+    pub hub: crate::registry::Hub,
+    pub agent_pool: std::sync::Arc<crate::registry::AgentPool>,
+    pub exe_dir: PathBuf,
 }
 
 pub struct Req {
@@ -31,6 +34,9 @@ pub struct Req {
     pub content_type: String,
     pub remote_ip: String,
     pub secure_cookie: bool,
+    pub node: String,
+    pub authorization: String,
+    pub panel_base: String,
 }
 
 pub struct Reply {
@@ -41,7 +47,7 @@ pub struct Reply {
     pub extra_headers: Vec<(String, String)>,
 }
 
-fn json_reply(status: u16, value: &Value) -> Reply {
+pub(crate) fn json_reply(status: u16, value: &Value) -> Reply {
     Reply {
         status,
         content_type: "application/json; charset=utf-8".to_string(),
@@ -137,6 +143,17 @@ pub fn record_system_operate(
     record_operate(store, "system", action, target, ok, detail);
 }
 
+pub fn record_user_operate(
+    store: &mut Store,
+    who: &str,
+    action: &str,
+    target: &str,
+    ok: bool,
+    detail: &str,
+) {
+    record_operate(store, who, action, target, ok, detail);
+}
+
 fn record_operate(
     store: &mut Store,
     who: &str,
@@ -211,6 +228,17 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
         sessions.touch(&token);
     }
 
+    let selected = req.node.trim();
+    if !selected.is_empty() && selected != "local" {
+        if crate::rpc::stays_on_panel(kind, action) {
+            // panel-local administration
+        } else if let Some((method, params)) = crate::rpc::map_admin(kind, action, req) {
+            return crate::registry::proxy(ctx, req, selected, &method, params);
+        } else {
+            return fail("notSupportedOnNode");
+        }
+    }
+
     match (kind, action) {
         ("main", "monitor") => monitor(ctx),
         ("login", _) => login(ctx, action, req),
@@ -228,8 +256,119 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
         ("cert", _) => cert(ctx, action, req),
         ("www", _) => www(ctx, action, req),
         ("install", _) => install(ctx, action, req),
+        ("node", _) => node_admin(ctx, action, req),
         _ => simple_table(ctx, kind, action, req),
     }
+}
+
+fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
+    match action {
+        "list" | "status" => {
+            let store = ctx.store.lock().unwrap();
+            let mut list = vec![crate::registry::local_node()];
+            for row in store.db.rows("node") {
+                list.push(crate::registry::public_node(row, &ctx.hub));
+            }
+            ok(Value::Array(list))
+        }
+        "save" => {
+            let body = body(req);
+            let name = field(&body, "name");
+            let id = field(&body, "id");
+            let mut store = ctx.store.lock().unwrap();
+            let result = if id.is_empty() {
+                crate::registry::create_node(&mut store.db, &name).and_then(|row| {
+                    let nid = crate::store::str_of(&row, "id");
+                    let (token, expires) = crate::registry::issue_join_token(&mut store.db, &nid)?;
+                    Ok((row, Some((token, expires))))
+                })
+            } else {
+                crate::registry::rename_node(&mut store.db, &id, &name).map(|row| (row, None))
+            };
+            match result {
+                Ok((row, issued)) => {
+                    record_operate(
+                        &mut store,
+                        &actor(ctx, req),
+                        "node.save",
+                        &crate::store::str_of(&row, "id"),
+                        true,
+                        &crate::store::str_of(&row, "name"),
+                    );
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
+                    let mut obj = crate::registry::public_node(&row, &ctx.hub);
+                    if let Some((token, expires)) = issued {
+                        if let Value::Object(map) = &mut obj {
+                            map.insert("token".into(), token.clone().into());
+                            map.insert("expires".into(), expires.to_string().into());
+                            map.insert(
+                                "installCommand".into(),
+                                install_command(&req.panel_base, &token).into(),
+                            );
+                        }
+                    }
+                    ok(obj)
+                }
+                Err(err) => fail(&err),
+            }
+        }
+        "token" => {
+            let id = field(&body(req), "id");
+            let mut store = ctx.store.lock().unwrap();
+            match crate::registry::issue_join_token(&mut store.db, &id) {
+                Ok((token, expires)) => {
+                    record_operate(&mut store, &actor(ctx, req), "node.token", &id, true, "");
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
+                    ok(json!({
+                        "id": id,
+                        "token": token,
+                        "expires": expires.to_string(),
+                        "installCommand": install_command(&req.panel_base, &token),
+                    }))
+                }
+                Err(err) => fail(&err),
+            }
+        }
+        "del" | "revoke" => {
+            let id = field(&body(req), "id");
+            if id.is_empty() || id == "local" {
+                return fail("badRequest");
+            }
+            let mut store = ctx.store.lock().unwrap();
+            if let Err(err) = crate::registry::revoke_node(&mut store.db, &ctx.hub, &id) {
+                return fail(&err);
+            }
+            if action == "del" {
+                store.db.delete("node", &id);
+            }
+            record_operate(
+                &mut store,
+                &actor(ctx, req),
+                &format!("node.{action}"),
+                &id,
+                true,
+                "",
+            );
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
+            ok_empty()
+        }
+        _ => fail("not found"),
+    }
+}
+
+fn install_command(panel_base: &str, token: &str) -> String {
+    let base = if panel_base.is_empty() {
+        "https://panel.example".to_string()
+    } else {
+        panel_base.trim_end_matches('/').to_string()
+    };
+    format!("curl -fsSL {base}/agent/install.sh | sh -s -- --url {base} --token {token}")
 }
 
 // --------------------------------------------------------------------- login
@@ -1104,6 +1243,11 @@ fn export(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     continue; // passwords are never exported
                 }
                 let mut cloned = rows.clone();
+                if name == "node" {
+                    for row in &mut cloned {
+                        crate::registry::strip_secrets(row);
+                    }
+                }
                 if name == "cert" {
                     for row in &mut cloned {
                         crate::secrets::strip_object_secrets(row, crate::secrets::SECRET_CERT_KEYS);
@@ -2379,12 +2523,15 @@ mod tests {
         let store = Store::open(&dir);
         Arc::new(Ctx {
             home: dir.clone(),
-            web_dir: dir,
+            web_dir: dir.clone(),
             store: Mutex::new(store),
             sessions: Mutex::new(Sessions::default()),
             limits: Mutex::new(RateLimiter::default()),
             init_token: Mutex::new(Some("init-secret".into())),
             secure_cookie: false,
+            hub: crate::registry::Hub::new(),
+            agent_pool: crate::registry::AgentPool::new(2),
+            exe_dir: dir,
         })
     }
 
@@ -2402,6 +2549,9 @@ mod tests {
             content_type: "application/json".into(),
             remote_ip: "127.0.0.1".into(),
             secure_cookie: false,
+            node: String::new(),
+            authorization: String::new(),
+            panel_base: String::new(),
         }
     }
 
@@ -2568,6 +2718,45 @@ mod tests {
         let row = ctx.store.lock().unwrap().db.get("admin", "9").unwrap();
         assert_eq!(row["name"], "keep-renamed");
         assert_eq!(row["pass"], "hashed-old");
+    }
+
+    #[test]
+    fn local_site_list_ignores_missing_node_header() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let reply = handle(&ctx, &test_req("/adminPage/site/list", json!({}), &token));
+        assert_eq!(body_of(&reply)["success"], true);
+    }
+
+    #[test]
+    fn remote_unknown_node_fails() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let mut req = test_req("/adminPage/site/list", json!({}), &token);
+        req.node = "missing".into();
+        let reply = handle(&ctx, &req);
+        assert_eq!(body_of(&reply)["success"], false);
+        assert_eq!(body_of(&reply)["msg"], "unknownNode");
+    }
+
+    #[test]
+    fn node_create_token_is_not_listed_again() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let reply = handle(
+            &ctx,
+            &test_req("/adminPage/node/save", json!({ "name": "edge" }), &token),
+        );
+        let body = body_of(&reply);
+        assert_eq!(body["success"], true);
+        assert!(!body["obj"]["token"].as_str().unwrap_or("").is_empty());
+        let id = body["obj"]["id"].as_str().unwrap().to_string();
+        let listed = handle(&ctx, &test_req("/adminPage/node/list", json!({}), &token));
+        let arr = body_of(&listed)["obj"].as_array().cloned().unwrap();
+        let found = arr.iter().find(|n| n["id"] == id).unwrap();
+        assert!(found.get("token").is_none());
+        assert!(found.get("joinTokenHash").is_none());
+        assert!(found.get("credHash").is_none());
     }
 
     #[test]

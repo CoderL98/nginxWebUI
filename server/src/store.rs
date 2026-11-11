@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const TABLES: [&str; 19] = [
+pub const TABLES: [&str; 20] = [
     "basic",
     "http",
     "server",
@@ -31,6 +31,7 @@ pub const TABLES: [&str; 19] = [
     "bak",
     "bakSub",
     "operateLog",
+    "node",
 ];
 
 #[derive(Clone, Default)]
