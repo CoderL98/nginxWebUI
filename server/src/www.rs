@@ -2,9 +2,9 @@
 //! original project's www page. Paths follow `script/` (`/var/www/<domain>`).
 
 use crate::site;
-use crate::store::Db;
 #[cfg(test)]
 use crate::store::str_of;
+use crate::store::Db;
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{Cursor, Read};
@@ -237,7 +237,9 @@ pub fn parse_multipart(body: &[u8], content_type: &str) -> Result<(Value, Vec<u8
             } else if !name.is_empty() {
                 fields.insert(
                     name.into(),
-                    String::from_utf8_lossy(content).trim_end_matches(['\r', '\n']).into(),
+                    String::from_utf8_lossy(content)
+                        .trim_end_matches(['\r', '\n'])
+                        .into(),
                 );
             }
         }
@@ -267,7 +269,12 @@ fn header_filename(header: &str) -> String {
         let lower = line.to_ascii_lowercase();
         if let Some(idx) = lower.find("filename=") {
             let raw = line[idx + 9..].trim().trim_matches('"');
-            return raw.split(';').next().unwrap_or(raw).trim_matches('"').to_string();
+            return raw
+                .split(';')
+                .next()
+                .unwrap_or(raw)
+                .trim_matches('"')
+                .to_string();
         }
     }
     String::new()
@@ -307,7 +314,8 @@ mod tests {
         let mut cursor = Cursor::new(Vec::new());
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
-            let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
             writer.start_file(name, options).unwrap();
             writer.write_all(payload).unwrap();
             writer.finish().unwrap();
@@ -317,7 +325,8 @@ mod tests {
 
     #[test]
     fn unzip_rejects_oversize_file() {
-        let dest = std::env::temp_dir().join(format!("nginxwebui-zip-oversize-{}", std::process::id()));
+        let dest =
+            std::env::temp_dir().join(format!("nginxwebui-zip-oversize-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dest);
         fs::create_dir_all(&dest).unwrap();
         let payload = vec![b'x'; (MAX_ZIP_FILE_BYTES as usize) + 1];

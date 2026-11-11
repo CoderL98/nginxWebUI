@@ -64,7 +64,11 @@ impl Block {
             out.push_str(&self.head);
             out.push_str(" {\n");
         }
-        let inner = if self.head.is_empty() { indent } else { indent + 4 };
+        let inner = if self.head.is_empty() {
+            indent
+        } else {
+            indent + 4
+        };
         for ent in &self.ents {
             match ent {
                 Ent::P(line) => {
@@ -91,7 +95,11 @@ impl Block {
 pub fn safe_name(raw: &str) -> String {
     raw.chars()
         .filter(|c| {
-            !c.is_whitespace() && !matches!(c, '?' | '<' | '>' | '|' | '"' | '#' | '&' | ';' | '\'' | '`' | '*' | '\\')
+            !c.is_whitespace()
+                && !matches!(
+                    c,
+                    '?' | '<' | '>' | '|' | '"' | '#' | '&' | ';' | '\'' | '`' | '*' | '\\'
+                )
         })
         .collect::<String>()
         .replace(':', "-")
@@ -290,7 +298,10 @@ fn server_http_block(db: &Db, server: &Value) -> Block {
     if !password_id.is_empty() {
         if let Some(password) = db.get("password", &password_id) {
             block.p(format!("auth_basic \"{}\"", str_of(&password, "name")));
-            block.p(format!("auth_basic_user_file {}", str_of(&password, "path")));
+            block.p(format!(
+                "auth_basic_user_file {}",
+                str_of(&password, "path")
+            ));
         }
     }
 
@@ -474,7 +485,10 @@ fn server_stream_block(db: &Db, server: &Value) -> Block {
     let upstream_id = str_of(server, "proxyUpstreamId");
     if !upstream_id.is_empty() {
         if let Some(upstream) = db.get("upstream", &upstream_id) {
-            block.p(format!("proxy_pass {}", get_or(&upstream, "name", "upstream")));
+            block.p(format!(
+                "proxy_pass {}",
+                get_or(&upstream, "name", "upstream")
+            ));
         }
     }
 
@@ -545,7 +559,11 @@ pub fn build_conf(db: &Db, decompose: bool) -> ConfExt {
         if name.trim().is_empty() {
             continue;
         }
-        root.p(format!("{} {}", name.trim(), str_of(&basic, "value").trim()));
+        root.p(format!(
+            "{} {}",
+            name.trim(),
+            str_of(&basic, "value").trim()
+        ));
     }
 
     // ---- http
@@ -560,7 +578,11 @@ pub fn build_conf(db: &Db, decompose: bool) -> ConfExt {
         if name.trim().is_empty() {
             continue;
         }
-        http.p(format!("{} {}", name.trim(), str_of(&param, "value").trim()));
+        http.p(format!(
+            "{} {}",
+            name.trim(),
+            str_of(&param, "value").trim()
+        ));
         has_http = true;
     }
 
@@ -580,7 +602,11 @@ pub fn build_conf(db: &Db, decompose: bool) -> ConfExt {
         has_http = true;
         let name = str_of(&upstream, "name");
         if decompose {
-            let file_name = format!("upstream_{}_{}.conf", str_of(&upstream, "id"), safe_name(&name));
+            let file_name = format!(
+                "upstream_{}_{}.conf",
+                str_of(&upstream, "id"),
+                safe_name(&name)
+            );
             let mut single = Block::new("");
             single.b(upstream_block(db, &upstream));
             files.push(ConfFile {
@@ -658,7 +684,11 @@ pub fn build_conf(db: &Db, decompose: bool) -> ConfExt {
         if name.trim().is_empty() {
             continue;
         }
-        stream.p(format!("{} {}", name.trim(), str_of(&param, "value").trim()));
+        stream.p(format!(
+            "{} {}",
+            name.trim(),
+            str_of(&param, "value").trim()
+        ));
         has_stream = true;
     }
 

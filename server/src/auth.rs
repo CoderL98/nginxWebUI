@@ -6,9 +6,9 @@
 //! Session ids, captcha text, and salts come from the OS CSPRNG.
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use rand_core::OsRng;
 use argon2::Argon2;
 use md5::{Digest, Md5};
+use rand_core::OsRng;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
@@ -401,9 +401,7 @@ mod tests {
         assert_ne!(a, b);
         let code = random_code();
         assert_eq!(code.len(), CAPTCHA_LEN);
-        assert!(code
-            .bytes()
-            .all(|c| CAPTCHA_ALPHABET.contains(&c)));
+        assert!(code.bytes().all(|c| CAPTCHA_ALPHABET.contains(&c)));
     }
 
     #[test]

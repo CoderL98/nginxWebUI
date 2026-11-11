@@ -359,7 +359,11 @@ pub fn apply(db: &Db, row: &Value, force: bool) -> (bool, String, Value) {
 
     let ssl = site::ssl_dir(db);
     if let Err(err) = crate::privfs::mkdir_all(&ssl) {
-        return (false, format!("cannot create {}: {}", ssl.display(), err), row.clone());
+        return (
+            false,
+            format!("cannot create {}: {}", ssl.display(), err),
+            row.clone(),
+        );
     }
 
     let (cer, key) = {
@@ -451,7 +455,11 @@ pub fn apply(db: &Db, row: &Value, force: bool) -> (bool, String, Value) {
 
     let stage = acme_home(db).join(".nginxwebui-stage").join(&cert_name);
     if let Err(err) = std::fs::create_dir_all(&stage) {
-        return (false, format!("cannot create {}: {}", stage.display(), err), row.clone());
+        return (
+            false,
+            format!("cannot create {}: {}", stage.display(), err),
+            row.clone(),
+        );
     }
     let stage_cer = stage.join("fullchain.cer");
     let stage_key = stage.join("cert.key");
@@ -482,11 +490,23 @@ pub fn apply(db: &Db, row: &Value, force: bool) -> (bool, String, Value) {
 
     let cer_bytes = match std::fs::read(&stage_cer) {
         Ok(b) => b,
-        Err(err) => return (false, format!("read {}: {}", stage_cer.display(), err), row.clone()),
+        Err(err) => {
+            return (
+                false,
+                format!("read {}: {}", stage_cer.display(), err),
+                row.clone(),
+            )
+        }
     };
     let key_bytes = match std::fs::read(&stage_key) {
         Ok(b) => b,
-        Err(err) => return (false, format!("read {}: {}", stage_key.display(), err), row.clone()),
+        Err(err) => {
+            return (
+                false,
+                format!("read {}: {}", stage_key.display(), err),
+                row.clone(),
+            )
+        }
     };
     if let Err(err) = crate::privfs::write(&cer, &cer_bytes) {
         return (false, format!("install cert: {err}"), row.clone());
@@ -523,12 +543,7 @@ pub fn cron(db: &Db) -> (bool, String) {
         return (false, "acmeNotFound".into());
     }
     let home = acme_home(db).display().to_string();
-    run_acme_env(
-        db,
-        &["--cron".into(), "--home".into(), home],
-        &[],
-        true,
-    )
+    run_acme_env(db, &["--cron".into(), "--home".into(), home], &[], true)
 }
 
 fn parse_env(text: &str) -> Vec<(String, String)> {
@@ -649,10 +664,7 @@ fn run_acme_env(
     for handle in readers {
         let _ = handle.join();
     }
-    let text = collected
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
+    let text = collected.lock().map(|g| g.clone()).unwrap_or_default();
     match status {
         Ok(status) => (status.success(), text),
         Err(err) => {

@@ -20,8 +20,8 @@ pub struct FileValues {
 }
 
 pub fn load(path: &Path) -> Result<FileValues, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| format!("{}: {}", path.display(), err))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|err| format!("{}: {}", path.display(), err))?;
     let base = path
         .parent()
         .map(Path::to_path_buf)
@@ -72,9 +72,10 @@ pub fn parse(text: &str, base: &Path) -> Result<FileValues, String> {
                 values.bind = Some(value);
             }
             "secure_cookie" | "secure.cookie" | "secure_cookies" => {
-                values.secure_cookie = Some(parse_bool(&value).map_err(|_| {
-                    format!("line {}: invalid secure_cookie", index + 1)
-                })?);
+                values.secure_cookie = Some(
+                    parse_bool(&value)
+                        .map_err(|_| format!("line {}: invalid secure_cookie", index + 1))?,
+                );
             }
             "bin" => values.bin = Some(resolve(base, &value)),
             "log" => values.log = Some(resolve(base, &value)),
@@ -202,10 +203,7 @@ reload_cmd = nginx -s reload
         assert_eq!(values.bind.as_deref(), Some("127.0.0.1"));
         assert_eq!(values.secure_cookie, Some(false));
         assert_eq!(values.home.as_deref(), Some(dir.join("data").as_path()));
-        assert_eq!(
-            values.web.as_deref(),
-            Some(dir.join("web/build").as_path())
-        );
+        assert_eq!(values.web.as_deref(), Some(dir.join("web/build").as_path()));
         assert_eq!(values.threads, Some(4));
         assert_eq!(values.reload_cmd.as_deref(), Some("nginx -s reload"));
     }
@@ -230,6 +228,9 @@ reload_cmd = nginx -s reload
             Some(PathBuf::from("/etc/nginxwebui.conf"))
         );
         let args = vec!["-c".into(), "nginxwebui.conf".into()];
-        assert_eq!(cli_config_path(&args), Some(PathBuf::from("nginxwebui.conf")));
+        assert_eq!(
+            cli_config_path(&args),
+            Some(PathBuf::from("nginxwebui.conf"))
+        );
     }
 }

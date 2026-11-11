@@ -61,7 +61,8 @@ fn sudo_output(args: &[&str], stdin_data: Option<&[u8]>) -> Result<String, Strin
     let mut child = cmd.spawn().map_err(|e| format!("sudo: {e}"))?;
     if let Some(data) = stdin_data {
         if let Some(mut sin) = child.stdin.take() {
-            sin.write_all(data).map_err(|e| format!("sudo stdin: {e}"))?;
+            sin.write_all(data)
+                .map_err(|e| format!("sudo stdin: {e}"))?;
         }
     }
     let out = child.wait_with_output().map_err(|e| format!("sudo: {e}"))?;
@@ -150,7 +151,11 @@ pub fn write(path: &Path, data: impl AsRef<[u8]>) -> Result<(), String> {
     }
 }
 
-fn copy_limited<R: Read, W: Write>(reader: &mut R, writer: &mut W, max: u64) -> Result<u64, String> {
+fn copy_limited<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    max: u64,
+) -> Result<u64, String> {
     let mut buf = [0u8; 8192];
     let mut total = 0u64;
     loop {
@@ -261,7 +266,8 @@ pub fn tail(path: &Path, max_bytes: u64) -> Result<String, String> {
             let start = size.saturating_sub(max_bytes);
             let _ = file.seek(SeekFrom::Start(start));
             let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer).map_err(|e| format!("{}: {}", path.display(), e))?;
+            file.read_to_end(&mut buffer)
+                .map_err(|e| format!("{}: {}", path.display(), e))?;
             Ok(String::from_utf8_lossy(&buffer).into_owned())
         }
         Err(err) if denied(&err) => {
@@ -394,7 +400,11 @@ mod tests {
 
     #[test]
     fn hint_mentions_path_and_setup() {
-        let text = hint(Path::new("/etc/nginx/sites-available/x.conf"), "Permission denied (os error 13)", "a password is required");
+        let text = hint(
+            Path::new("/etc/nginx/sites-available/x.conf"),
+            "Permission denied (os error 13)",
+            "a password is required",
+        );
         assert!(text.contains("/etc/nginx/sites-available/x.conf"));
         assert!(text.contains("setup-sudo.sh"));
         assert!(text.contains("Permission denied"));

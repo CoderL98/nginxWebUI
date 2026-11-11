@@ -49,7 +49,8 @@ fn detect_nginx(db: &mut Db) {
         if db.setting("nginxDir").is_empty() && prefix.is_dir() {
             db.set_setting("nginxDir", &prefix.display().to_string());
         }
-        if (db.setting("nginxExe").is_empty() || db.setting("nginxExe") == "nginx") && sbin.is_file()
+        if (db.setting("nginxExe").is_empty() || db.setting("nginxExe") == "nginx")
+            && sbin.is_file()
         {
             db.set_setting("nginxExe", &sbin.display().to_string());
         }
@@ -153,8 +154,18 @@ pub fn cert_pairs(db: &Db, name: &str) -> Vec<CertPair> {
         }
     };
     let ssl = site::ssl_dir(db);
-    push(ssl.join(format!("{name}.cer")), ssl.join(format!("{name}.key")), "sslDir", false);
-    push(ssl.join(format!("{name}.pem")), ssl.join(format!("{name}.key")), "sslDir", false);
+    push(
+        ssl.join(format!("{name}.cer")),
+        ssl.join(format!("{name}.key")),
+        "sslDir",
+        false,
+    );
+    push(
+        ssl.join(format!("{name}.pem")),
+        ssl.join(format!("{name}.key")),
+        "sslDir",
+        false,
+    );
     push(
         ssl.join(name).join("fullchain.pem"),
         ssl.join(name).join("privkey.pem"),
@@ -194,7 +205,12 @@ pub fn cert_pairs(db: &Db, name: &str) -> Vec<CertPair> {
             "nginxWebUI",
             false,
         );
-        push(dir.join("fullchain.cer"), dir.join("private.key"), "nginxWebUI", false);
+        push(
+            dir.join("fullchain.cer"),
+            dir.join("private.key"),
+            "nginxWebUI",
+            false,
+        );
     }
     out
 }
@@ -416,7 +432,10 @@ fn import_certs(db: &mut Db) -> usize {
         row.insert("key".into(), pair.key.display().to_string().into());
         row.insert("kind".into(), kind.into());
         row.insert("source".into(), pair.source.clone().into());
-        row.insert("encryption".into(), if pair.ecc { "ECC" } else { "RSA" }.into());
+        row.insert(
+            "encryption".into(),
+            if pair.ecc { "ECC" } else { "RSA" }.into(),
+        );
         row.insert("imported".into(), true.into());
         db.upsert("cert", Value::Object(row));
         added += 1;
@@ -439,7 +458,12 @@ fn kind_from_acme_dir(pair: &CertPair) -> String {
     } else if text.contains("dns_cf") {
         "dns_cf".into()
     } else if let Some(line) = text.lines().find(|l| l.contains("Le_Webroot")) {
-        let v = line.split('=').nth(1).unwrap_or("").trim().trim_matches('\'');
+        let v = line
+            .split('=')
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .trim_matches('\'');
         if v.starts_with("dns_") {
             v.to_string()
         } else if pair.source == "acme.sh" {
@@ -661,10 +685,7 @@ server {
         let blocks = parse_ssl_blocks(text);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].2, "app.example.com");
-        assert!(blocks[0]
-            .0
-            .to_string_lossy()
-            .ends_with("fullchain.cer"));
+        assert!(blocks[0].0.to_string_lossy().ends_with("fullchain.cer"));
     }
 
     #[test]
