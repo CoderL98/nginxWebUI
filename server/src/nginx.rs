@@ -119,14 +119,13 @@ pub fn backup_main_conf(store: &mut Store) {
     }
 }
 
-/// Write `conf_text` after `nginx -t` on a sibling temp file. When
-/// `require_generated` is set, refuse to replace a foreign main conf.
-pub fn install_main_conf(
-    store: &mut Store,
+/// Run `nginx -t` against a sibling temp file. Does not write the live path.
+pub fn stage_main_conf(
+    db: &Db,
     conf_text: &str,
     require_generated: bool,
-) -> Result<String, String> {
-    let main_path = nginx_path(&store.db);
+) -> Result<(PathBuf, String), String> {
+    let main_path = nginx_path(db);
     let previous = crate::privfs::read_to_string(&main_path).unwrap_or_default();
     if require_generated && !can_overwrite_conf(&previous) {
         return Err("refuseOverwriteNginxConf".into());
@@ -136,19 +135,37 @@ pub fn install_main_conf(
     }
     let temp = temp_conf_path(&main_path);
     crate::privfs::write(&temp, conf_text)?;
-    let (ok, output) = test_conf_file(&store.db, &temp);
+    let (ok, output) = test_conf_file(db, &temp);
     if !ok {
         let _ = crate::privfs::remove_file(&temp);
         return Err(format!("nginx -t failed\n{output}"));
     }
+    Ok((temp, output))
+}
+
+pub fn commit_staged_conf(store: &mut Store, conf_text: &str, temp: &Path) -> Result<(), String> {
+    let main_path = nginx_path(&store.db);
+    let previous = crate::privfs::read_to_string(&main_path).unwrap_or_default();
     if !previous.trim().is_empty() {
         backup_main_conf(store);
     }
     if let Err(err) = crate::privfs::write(&main_path, conf_text) {
-        let _ = crate::privfs::remove_file(&temp);
+        let _ = crate::privfs::remove_file(temp);
         return Err(err);
     }
-    let _ = crate::privfs::remove_file(&temp);
+    let _ = crate::privfs::remove_file(temp);
+    Ok(())
+}
+
+/// Write `conf_text` after `nginx -t` on a sibling temp file. When
+/// `require_generated` is set, refuse to replace a foreign main conf.
+pub fn install_main_conf(
+    store: &mut Store,
+    conf_text: &str,
+    require_generated: bool,
+) -> Result<String, String> {
+    let (temp, output) = stage_main_conf(&store.db, conf_text, require_generated)?;
+    commit_staged_conf(store, conf_text, &temp)?;
     Ok(output)
 }
 
@@ -291,7 +308,9 @@ fn priv_nginx(db: &Db, op: NginxPriv) -> (bool, String) {
     let conf = nginx_path(db);
     let conf_s = conf.display().to_string();
     let helper = match op {
-        NginxPriv::Test if conf_s.starts_with("/etc/nginx/") && conf_s != "/etc/nginx/nginx.conf" => {
+        NginxPriv::Test
+            if conf_s.starts_with("/etc/nginx/") && conf_s != "/etc/nginx/nginx.conf" =>
+        {
             crate::privfs::run_helper("nginx-t", &[&conf_s])
         }
         NginxPriv::Test => crate::privfs::run_helper("nginx-t", &[]),
@@ -316,10 +335,7 @@ fn priv_nginx(db: &Db, op: NginxPriv) -> (bool, String) {
             };
             match direct {
                 Ok(text) => (true, merge_out(&err, &text)),
-                Err(err2) => (
-                    false,
-                    merge_out(&merge_out(&err, &err2), setup_sudo_hint()),
-                ),
+                Err(err2) => (false, merge_out(&merge_out(&err, &err2), setup_sudo_hint())),
             }
         }
     }
@@ -362,19 +378,59 @@ pub fn test_conf_file(db: &Db, path: &Path) -> (bool, String) {
         };
         match helper {
             Ok(text) => (true, merge_out(&out, &text)),
-            Err(err) => (
-                false,
-                merge_out(&merge_out(&out, &err), setup_sudo_hint()),
-            ),
+            Err(err) => (false, merge_out(&merge_out(&out, &err), setup_sudo_hint())),
         }
     } else {
         (ok, out)
     }
 }
 
+pub fn allowed_reload_commands() -> &'static [&'static str] {
+    &[
+        "sudo -n systemctl reload nginx",
+        "sudo systemctl reload nginx",
+        "systemctl reload nginx",
+        "systemctl reload nginx.service",
+        "nginx -s reload",
+        "/usr/sbin/nginx -s reload",
+        "/usr/bin/nginx -s reload",
+        "nginxwebui-priv reload",
+        "/usr/local/sbin/nginxwebui-priv reload",
+    ]
+}
+
+pub fn normalize_reload_cmd(cmd: &str) -> Option<String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Some(String::new());
+    }
+    let helper = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    if helper == "nginxwebui-priv reload" || trimmed.ends_with("/nginxwebui-priv reload") {
+        return Some(trimmed.to_string());
+    }
+    for allowed in allowed_reload_commands() {
+        if trimmed == *allowed {
+            if trimmed == "sudo systemctl reload nginx" {
+                return Some("sudo -n systemctl reload nginx".into());
+            }
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
 pub fn reload(db: &Db) -> (bool, String) {
     let cmd = db.setting("reloadCmd");
     if !cmd.trim().is_empty() {
+        let Some(cmd) = normalize_reload_cmd(cmd.trim()) else {
+            crate::applog::warn(
+                "ignoring non-whitelisted reloadCmd; falling back to nginx -s reload",
+            );
+            return run_or_priv(db, &["-s", "reload"], NginxPriv::Reload);
+        };
+        if cmd.is_empty() {
+            return run_or_priv(db, &["-s", "reload"], NginxPriv::Reload);
+        }
         let (ok, out) = run_command(db, cmd.trim());
         if ok {
             return (true, out);
@@ -490,10 +546,7 @@ pub fn command_is_safe(command: &str) -> bool {
 }
 
 pub fn run_command(db: &Db, command: &str) -> (bool, String) {
-    let parts: Vec<String> = command
-        .split_whitespace()
-        .map(|s| s.to_string())
-        .collect();
+    let parts: Vec<String> = command.split_whitespace().map(|s| s.to_string()).collect();
     if parts.is_empty() {
         return (false, "empty command".to_string());
     }
@@ -659,7 +712,12 @@ pub fn md5_crypt(pass: &str, salt: &str, magic: &str) -> String {
     out
 }
 
-pub fn write_password_file(_store: &Store, path: &Path, user: &str, pass: &str) -> std::io::Result<()> {
+pub fn write_password_file(
+    _store: &Store,
+    path: &Path,
+    user: &str,
+    pass: &str,
+) -> std::io::Result<()> {
     let value = if cfg!(windows) {
         format!("{}:{}", user, pass)
     } else {
@@ -720,6 +778,18 @@ mod tests {
     }
 
     #[test]
+    fn reload_cmd_whitelist_accepts_known_and_rejects_others() {
+        assert!(normalize_reload_cmd("nginx -s reload").is_some());
+        assert!(normalize_reload_cmd("sudo -n systemctl reload nginx").is_some());
+        assert_eq!(
+            normalize_reload_cmd("sudo systemctl reload nginx").as_deref(),
+            Some("sudo -n systemctl reload nginx")
+        );
+        assert!(normalize_reload_cmd("curl http://evil").is_none());
+        assert!(normalize_reload_cmd("nginx -c /tmp/evil.conf").is_none());
+    }
+
+    #[test]
     fn nginx_t_permission_denied_is_priv_fail() {
         let out = r#"nginx: [alert] could not open error log file: open() "/var/log/nginx/error.log" failed (13: Permission denied)
 nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
@@ -738,7 +808,15 @@ nginx: configuration file /etc/nginx/nginx.conf test failed"#;
             Some(NginxPriv::Test)
         ));
         assert!(matches!(
-            infer_nginx_priv("sudo", &["-n".into(), "systemctl".into(), "reload".into(), "nginx".into()]),
+            infer_nginx_priv(
+                "sudo",
+                &[
+                    "-n".into(),
+                    "systemctl".into(),
+                    "reload".into(),
+                    "nginx".into()
+                ]
+            ),
             Some(NginxPriv::Reload)
         ));
         assert!(matches!(

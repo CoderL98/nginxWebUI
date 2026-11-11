@@ -74,6 +74,10 @@ fn field(value: &Value, key: &str) -> String {
     str_of(value, key)
 }
 
+fn id_of(value: &Value) -> String {
+    str_of(value, "id")
+}
+
 fn rows_with(db: &Db, table: &str, column: &str, id: &str) -> Vec<Value> {
     db.rows(table)
         .iter()
@@ -110,6 +114,53 @@ fn persist(store: &Store) -> Result<(), Reply> {
 
 fn persist_result(result: std::io::Result<()>) -> Result<(), Reply> {
     result.map_err(|err| fail(&format!("saveFailed: {err}")))
+}
+
+fn actor(ctx: &Ctx, req: &Req) -> String {
+    let token = token_of(req);
+    ctx.sessions
+        .lock()
+        .unwrap()
+        .get(&token)
+        .map(|s| s.admin_name.clone())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "system".into())
+}
+
+fn record_operate(
+    store: &mut Store,
+    who: &str,
+    action: &str,
+    target: &str,
+    ok: bool,
+    detail: &str,
+) {
+    let detail: String = detail.chars().take(2000).collect();
+    crate::applog::info(format!(
+        "operate who={who} action={action} target={target} ok={ok}"
+    ));
+    let mut row = Map::new();
+    row.insert("id".into(), new_id().into());
+    row.insert("adminName".into(), who.into());
+    row.insert("type".into(), action.into());
+    row.insert("name".into(), target.into());
+    row.insert("success".into(), if ok { "true" } else { "false" }.into());
+    row.insert("msg".into(), detail.into());
+    row.insert("time".into(), now_ms().to_string().into());
+    store.db.upsert("operateLog", Value::Object(row));
+    let mut ids: Vec<(String, i64)> = store
+        .db
+        .rows("operateLog")
+        .iter()
+        .map(|r| (str_of(r, "id"), int_of(r, "time")))
+        .collect();
+    if ids.len() > 200 {
+        ids.sort_by_key(|item| item.1);
+        let extra = ids.len() - 200;
+        for (id, _) in ids.into_iter().take(extra) {
+            store.db.delete("operateLog", &id);
+        }
+    }
 }
 
 // ------------------------------------------------------------------ dispatch
@@ -294,7 +345,10 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }
             drop(store);
 
-            ctx.limits.lock().unwrap().succeed_login(&req.remote_ip, &name);
+            ctx.limits
+                .lock()
+                .unwrap()
+                .succeed_login(&req.remote_ip, &name);
             let mut sessions = ctx.sessions.lock().unwrap();
             let token = if sessions.touch(&token) {
                 token.clone()
@@ -362,12 +416,23 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             admin.insert("pass".into(), hashed.into());
             admin.insert("type".into(), "0".into());
             store.db.upsert("admin", Value::Object(admin));
+            record_operate(
+                &mut store,
+                name.trim(),
+                "addAdmin",
+                name.trim(),
+                true,
+                "created",
+            );
             if let Err(reply) = persist(&store) {
                 return reply;
             }
             drop(store);
             *ctx.init_token.lock().unwrap() = None;
-            ctx.limits.lock().unwrap().succeed_login(&req.remote_ip, &name);
+            ctx.limits
+                .lock()
+                .unwrap()
+                .succeed_login(&req.remote_ip, &name);
             ok_empty()
         }
         "loginOut" => {
@@ -379,7 +444,9 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let body = body(req);
             let lang = field(&body, "lang");
             let mut store = ctx.store.lock().unwrap();
-            store.db.set_setting("lang", if lang == "en" { "en" } else { "zh" });
+            store
+                .db
+                .set_setting("lang", if lang == "en" { "en" } else { "zh" });
             if let Err(reply) = persist(&store) {
                 return reply;
             }
@@ -428,11 +495,22 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 map.insert("pass".into(), hashed.into());
             }
             store.db.upsert("admin", updated);
+            record_operate(
+                &mut store,
+                &admin_name,
+                "changePass",
+                &admin_name,
+                true,
+                "updated",
+            );
             if let Err(reply) = persist(&store) {
                 return reply;
             }
             drop(store);
-            ctx.sessions.lock().unwrap().revoke_others(&token, &admin_id);
+            ctx.sessions
+                .lock()
+                .unwrap()
+                .revoke_others(&token, &admin_id);
             ok_empty()
         }
         _ => fail("not found"),
@@ -448,7 +526,11 @@ fn monitor(ctx: &Ctx) -> Reply {
         map.insert("webDir".into(), ctx.web_dir.display().to_string().into());
         map.insert(
             "dataFile".into(),
-            ctx.home.join("data/nginxwebui.db").display().to_string().into(),
+            ctx.home
+                .join("data/nginxwebui.db")
+                .display()
+                .to_string()
+                .into(),
         );
         map.insert("servers".into(), store.db.rows("server").len().into());
         map.insert("sites".into(), store.db.rows("site").len().into());
@@ -460,15 +542,30 @@ fn monitor(ctx: &Ctx) -> Reply {
         );
         map.insert(
             "sitesAvailable".into(),
-            crate::site::sites_available(&store.db).display().to_string().into(),
+            crate::site::sites_available(&store.db)
+                .display()
+                .to_string()
+                .into(),
         );
         map.insert("install".into(), crate::install::status(&store.db));
-        map.insert("nginxFound".into(), crate::install::nginx_present(&store.db).into());
-        map.insert("acmeFound".into(), crate::install::acme_present(&store.db).into());
-        map.insert("autoInstall".into(), crate::install::auto_install_enabled(&store.db).into());
+        map.insert(
+            "nginxFound".into(),
+            crate::install::nginx_present(&store.db).into(),
+        );
+        map.insert(
+            "acmeFound".into(),
+            crate::install::acme_present(&store.db).into(),
+        );
+        map.insert(
+            "autoInstall".into(),
+            crate::install::auto_install_enabled(&store.db).into(),
+        );
         map.insert(
             "webRoot".into(),
-            crate::site::web_root_base(&store.db).display().to_string().into(),
+            crate::site::web_root_base(&store.db)
+                .display()
+                .to_string()
+                .into(),
         );
         map.insert("canInstall".into(), crate::install::can_install().into());
     }
@@ -512,49 +609,79 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 .and_then(|f| f.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let mut store = ctx.store.lock().unwrap();
-            store.db.set_setting("decompose", if decompose { "true" } else { "false" });
-            if let Err(err) = nginx::install_main_conf(&mut store, &conf_text, true) {
-                return fail(&err);
-            }
-            if decompose {
-                let conf_d = nginx::nginx_dir(&store.db).join("conf.d");
-                if let Err(err) = crate::privfs::mkdir_all(&conf_d) {
+            let who = actor(ctx, req);
+            let db = {
+                let store = ctx.store.lock().unwrap();
+                store.db.clone()
+            };
+            match nginx::stage_main_conf(&db, &conf_text, true) {
+                Err(err) => {
+                    let mut store = ctx.store.lock().unwrap();
+                    record_operate(&mut store, &who, "conf.replace", "", false, &err);
+                    let _ = persist(&store);
                     return fail(&err);
                 }
-                for file in files {
-                    let name = field(&file, "name");
-                    if name.is_empty() || name.contains('/') || name.contains("..") {
-                        continue;
-                    }
-                    if let Err(err) = crate::privfs::write(&conf_d.join(name), field(&file, "conf")) {
+                Ok((temp, _)) => {
+                    let mut store = ctx.store.lock().unwrap();
+                    store
+                        .db
+                        .set_setting("decompose", if decompose { "true" } else { "false" });
+                    if let Err(err) = nginx::commit_staged_conf(&mut store, &conf_text, &temp) {
+                        record_operate(&mut store, &who, "conf.replace", "", false, &err);
+                        let _ = persist(&store);
                         return fail(&err);
                     }
+                    if decompose {
+                        let conf_d = nginx::nginx_dir(&store.db).join("conf.d");
+                        if let Err(err) = crate::privfs::mkdir_all(&conf_d) {
+                            return fail(&err);
+                        }
+                        for file in files {
+                            let name = field(&file, "name");
+                            if name.is_empty() || name.contains('/') || name.contains("..") {
+                                continue;
+                            }
+                            if let Err(err) =
+                                crate::privfs::write(&conf_d.join(name), field(&file, "conf"))
+                            {
+                                return fail(&err);
+                            }
+                        }
+                    }
+                    record_operate(&mut store, &who, "conf.replace", "", true, "ok");
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
+                    ok_empty()
                 }
             }
-            if let Err(reply) = persist(&store) { return reply; }
-            ok_empty()
         }
         "check" => {
-            let store = ctx.store.lock().unwrap();
-            let (good, output) = nginx::test_conf(&store.db);
+            let db = {
+                let store = ctx.store.lock().unwrap();
+                store.db.clone()
+            };
+            let (good, output) = nginx::test_conf(&db);
             ok(json!({ "success": good, "output": output }))
         }
         "reload" => {
-            let store = ctx.store.lock().unwrap();
-            let (test_ok, check_output) = nginx::test_conf(&store.db);
+            let db = {
+                let store = ctx.store.lock().unwrap();
+                store.db.clone()
+            };
+            let (test_ok, check_output) = nginx::test_conf(&db);
             if !test_ok {
                 return ok(json!({
                     "success": false,
                     "output": check_output,
-                    "running": nginx::running(&store.db),
+                    "running": nginx::running(&db),
                 }));
             }
-            let (good, output) = nginx::reload(&store.db);
+            let (good, output) = nginx::reload(&db);
             ok(json!({
                 "success": good,
                 "output": format!("{}\n{}", check_output, output),
-                "running": nginx::running(&store.db),
+                "running": nginx::running(&db),
             }))
         }
         "status" => {
@@ -563,9 +690,13 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         }
         "signal" => {
             let body = body(req);
-            let store = ctx.store.lock().unwrap();
-            let (good, output) = nginx::signal(&store.db, &field(&body, "action"));
-            ok(json!({ "success": good, "output": output, "running": nginx::running(&store.db) }))
+            let action = field(&body, "action");
+            let db = {
+                let store = ctx.store.lock().unwrap();
+                store.db.clone()
+            };
+            let (good, output) = nginx::signal(&db, &action);
+            ok(json!({ "success": good, "output": output, "running": nginx::running(&db) }))
         }
         "saveCmd" => {
             let body = body(req);
@@ -597,14 +728,25 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     {
                         continue;
                     }
+                    if key == "reloadCmd" {
+                        match nginx::normalize_reload_cmd(value.trim()) {
+                            Some(cmd) => store.db.set_setting(key, &cmd),
+                            None => return fail("unsafeReloadCmd"),
+                        }
+                        continue;
+                    }
                     store.db.set_setting(key, value.trim());
                 }
             }
             if body.get("decompose").is_some() {
                 let decompose = bool_of(&body, "decompose", false);
-                store.db.set_setting("decompose", if decompose { "true" } else { "false" });
+                store
+                    .db
+                    .set_setting("decompose", if decompose { "true" } else { "false" });
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({
                 "nginxPath": nginx::nginx_path(&store.db).display().to_string(),
                 "nginxDir": nginx::nginx_dir(&store.db).display().to_string(),
@@ -613,27 +755,76 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         }
         "runCmd" => {
             let body = body(req);
-            let command = field(&body, "cmd");
-            let store = ctx.store.lock().unwrap();
-            let reload = store.db.setting("reloadCmd");
-            let allowed = command == reload
-                || command.starts_with("nginx ")
-                || command == "nginx"
-                || command.starts_with(&format!("{} ", nginx::nginx_exe(&store.db)));
-            if !allowed || !nginx::command_is_safe(&command) {
-                return fail("unsafeCommand");
+            let mut action = field(&body, "action");
+            if action.is_empty() {
+                action = field(&body, "cmd");
             }
-            let (good, output) = nginx::run_command(&store.db, &command);
+            let db = {
+                let store = ctx.store.lock().unwrap();
+                store.db.clone()
+            };
+            let (good, output) = match action.as_str() {
+                "reload"
+                | "nginx -s reload"
+                | "sudo -n systemctl reload nginx"
+                | "sudo systemctl reload nginx"
+                | "systemctl reload nginx" => nginx::reload(&db),
+                "check" | "test" | "nginx -t" => nginx::test_conf(&db),
+                "start" | "stop" | "restart" | "quit" => nginx::signal(&db, &action),
+                _ => return fail("unsafeCommand"),
+            };
             ok(json!({ "success": good, "output": output }))
         }
         "write" => {
-            let mut store = ctx.store.lock().unwrap();
-            match nginx::write_conf(&mut store) {
-                Ok(written) => {
-                    if let Err(reply) = persist(&store) { return reply; }
+            let who = actor(ctx, req);
+            let (db, conf_text, files, split, dir) = {
+                let store = ctx.store.lock().unwrap();
+                let ext = nginx::preview(&store.db);
+                (
+                    store.db.clone(),
+                    ext.conf,
+                    ext.files,
+                    nginx::decompose(&store.db),
+                    nginx::nginx_dir(&store.db),
+                )
+            };
+            match nginx::stage_main_conf(&db, &conf_text, true) {
+                Err(err) => {
+                    let mut store = ctx.store.lock().unwrap();
+                    record_operate(&mut store, &who, "conf.write", "", false, &err);
+                    let _ = persist(&store);
+                    fail(&err)
+                }
+                Ok((temp, _)) => {
+                    let mut store = ctx.store.lock().unwrap();
+                    if let Err(err) = nginx::commit_staged_conf(&mut store, &conf_text, &temp) {
+                        record_operate(&mut store, &who, "conf.write", "", false, &err);
+                        let _ = persist(&store);
+                        return fail(&err);
+                    }
+                    let mut written = vec![nginx::nginx_path(&store.db).display().to_string()];
+                    let conf_d = dir.join("conf.d");
+                    if let Err(err) = crate::privfs::mkdir_all(&conf_d) {
+                        return fail(&err);
+                    }
+                    let mut wanted: Vec<String> = Vec::new();
+                    if split {
+                        for file in &files {
+                            if let Err(err) =
+                                crate::privfs::write(&conf_d.join(&file.name), &file.conf)
+                            {
+                                return fail(&err);
+                            }
+                            wanted.push(file.name.clone());
+                            written.push(conf_d.join(&file.name).display().to_string());
+                        }
+                    }
+                    record_operate(&mut store, &who, "conf.write", "", true, "ok");
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
                     ok(json!({ "written": written }))
                 }
-                Err(err) => fail(&err),
             }
         }
         _ => fail("not found"),
@@ -670,7 +861,7 @@ fn bak(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             if id.is_empty() {
                 return fail("not found");
             }
-            let mut store = ctx.store.lock().unwrap();
+            let store = ctx.store.lock().unwrap();
             let Some(row) = store.db.get("bak", &id) else {
                 return fail("not found");
             };
@@ -678,14 +869,29 @@ fn bak(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             if content.trim().is_empty() {
                 return fail("emptyBackup");
             }
-            match nginx::install_main_conf(&mut store, &content, false) {
-                Ok(output) => {
+            let db = store.db.clone();
+            drop(store);
+            let who = actor(ctx, req);
+            match nginx::stage_main_conf(&db, &content, false) {
+                Err(err) => {
+                    let mut store = ctx.store.lock().unwrap();
+                    record_operate(&mut store, &who, "bak.restore", &id, false, &err);
+                    let _ = persist(&store);
+                    fail(&err)
+                }
+                Ok((temp, output)) => {
+                    let mut store = ctx.store.lock().unwrap();
+                    if let Err(err) = nginx::commit_staged_conf(&mut store, &content, &temp) {
+                        record_operate(&mut store, &who, "bak.restore", &id, false, &err);
+                        let _ = persist(&store);
+                        return fail(&err);
+                    }
+                    record_operate(&mut store, &who, "bak.restore", &id, true, "ok");
                     if let Err(reply) = persist(&store) {
                         return reply;
                     }
                     ok(json!({ "output": output }))
                 }
-                Err(err) => fail(&err),
             }
         }
         _ => fail("not found"),
@@ -716,7 +922,11 @@ fn log(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }))
         }
         "tail" => {
-            let name = req.query.get("name").cloned().unwrap_or_else(|| "error.log".into());
+            let name = req
+                .query
+                .get("name")
+                .cloned()
+                .unwrap_or_else(|| "error.log".into());
             let lines: usize = req
                 .query
                 .get("lines")
@@ -760,7 +970,9 @@ fn setting(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }
             let mut store = ctx.store.lock().unwrap();
             store.db.set_setting(&key, &value);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -809,7 +1021,9 @@ fn export(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     }
                 }
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -823,7 +1037,9 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         "list" => {
             let mut store = ctx.store.lock().unwrap();
             let _ = crate::compat::adopt(&mut store.db);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             let list: Vec<Value> = ordered(&store.db, "site", true)
                 .into_iter()
                 .map(|row| {
@@ -836,11 +1052,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                             "locationSummary".into(),
                             locs.iter()
                                 .map(|l| {
-                                    format!(
-                                        "{} {}",
-                                        crate::site::loc_type(l),
-                                        str_of(l, "path")
-                                    )
+                                    format!("{} {}", crate::site::loc_type(l), str_of(l, "path"))
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", ")
@@ -964,17 +1176,37 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     match crate::install::ensure_nginx(&mut store.db) {
                         Ok(log) => output.push_str(&log),
                         Err(err) => {
-                            if let Err(reply) = persist(&store) { return reply; }
+                            if let Err(reply) = persist(&store) {
+                                return reply;
+                            }
                             return fail(&err);
                         }
                     }
                 }
-                match crate::site::apply(&mut store, &saved) {
+                match crate::site::apply(&store.db, &saved) {
                     Ok((path, log)) => {
                         output = format!("{}\n{}\n{}", output, path, log);
+                        record_operate(
+                            &mut store,
+                            &actor(ctx, req),
+                            "site.apply",
+                            &id_of(&saved),
+                            true,
+                            &output,
+                        );
                     }
                     Err(err) => {
-                        if let Err(reply) = persist(&store) { return reply; }
+                        record_operate(
+                            &mut store,
+                            &actor(ctx, req),
+                            "site.apply",
+                            &id_of(&saved),
+                            false,
+                            &err,
+                        );
+                        if let Err(reply) = persist(&store) {
+                            return reply;
+                        }
                         return json_reply(
                             200,
                             &json!({
@@ -986,7 +1218,9 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     }
                 }
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id, "output": output }))
         }
         "del" => {
@@ -996,7 +1230,9 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 crate::site::remove_files(&store.db, &row);
             }
             store.db.delete("site", &id);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             let (ok_t, out) = nginx::test_conf(&store.db);
             if ok_t {
                 let _ = nginx::reload(&store.db);
@@ -1005,25 +1241,42 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         }
         "apply" => {
             let id = field(&body(req), "id");
-            let mut store = ctx.store.lock().unwrap();
-            let row = match store.db.get("site", &id) {
-                Some(row) => row,
-                None => return fail("not found"),
-            };
-            if crate::install::should_ensure(&store.db)
-                && !crate::install::nginx_present(&store.db)
-            {
-                if let Err(err) = crate::install::ensure_nginx(&mut store.db) {
-                    if let Err(reply) = persist(&store) { return reply; }
-                    return fail(&err);
+            let who = actor(ctx, req);
+            let (row, db) = {
+                let mut store = ctx.store.lock().unwrap();
+                if crate::install::should_ensure(&store.db)
+                    && !crate::install::nginx_present(&store.db)
+                {
+                    if let Err(err) = crate::install::ensure_nginx(&mut store.db) {
+                        if let Err(reply) = persist(&store) {
+                            return reply;
+                        }
+                        return fail(&err);
+                    }
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
                 }
-            }
-            match crate::site::apply(&mut store, &row) {
+                match store.db.get("site", &id) {
+                    Some(row) => (row, store.db.clone()),
+                    None => return fail("not found"),
+                }
+            };
+            match crate::site::apply(&db, &row) {
                 Ok((path, log)) => {
-                    if let Err(reply) = persist(&store) { return reply; }
+                    let mut store = ctx.store.lock().unwrap();
+                    record_operate(&mut store, &who, "site.apply", &id, true, &log);
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
                     ok(json!({ "path": path, "output": log }))
                 }
-                Err(err) => fail(&err),
+                Err(err) => {
+                    let mut store = ctx.store.lock().unwrap();
+                    record_operate(&mut store, &who, "site.apply", &id, false, &err);
+                    let _ = persist(&store);
+                    fail(&err)
+                }
             }
         }
         _ => fail("not found"),
@@ -1036,8 +1289,16 @@ fn server(ctx: &Ctx, action: &str, req: &Req) -> Reply {
     match action {
         "list" => {
             let keywords = req.query.get("keywords").cloned().unwrap_or_default();
-            let page: usize = req.query.get("page").and_then(|v| v.parse().ok()).unwrap_or(1);
-            let limit: usize = req.query.get("limit").and_then(|v| v.parse().ok()).unwrap_or(15);
+            let page: usize = req
+                .query
+                .get("page")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let limit: usize = req
+                .query
+                .get("limit")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15);
             let store = ctx.store.lock().unwrap();
             let mut all: Vec<Value> = Vec::new();
             for row in ordered(&store.db, "server", false) {
@@ -1133,7 +1394,9 @@ fn server(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
                 store.db.upsert("param", param);
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1144,7 +1407,9 @@ fn server(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 store.db.delete_where("location", "serverId", id);
                 store.db.delete_where("param", "serverId", id);
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         "enable" => {
@@ -1157,7 +1422,9 @@ fn server(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     map.insert("enable".into(), enable.into());
                 }
                 store.db.upsert("server", row);
-                if let Err(reply) = persist(&store) { return reply; }
+                if let Err(reply) = persist(&store) {
+                    return reply;
+                }
             }
             ok_empty()
         }
@@ -1210,7 +1477,12 @@ fn upstream(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 let mut node = node;
                 if let Value::Object(map) = &mut node {
                     map.insert("upstreamId".into(), id.clone().into());
-                    if map.get("id").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                    if map
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true)
+                    {
                         map.insert("id".into(), new_id().into());
                     }
                 }
@@ -1226,13 +1498,20 @@ fn upstream(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 let mut param = param;
                 if let Value::Object(map) = &mut param {
                     map.insert("upstreamId".into(), id.clone().into());
-                    if map.get("id").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                    if map
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true)
+                    {
                         map.insert("id".into(), new_id().into());
                     }
                 }
                 store.db.upsert("param", param);
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1243,7 +1522,9 @@ fn upstream(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 store.db.delete_where("upstreamServer", "upstreamId", id);
                 store.db.delete_where("param", "upstreamId", id);
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1286,13 +1567,20 @@ fn template(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 let mut param = param;
                 if let Value::Object(map) = &mut param {
                     map.insert("templateId".into(), id.clone().into());
-                    if map.get("id").and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+                    if map
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true)
+                    {
                         map.insert("id".into(), new_id().into());
                     }
                 }
                 store.db.upsert("param", param);
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1302,7 +1590,9 @@ fn template(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 store.db.delete("template", id);
                 store.db.delete_where("param", "templateId", id);
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1341,7 +1631,10 @@ fn admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }
             let mut store = ctx.store.lock().unwrap();
             let id = store.db.upsert("admin", row);
-            if let Err(reply) = persist(&store) { return reply; }
+            record_operate(&mut store, &actor(ctx, req), "admin.save", &id, true, "");
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1351,7 +1644,10 @@ fn admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 return fail("lastAdmin");
             }
             store.db.delete("admin", &id);
-            if let Err(reply) = persist(&store) { return reply; }
+            record_operate(&mut store, &actor(ctx, req), "admin.del", &id, true, "");
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1398,7 +1694,9 @@ fn password(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 return fail(&err.to_string());
             }
             let id = store.db.upsert("password", row);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1411,7 +1709,9 @@ fn password(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
             }
             store.db.delete("password", &id);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1425,7 +1725,9 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
         "list" | "scan" => {
             let mut store = ctx.store.lock().unwrap();
             let adopted = crate::compat::adopt(&mut store.db);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             let certs: Vec<Value> = ordered(&store.db, "cert", true)
                 .into_iter()
                 .map(|row| {
@@ -1506,13 +1808,20 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                 for key in crate::secrets::SECRET_CERT_KEYS {
                     map.remove(*key);
                 }
-                if map.get("kind").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if map
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     map.insert("kind".into(), "dns_cf".into());
                 }
             }
             let mut store = ctx.store.lock().unwrap();
             let id = store.db.upsert("cert", row);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id }))
         }
         "apply" | "renew" => {
@@ -1530,10 +1839,14 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                     && !crate::install::acme_present(&store.db)
                 {
                     if let Err(err) = crate::install::ensure_acme(&mut store.db) {
-                        if let Err(reply) = persist(&store) { return reply; }
+                        if let Err(reply) = persist(&store) {
+                            return reply;
+                        }
                         return fail(&err);
                     }
-                    if let Err(reply) = persist(&store) { return reply; }
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
                 }
                 match store.db.get("cert", &id) {
                     Some(row) => (store.db.clone(), row),
@@ -1552,11 +1865,11 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
             }
             let ctx = Arc::clone(ctx);
             std::thread::spawn(move || {
-                let (ok_apply, log, updated) =
-                    crate::acme::apply(&snapshot.0, &snapshot.1, force);
+                let (ok_apply, log, updated) = crate::acme::apply(&snapshot.0, &snapshot.1, force);
                 {
                     let mut store = ctx.store.lock().unwrap();
                     store.db.upsert("cert", updated);
+                    record_operate(&mut store, "system", "cert.apply", &id, ok_apply, &log);
                     if persist(&store).is_err() {
                         crate::acme::job_finish(false, "saveFailed");
                         return;
@@ -1607,7 +1920,9 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                 }
             }
             store.db.delete("cert", &id);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1710,7 +2025,9 @@ fn www(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
             }
             let id = store.db.upsert("www", row);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({
                 "id": id,
                 "path": dest.display().to_string(),
@@ -1738,7 +2055,9 @@ fn www(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let id = field(&body(req), "id");
             let mut store = ctx.store.lock().unwrap();
             store.db.delete("www", &id);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1755,7 +2074,9 @@ fn install(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut store = ctx.store.lock().unwrap();
             match crate::install::install_nginx(&mut store.db) {
                 Ok(log) => {
-                    if let Err(reply) = persist(&store) { return reply; }
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
                     ok(json!({ "output": log, "status": crate::install::status(&store.db) }))
                 }
                 Err(err) => fail(&err),
@@ -1765,7 +2086,9 @@ fn install(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut store = ctx.store.lock().unwrap();
             match crate::install::install_acme(&mut store.db) {
                 Ok(log) => {
-                    if let Err(reply) = persist(&store) { return reply; }
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
                     ok(json!({ "output": log, "status": crate::install::status(&store.db) }))
                 }
                 Err(err) => fail(&err),
@@ -1778,7 +2101,9 @@ fn install(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             store
                 .db
                 .set_setting("autoInstall", if enable { "true" } else { "false" });
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "autoInstall": enable }))
         }
         _ => fail("not found"),
@@ -1853,7 +2178,9 @@ fn simple_table(ctx: &Ctx, kind: &str, action: &str, req: &Req) -> Reply {
                 }
             }
             let id = store.db.upsert(table, row);
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok(json!({ "id": id }))
         }
         ("POST", "del") => {
@@ -1862,7 +2189,9 @@ fn simple_table(ctx: &Ctx, kind: &str, action: &str, req: &Req) -> Reply {
             for id in ids.split(',').filter(|s| !s.is_empty()) {
                 store.db.delete(table, id);
             }
-            if let Err(reply) = persist(&store) { return reply; }
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1880,5 +2209,151 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["success"], false);
         assert_eq!(body["msg"], "saveFailed: disk full");
+    }
+
+    fn test_ctx() -> Arc<Ctx> {
+        let dir = std::env::temp_dir().join(format!(
+            "nginxwebui-api-{}-{}",
+            std::process::id(),
+            crate::store::new_id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = Store::open(&dir);
+        Arc::new(Ctx {
+            home: dir.clone(),
+            web_dir: dir,
+            store: Mutex::new(store),
+            sessions: Mutex::new(Sessions::default()),
+            limits: Mutex::new(RateLimiter::default()),
+            init_token: Mutex::new(Some("init-secret".into())),
+            secure_cookie: false,
+        })
+    }
+
+    fn test_req(path: &str, payload: Value, token: &str) -> Req {
+        let mut cookies = HashMap::new();
+        if !token.is_empty() {
+            cookies.insert(COOKIE.to_string(), token.to_string());
+        }
+        Req {
+            method: "POST".into(),
+            path: path.into(),
+            query: HashMap::new(),
+            body: serde_json::to_vec(&payload).unwrap_or_default(),
+            cookies,
+            content_type: "application/json".into(),
+            remote_ip: "127.0.0.1".into(),
+            secure_cookie: false,
+        }
+    }
+
+    fn signed_in(ctx: &Ctx) -> String {
+        let mut sessions = ctx.sessions.lock().unwrap();
+        let token = sessions.new_session();
+        sessions.sign_in(&token, "1", "tester");
+        token
+    }
+
+    fn body_of(reply: &Reply) -> Value {
+        serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    #[test]
+    fn unsigned_api_returns_401() {
+        let ctx = test_ctx();
+        let reply = handle(&ctx, &test_req("/adminPage/conf/show", json!({}), ""));
+        assert_eq!(reply.status, 401);
+        assert_eq!(body_of(&reply)["needLogin"], true);
+    }
+
+    #[test]
+    fn add_admin_requires_init_token_and_captcha() {
+        let ctx = test_ctx();
+        let token = {
+            let mut sessions = ctx.sessions.lock().unwrap();
+            let token = sessions.new_session();
+            sessions.set_code(&token, "ABC234");
+            token
+        };
+        let missing = handle(
+            &ctx,
+            &test_req(
+                "/adminPage/login/addAdmin",
+                json!({
+                    "name": "alice",
+                    "pass": "secret1",
+                    "code": "ABC234",
+                    "initToken": "wrong"
+                }),
+                &token,
+            ),
+        );
+        assert_eq!(body_of(&missing)["success"], false);
+        assert_eq!(body_of(&missing)["msg"], "initTokenError");
+
+        let ok_reply = handle(
+            &ctx,
+            &test_req(
+                "/adminPage/login/addAdmin",
+                json!({
+                    "name": "alice",
+                    "pass": "secret1",
+                    "code": "ABC234",
+                    "initToken": "init-secret"
+                }),
+                &token,
+            ),
+        );
+        assert_eq!(body_of(&ok_reply)["success"], true);
+        assert_eq!(ctx.store.lock().unwrap().db.rows("admin").len(), 1);
+        assert!(ctx
+            .store
+            .lock()
+            .unwrap()
+            .db
+            .rows("operateLog")
+            .iter()
+            .any(|row| { str_of(row, "type") == "addAdmin" }));
+    }
+
+    #[test]
+    fn replace_refuses_foreign_nginx_conf() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let conf_path = ctx.home.join("foreign.conf");
+        std::fs::write(&conf_path, "user www-data;\nhttp { }\n").unwrap();
+        {
+            let mut store = ctx.store.lock().unwrap();
+            store
+                .db
+                .set_setting("nginxPath", &conf_path.display().to_string());
+            store.flush().unwrap();
+        }
+        let reply = handle(
+            &ctx,
+            &test_req(
+                "/adminPage/conf/replace",
+                json!({ "conf": "# Generated by nginxWebUI\nhttp { }\n" }),
+                &token,
+            ),
+        );
+        let body = body_of(&reply);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["msg"], "refuseOverwriteNginxConf");
+    }
+
+    #[test]
+    fn run_cmd_rejects_free_form_strings() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let reply = handle(
+            &ctx,
+            &test_req(
+                "/adminPage/conf/runCmd",
+                json!({ "cmd": "curl http://example" }),
+                &token,
+            ),
+        );
+        assert_eq!(body_of(&reply)["msg"], "unsafeCommand");
     }
 }

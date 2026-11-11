@@ -4,7 +4,7 @@
 //! domain, tests with `nginx -t`, and reloads.
 
 use crate::nginx;
-use crate::store::{bool_of, str_of, Db, Store};
+use crate::store::{bool_of, str_of, Db};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,7 +95,9 @@ pub fn safe_domain(raw: &str) -> Option<String> {
     if d.is_empty() || d.contains("..") || d.contains('/') || d.contains('\\') {
         return None;
     }
-    let ok = d.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '*');
+    let ok = d
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '*');
     if !ok {
         return None;
     }
@@ -104,13 +106,23 @@ pub fn safe_domain(raw: &str) -> Option<String> {
 
 pub fn cert_paths(db: &Db, name: &str) -> (PathBuf, PathBuf) {
     let dir = ssl_dir(db);
-    (dir.join(format!("{}.cer", name)), dir.join(format!("{}.key", name)))
+    (
+        dir.join(format!("{}.cer", name)),
+        dir.join(format!("{}.key", name)),
+    )
 }
 
 /// SANs from `openssl x509 -noout -ext subjectAltName`.
 pub fn cert_sans(cert: &Path) -> Vec<String> {
     let output = Command::new("openssl")
-        .args(["x509", "-in", &cert.display().to_string(), "-noout", "-ext", "subjectAltName"])
+        .args([
+            "x509",
+            "-in",
+            &cert.display().to_string(),
+            "-noout",
+            "-ext",
+            "subjectAltName",
+        ])
         .output();
     let text = match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -242,7 +254,9 @@ fn proxy_url(raw: &str) -> Result<String, String> {
     if t.is_empty() {
         return Err("proxyRequired".into());
     }
-    if t.chars().any(|c| c.is_control() || matches!(c, ';' | '{' | '}' | '"' | '\'')) {
+    if t.chars()
+        .any(|c| c.is_control() || matches!(c, ';' | '{' | '}' | '"' | '\''))
+    {
         return Err("badProxy".into());
     }
     if t.chars().all(|c| c.is_ascii_digit()) {
@@ -469,7 +483,11 @@ fn safe_listen(raw: &str) -> String {
 }
 
 fn emit_upstream_block(db: &Db, out: &mut String, uniq: &str, name: &str) -> bool {
-    let row = match db.rows("upstream").iter().find(|u| str_of(u, "name") == name) {
+    let row = match db
+        .rows("upstream")
+        .iter()
+        .find(|u| str_of(u, "name") == name)
+    {
         Some(row) => row.clone(),
         None => return false,
     };
@@ -487,8 +505,15 @@ fn emit_upstream_block(db: &Db, out: &mut String, uniq: &str, name: &str) -> boo
     out.push_str(&format!("upstream {uniq} {{\n"));
     for node in nodes {
         let host = str_of(&node, "server");
-        let host = if host.is_empty() { "127.0.0.1".into() } else { host };
-        if host.chars().any(|c| matches!(c, ';' | '{' | '}' | '"' | '\n')) {
+        let host = if host.is_empty() {
+            "127.0.0.1".into()
+        } else {
+            host
+        };
+        if host
+            .chars()
+            .any(|c| matches!(c, ';' | '{' | '}' | '"' | '\n'))
+        {
             continue;
         }
         let port = crate::store::int_of(&node, "port");
@@ -671,8 +696,14 @@ pub fn render(db: &Db, site: &Value) -> Result<String, String> {
     }
     out.push_str(&format!("    server_name {domain};\n"));
     if ssl {
-        out.push_str(&format!("\n    ssl_certificate     {};\n", nginx_path_text(&cer)));
-        out.push_str(&format!("    ssl_certificate_key {};\n", nginx_path_text(&key)));
+        out.push_str(&format!(
+            "\n    ssl_certificate     {};\n",
+            nginx_path_text(&cer)
+        ));
+        out.push_str(&format!(
+            "    ssl_certificate_key {};\n",
+            nginx_path_text(&key)
+        ));
         if include_params {
             out.push_str(&format!("    include {};\n", nginx_path_text(&params)));
         }
@@ -683,7 +714,10 @@ pub fn render(db: &Db, site: &Value) -> Result<String, String> {
         let index = loc_index(loc);
         if ssl && !sub_cache {
             out.push_str("\n    ssl_stapling on;\n    ssl_stapling_verify on;\n");
-            out.push_str(&format!("    ssl_trusted_certificate {};\n", nginx_path_text(&cer)));
+            out.push_str(&format!(
+                "    ssl_trusted_certificate {};\n",
+                nginx_path_text(&cer)
+            ));
             out.push_str("    resolver 223.5.5.5 8.8.8.8 valid=300s ipv6=off;\n");
             out.push_str("    resolver_timeout 2s;\n\n");
             out.push_str("    charset utf-8;\n    sendfile on;\n    tcp_nopush on;\n    tcp_nodelay on;\n    keepalive_timeout 65;\n\n");
@@ -737,12 +771,17 @@ pub fn render(db: &Db, site: &Value) -> Result<String, String> {
                     let url = str_of(loc, "returnUrl");
                     let url = if url.trim().is_empty() {
                         "https://$host$request_uri".to_string()
-                    } else if url.chars().any(|c| matches!(c, ';' | '{' | '}' | '"' | '\n')) {
+                    } else if url
+                        .chars()
+                        .any(|c| matches!(c, ';' | '{' | '}' | '"' | '\n'))
+                    {
                         return Err("badRedirect".into());
                     } else {
                         url
                     };
-                    out.push_str(&format!("    location {path} {{\n        return 301 {url};\n    }}\n"));
+                    out.push_str(&format!(
+                        "    location {path} {{\n        return 301 {url};\n    }}\n"
+                    ));
                 }
                 "custom" => {
                     let body = str_of(loc, "custom");
@@ -770,22 +809,22 @@ pub fn render(db: &Db, site: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String> {
+pub fn apply(db: &Db, site: &Value) -> Result<(String, String), String> {
     let domain = safe_domain(&str_of(site, "domain")).ok_or("badDomain")?;
     if bool_of(site, "fromDisk", false) {
-        if let Some(kept) = keep_existing_site(&store.db, site) {
+        if let Some(kept) = keep_existing_site(db, site) {
             return kept;
         }
     }
     if site_kind(site) != "forward" && bool_of(site, "ssl", true) {
         let mut cert_name = str_of(site, "certName");
         if cert_name.is_empty() {
-            cert_name = find_cert(&store.db, &domain).unwrap_or_default();
+            cert_name = find_cert(db, &domain).unwrap_or_default();
         }
         if cert_name.is_empty() {
             return Err(format!("no certificate covers {}", domain));
         }
-        let (cer, key) = crate::compat::resolve_pair(&store.db, &cert_name);
+        let (cer, key) = crate::compat::resolve_pair(db, &cert_name);
         if !cer.is_file() {
             return Err(format!("missing {}", cer.display()));
         }
@@ -793,37 +832,37 @@ pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String
             return Err(format!("missing {}", key.display()));
         }
     }
-    let text = render(&store.db, site)?;
+    let text = render(db, site)?;
     if site_kind(site) != "forward" && bool_of(site, "ssl", true) {
-        ensure_ssl_params(&store.db)?;
+        ensure_ssl_params(db)?;
     }
-    let available = sites_available(&store.db);
-    let enabled = sites_enabled(&store.db);
+    let available = sites_available(db);
+    let enabled = sites_enabled(db);
     crate::privfs::mkdir_all(&available)?;
     crate::privfs::mkdir_all(&enabled)?;
 
-    let (avail_path, enabled_path, in_place) = site_write_paths(&store.db, site, &domain);
+    let (avail_path, enabled_path, in_place) = site_write_paths(db, site, &domain);
     let previous = crate::privfs::read_to_string(&avail_path).ok();
     let had_link = enabled_path.exists();
 
-    let locations = locations_of(&store.db, site);
+    let locations = locations_of(db, site);
     for loc in &locations {
         if loc_type(loc) == "static" {
-            let root = PathBuf::from(site_root(&store.db, site, Some(loc)));
+            let root = PathBuf::from(site_root(db, site, Some(loc)));
             if !root.exists() {
                 crate::privfs::mkdir_www(&root)?;
             }
         }
     }
-    let _ = crate::privfs::mkdir_all(&access_log_dir(&store.db));
-    ensure_main_includes_sites(&store.db)?;
+    let _ = crate::privfs::mkdir_all(&access_log_dir(db));
+    ensure_main_includes_sites(db)?;
 
     crate::privfs::write(&avail_path, &text)?;
     if !in_place && !enabled_path.exists() {
         crate::privfs::link_or_copy(&avail_path, &enabled_path)?;
     }
 
-    let (ok, output) = nginx::test_conf(&store.db);
+    let (ok, output) = nginx::test_conf(db);
     if !ok {
         if let Some(prev) = previous {
             let _ = crate::privfs::write(&avail_path, prev);
@@ -836,7 +875,7 @@ pub fn apply(store: &mut Store, site: &Value) -> Result<(String, String), String
         return Err(format!("nginx -t failed, rolled back\n{}", output));
     }
 
-    let (rok, rout) = nginx::reload(&store.db);
+    let (rok, rout) = nginx::reload(db);
     Ok((
         avail_path.display().to_string(),
         format!("{}\nreload ok={} {}", output, rok, rout),
@@ -852,7 +891,9 @@ pub fn existing_conf_text(_db: &Db, site: &Value) -> Option<String> {
     if conf_path.is_empty() {
         return None;
     }
-    crate::privfs::read_to_string(Path::new(&conf_path)).ok().filter(|s| !s.trim().is_empty())
+    crate::privfs::read_to_string(Path::new(&conf_path))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn keep_existing_site(db: &Db, site: &Value) -> Option<Result<(String, String), String>> {
@@ -925,7 +966,8 @@ mod tests {
 
     #[test]
     fn parses_openssl_sans() {
-        let text = "X509v3 Subject Alternative Name:\n    DNS:cdn.example.com, DNS:*.cdn.example.com\n";
+        let text =
+            "X509v3 Subject Alternative Name:\n    DNS:cdn.example.com, DNS:*.cdn.example.com\n";
         let sans = parse_sans(text);
         assert_eq!(sans, vec!["cdn.example.com", "*.cdn.example.com"]);
     }
@@ -967,7 +1009,10 @@ mod tests {
         assert!(text.contains("gzip on;"));
         assert!(text.contains("Cache-Control \"no-cache\""));
         let log = nginx_path_text(&access_log_dir(&db).join("www.example.com.access.log"));
-        assert!(text.contains(&format!("access_log {log};")), "missing log in:\n{text}");
+        assert!(
+            text.contains(&format!("access_log {log};")),
+            "missing log in:\n{text}"
+        );
     }
 
     #[test]
@@ -1007,7 +1052,10 @@ mod tests {
         let text = render(&db, &site).unwrap();
         assert!(text.contains("listen 443 ssl;"), "missing 443 in:\n{text}");
         assert!(text.contains("ssl_certificate"), "missing cert in:\n{text}");
-        assert!(text.contains("ssl_certificate_key"), "missing key in:\n{text}");
+        assert!(
+            text.contains("ssl_certificate_key"),
+            "missing key in:\n{text}"
+        );
         assert!(text.contains("return 301 https://$host$request_uri;"));
     }
 
@@ -1073,7 +1121,9 @@ mod tests {
             "rawConf": "server { server_name kept.example.com; }",
             "confPath": "/no/such/file.conf"
         });
-        assert!(existing_conf_text(&db, &site).unwrap().contains("kept.example.com"));
+        assert!(existing_conf_text(&db, &site)
+            .unwrap()
+            .contains("kept.example.com"));
     }
 
     #[test]
@@ -1094,16 +1144,26 @@ mod tests {
         let dir = std::env::temp_dir().join("nginxwebui-test-include");
         let _ = std::fs::create_dir_all(&dir);
         let conf = dir.join("nginx.conf");
-        std::fs::write(&conf, "worker_processes 1;\nevents { worker_connections 64; }\n").unwrap();
+        std::fs::write(
+            &conf,
+            "worker_processes 1;\nevents { worker_connections 64; }\n",
+        )
+        .unwrap();
         let mut db = Db::new();
         db.set_setting("nginxPath", &conf.display().to_string());
-        db.set_setting("sitesEnabled", &dir.join("sites-enabled").display().to_string());
+        db.set_setting(
+            "sitesEnabled",
+            &dir.join("sites-enabled").display().to_string(),
+        );
         ensure_main_includes_sites(&db).unwrap();
         let text = std::fs::read_to_string(&conf).unwrap();
         assert!(text.contains("sites-enabled"));
         assert!(text.contains("http {"));
         ensure_main_includes_sites(&db).unwrap();
         let again = std::fs::read_to_string(&conf).unwrap();
-        assert_eq!(text.matches("sites-enabled").count(), again.matches("sites-enabled").count());
+        assert_eq!(
+            text.matches("sites-enabled").count(),
+            again.matches("sites-enabled").count()
+        );
     }
 }
