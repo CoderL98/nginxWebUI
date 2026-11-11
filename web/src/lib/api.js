@@ -83,7 +83,7 @@ export const api = {
     detail: (id) => get('/adminPage/site/detail', { id }),
     save: (row) => post('/adminPage/site/save', row),
     remove: (id) => post('/adminPage/site/del', { id }),
-    apply: (id) => post('/adminPage/site/apply', { id }),
+    apply: (id, extra = {}) => post('/adminPage/site/apply', { id, ...extra }),
     preview: (row) => post('/adminPage/site/preview', row),
     findCert: (domain) => get('/adminPage/site/findCert', { domain })
   },
@@ -128,7 +128,9 @@ export const api = {
     signal: (cmd) => post('/adminPage/conf/signal', { action: cmd }),
     status: () => get('/adminPage/conf/status'),
     saveCmd: (body) => post('/adminPage/conf/saveCmd', body),
-    write: () => post('/adminPage/conf/write', {})
+    write: () => post('/adminPage/conf/write', {}),
+    sitesInclude: () => get('/adminPage/conf/sitesInclude'),
+    applySitesInclude: () => post('/adminPage/conf/sitesInclude', { confirm: true })
   },
   bak: {
     list: () => get('/adminPage/bak/list'),
@@ -140,6 +142,7 @@ export const api = {
     tail: (name, lines) => get('/adminPage/log/tail', { name, lines }),
     operate: () => get('/adminPage/log/operate')
   },
+  admin: table('admin'),
   setting: {
     get: (key) => get('/adminPage/setting/get', { key }),
     set: (key, value) => post('/adminPage/setting/set', { key, value })

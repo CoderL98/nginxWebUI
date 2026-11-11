@@ -58,11 +58,20 @@
 
   onMount(load);
 
+  function askIncludeConfirm(r) {
+    if (!r || r.msg !== 'needsSitesIncludeConfirm') return false;
+    const preview = (r.obj && (r.obj.preview || r.obj.includeLine)) || '';
+    return confirm($tt('confirmSitesInclude') + '\n\n' + preview);
+  }
+
   async function apply(row) {
     busy = true;
     error = '';
-    const r = await api.site.apply(row.id);
-    if (!r.success) error = r.msg || $tt('failed');
+    let r = await api.site.apply(row.id);
+    if (!r.success && askIncludeConfirm(r)) {
+      r = await api.site.apply(row.id, { confirmInclude: true });
+    }
+    if (!r.success) error = $tt(r.msg) || r.msg || $tt('failed');
     busy = false;
     load();
   }

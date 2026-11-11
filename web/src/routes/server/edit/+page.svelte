@@ -220,13 +220,22 @@
     return s;
   }
 
+  function askIncludeConfirm(r) {
+    if (!r || r.msg !== 'needsSitesIncludeConfirm') return false;
+    const preview = (r.obj && (r.obj.preview || r.obj.includeLine)) || '';
+    return confirm($tt('confirmSitesInclude') + '\n\n' + preview);
+  }
+
   async function save(apply) {
     busy = true;
     error = '';
     note = '';
     output = '';
     try {
-      const r = await api.site.save(payload(apply));
+      let r = await api.site.save(payload(apply));
+      if (!r.success && askIncludeConfirm(r)) {
+        r = await api.site.save({ ...payload(apply), confirmInclude: true });
+      }
       if (r.success) {
         note = $tt('saved');
         output = (r.obj || {}).output || '';
@@ -480,6 +489,7 @@
           <div class="grid gap-1.5">
             <Label>{$tt('customBody')}</Label>
             <Textarea bind:value={loc.custom} rows={5} placeholder="try_files $uri $uri/ /index.html;" />
+            <p class="text-muted-foreground text-xs">{$tt('customBodyWarn')}</p>
           </div>
         {/if}
       </div>

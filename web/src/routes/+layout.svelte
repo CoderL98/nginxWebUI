@@ -24,6 +24,7 @@
     { href: '/conf', key: 'conf' },
     { href: '/log', key: 'log' },
     { href: '/password', key: 'password' },
+    { href: '/admins', key: 'admins' },
     { href: '/deny-allow', key: 'denyAllow' },
     { href: '/bak', key: 'bak' },
     { href: '/about', key: 'settings' }
