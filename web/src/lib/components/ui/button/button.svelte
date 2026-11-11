@@ -59,7 +59,6 @@
 	<a
 		bind:this={ref}
 		data-slot="button"
-		data-sveltekit-reload
 		class={cn(buttonVariants({ variant, size }), className)}
 		href={disabled ? undefined : href}
 		aria-disabled={disabled}

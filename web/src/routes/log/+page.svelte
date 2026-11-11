@@ -15,6 +15,7 @@
   let lines = $state(200);
   let error = $state('');
   let busy = $state(false);
+  let ops = $state([]);
 
   async function loadNames() {
     try {
@@ -24,6 +25,8 @@
       names = data.names || [];
       if (!current && names.length) current = names[0];
       if (current) await loadTail();
+      const o = await api.log.operate();
+      ops = Array.isArray(o.obj) ? o.obj.slice().reverse() : [];
     } catch {
       error = $tt('failed');
     }
@@ -45,7 +48,7 @@
 </script>
 
 <h1 class="mb-1 text-lg font-semibold">{$tt('log')}</h1>
-<p class="text-muted-foreground mb-4 text-sm">读取本机 nginx 日志文件末尾，不把整份日志载入内存。</p>
+<p class="text-muted-foreground mb-4 text-sm">{$tt('logHint')}</p>
 
 {#if error}
   <Alert.Root variant="destructive" class="mb-3"><Alert.Title>{error}</Alert.Title></Alert.Root>
@@ -70,10 +73,21 @@
         <NativeSelect.Option value={1000}>1000</NativeSelect.Option>
       </NativeSelect.Root>
     </div>
-    <Button variant="outline" onclick={loadTail} disabled={busy}>↻</Button>
+    <Button variant="outline" onclick={loadTail} disabled={busy} aria-label={$tt('refresh')}>↻</Button>
     <p class="text-muted-foreground w-full font-mono text-xs">{dir}</p>
   </Card.Content>
 </Card.Root>
+
+{#if ops.length}
+  <Card.Root class="mt-4">
+    <Card.Header>
+      <Card.Title>{$tt('operateLog')}</Card.Title>
+    </Card.Header>
+    <Card.Content class="overflow-x-auto">
+      <pre class="code">{ops.map((row) => [row.time, row.adminName, row.type, row.name, row.success, row.msg].filter(Boolean).join('  ')).join('\n')}</pre>
+    </Card.Content>
+  </Card.Root>
+{/if}
 
 <Card.Root>
   <Card.Content class="pt-6">

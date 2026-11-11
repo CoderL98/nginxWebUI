@@ -104,7 +104,7 @@
     if (!String(payload.GCORE_Key || '').trim()) delete payload.GCORE_Key;
     const r = await api.conf.saveCmd(payload);
     await api.install.auto(flagOn(form.autoInstall, false));
-    message = r.success ? $tt('saved') : $tt('failed');
+    message = r.success ? $tt('saved') : ($tt(r.msg) !== r.msg ? $tt(r.msg) : (r.msg || $tt('failed')));
     busy = false;
   }
 
@@ -164,7 +164,7 @@
         <Input bind:value={form.acmeSh} placeholder="/home/you/.acme.sh/acme.sh" />
       </div>
       <div class="grid gap-1.5">
-        <Label>acme home</Label>
+        <Label>{$tt('acmeHome')}</Label>
         <Input bind:value={form.acmeHome} placeholder="/home/you/.acme.sh" />
       </div>
       <div class="grid gap-1.5">
@@ -182,7 +182,7 @@
 
 <Card.Root class="mt-4">
   <Card.Header>
-    <Card.Title>nginx 路径</Card.Title>
+    <Card.Title>{$tt('nginxPaths')}</Card.Title>
     <Card.Description>{$tt('compatHint')}</Card.Description>
   </Card.Header>
   <Card.Content class="grid gap-3 sm:grid-cols-2">
@@ -191,8 +191,14 @@
       <Input bind:value={form.nginxExe} />
     </div>
     <div class="grid gap-1.5">
-      <Label>reload</Label>
-      <Input bind:value={form.reloadCmd} />
+      <Label>{$tt('reloadCmd')}</Label>
+      <select class="border-input bg-background h-9 rounded-md border px-2 text-sm" bind:value={form.reloadCmd}>
+        <option value="sudo -n systemctl reload nginx">sudo -n systemctl reload nginx</option>
+        <option value="systemctl reload nginx">systemctl reload nginx</option>
+        <option value="nginx -s reload">nginx -s reload</option>
+        <option value="/usr/sbin/nginx -s reload">/usr/sbin/nginx -s reload</option>
+        <option value="/usr/local/sbin/nginxwebui-priv reload">nginxwebui-priv reload</option>
+      </select>
     </div>
     <div class="grid gap-1.5">
       <Label>{$tt('nginxPath')}</Label>
@@ -203,11 +209,11 @@
       <Input bind:value={form.nginxDir} />
     </div>
     <div class="grid gap-1.5">
-      <Label>sites-available</Label>
+      <Label>{$tt('sitesAvailable')}</Label>
       <Input bind:value={form.sitesAvailable} />
     </div>
     <div class="grid gap-1.5">
-      <Label>sites-enabled</Label>
+      <Label>{$tt('sitesEnabled')}</Label>
       <Input bind:value={form.sitesEnabled} />
     </div>
     <div class="grid gap-1.5">
@@ -215,11 +221,11 @@
       <Input bind:value={form.sslDir} />
     </div>
     <div class="grid gap-1.5">
-      <Label>ssl-params.conf</Label>
+      <Label>{$tt('sslParams')}</Label>
       <Input bind:value={form.sslParams} />
     </div>
     <div class="grid gap-1.5 sm:col-span-2">
-      <Label>/var/www</Label>
+      <Label>{$tt('webRoot')}</Label>
       <Input bind:value={form.webRoot} />
     </div>
     <label class="{flagClass(form.autoInstall)} sm:col-span-2 w-fit">
@@ -244,9 +250,9 @@
 
 <Card.Root class="mt-4">
   <Card.Header>
-    <Card.Title>DNS 凭据</Card.Title>
+    <Card.Title>{$tt('dnsCreds')}</Card.Title>
     <Card.Description>
-      传给 acme.sh 的环境变量。也可事先写在 ~/.acme.sh/account.conf（SAVED_CF_Token / SAVED_GCORE_Key）。
+      {$tt('dnsCredsHint')}
     </Card.Description>
   </Card.Header>
   <Card.Content class="grid gap-3 sm:grid-cols-2">

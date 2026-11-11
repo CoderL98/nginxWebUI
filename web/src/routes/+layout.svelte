@@ -70,8 +70,8 @@
 {:else}
   <div class="bg-background min-h-svh md:grid md:grid-cols-[13rem_1fr]">
     <header class="bg-background sticky top-0 z-10 flex h-12 items-center gap-2 border-b px-3 md:col-span-2">
-      <Button variant="ghost" size="sm" class="md:hidden" onclick={() => (menuOpen = !menuOpen)}>☰</Button>
-      <a href="/" data-sveltekit-reload class="text-sm font-semibold">nginxWebUI</a>
+      <Button variant="ghost" size="sm" class="md:hidden" aria-label={$tt('menu')} onclick={() => (menuOpen = !menuOpen)}>☰</Button>
+      <a href="/" class="text-sm font-semibold">nginxWebUI</a>
       {#if version}<span class="text-muted-foreground text-[11px]">v{version}</span>{/if}
       <div class="flex-1"></div>
       <Button variant="ghost" size="sm" onclick={toggleLang}>{$tt('lang')}</Button>
@@ -84,7 +84,7 @@
         {#each menu as item}
           <a
             href={item.href}
-            data-sveltekit-reload
+           
             class="hover:bg-muted rounded-md px-3 py-2 text-sm {active === item.href ? 'bg-muted font-medium' : 'text-muted-foreground'}"
             onclick={() => (menuOpen = false)}
           >
@@ -93,10 +93,10 @@
         {/each}
         <div class="text-muted-foreground mt-3 px-3 text-[11px] uppercase">advanced</div>
         <p class="text-muted-foreground px-3 pb-1 text-[11px] leading-snug">{$tt('siteVsAdvanced')}</p>
-        <a href="/upstream" data-sveltekit-reload class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/upstream' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('upstream')}</a>
-        <a href="/stream" data-sveltekit-reload class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/stream' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('stream')}</a>
-        <a href="/http" data-sveltekit-reload class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/http' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('http')}</a>
-        <a href="/basic" data-sveltekit-reload class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/basic' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('basic')}</a>
+        <a href="/upstream" class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/upstream' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('upstream')}</a>
+        <a href="/stream" class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/stream' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('stream')}</a>
+        <a href="/http" class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/http' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('http')}</a>
+        <a href="/basic" class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/basic' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('basic')}</a>
       </nav>
     </aside>
 
