@@ -6,6 +6,7 @@
 
 mod acme;
 mod api;
+mod applog;
 mod auth;
 mod compat;
 mod conf;
@@ -19,7 +20,7 @@ mod store;
 mod sysinfo;
 mod www;
 
-use api::{Ctx, Req, Reply};
+use api::{Ctx, Reply, Req};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -51,7 +52,8 @@ const KOI_UTF: &str = include_str!("../assets/conf/koi-utf");
 const KOI_WIN: &str = include_str!("../assets/conf/koi-win");
 const WIN_UTF: &str = include_str!("../assets/conf/win-utf");
 
-const NGINX_CONF_TEMPLATE: &str = "worker_processes  1;\n\nevents {\n    worker_connections  1024;\n}\n";
+const NGINX_CONF_TEMPLATE: &str =
+    "worker_processes  1;\n\nevents {\n    worker_connections  1024;\n}\n";
 
 struct Options {
     port: u16,
@@ -81,7 +83,7 @@ fn parse_args() -> Options {
         println!("  --bind=127.0.0.1     监听地址（默认本机；Docker 需 0.0.0.0）");
         println!("  --project.home=DIR   数据目录");
         println!("  --web.dir=DIR        静态前端目录");
-        println!("  --threads=N          工作线程（默认 1）");
+        println!("  --threads=N          工作线程（默认 2）");
         println!();
         println!("优先顺序：命令行 > 环境变量 > 配置文件 > 默认值");
         std::process::exit(0);
@@ -92,7 +94,7 @@ fn parse_args() -> Options {
         bind: "127.0.0.1".into(),
         home: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         web: None,
-        threads: 1,
+        threads: 2,
         reload_cmd: None,
         secure_cookie: false,
         config_path: None,
@@ -405,7 +407,10 @@ fn find_web_dir(options: &Options, exe_dir: &Path) -> PathBuf {
             return candidate.clone();
         }
     }
-    candidates.into_iter().next().unwrap_or_else(|| PathBuf::from("web/build"))
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from("web/build"))
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -594,7 +599,14 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
             content_type = header.value.as_str().to_string();
         }
         if header.field.equiv("X-Forwarded-Proto") {
-            forwarded_https = header.value.as_str().split(',').next().unwrap_or("").trim().eq_ignore_ascii_case("https");
+            forwarded_https = header
+                .value
+                .as_str()
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("https");
         }
         if header.field.equiv("X-Forwarded-For") {
             forwarded_ip = header
@@ -610,8 +622,20 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
     let remote_ip = if !forwarded_ip.is_empty() {
         forwarded_ip
     } else {
-        request.remote_addr().map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".into())
+        request
+            .remote_addr()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|| "unknown".into())
     };
+
+    if path == "/healthz" || path == "/readyz" {
+        let reply = api::ok(serde_json::json!({
+            "ok": true,
+            "version": VERSION,
+        }));
+        respond(request, reply);
+        return;
+    }
 
     let is_api = path.starts_with("/adminPage/");
     let reply = if is_api {
@@ -675,6 +699,7 @@ fn main() {
     let data_dir = home.join("data");
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::fs::create_dir_all(home.join("logs"));
+    crate::applog::init(&home, None);
     if !nginx::unix_is_file("/etc/nginx/nginx.conf") {
         let _ = write_default_files(&home);
     }
@@ -687,21 +712,22 @@ fn main() {
 
     let web_dir = find_web_dir(&options, &exe_dir);
 
+    crate::applog::info(format!("nginxWebUI {VERSION} starting"));
     println!("nginxWebUI {} (Rust backend)", VERSION);
     if let Some(path) = &options.config_path {
         println!("  config    : {}", path.display());
     }
     println!("  home      : {}", home.display());
     println!("  web pages : {}", web_dir.display());
-    println!(
-        "  address   : http://{}:{}",
-        options.bind, options.port
-    );
+    println!("  address   : http://{}:{}", options.bind, options.port);
     if options.bind == "0.0.0.0" || options.bind == "::" {
         println!("  warning   : listening on all interfaces; do not expose this port on the public internet without HTTPS");
     }
     println!("  sqlite    : {}", store.db_path.display());
-    println!("  memory    : no JVM, local sqlite, {} worker threads", options.threads);
+    println!(
+        "  memory    : no JVM, local sqlite, {} worker threads",
+        options.threads
+    );
 
     let init_token = if store.db.rows("admin").is_empty() {
         let token = std::env::var("NGINXWEBUI_INIT_TOKEN")
@@ -746,11 +772,11 @@ fn main() {
             let (ok, out) = crate::acme::cron(&snapshot);
             crate::acme::job_finish(ok, &out);
             if !out.trim().is_empty() {
-                println!(
+                crate::applog::info(format!(
                     "acme.sh --cron (ok={}): {}",
                     ok,
                     out.chars().take(400).collect::<String>()
-                );
+                ));
             }
         });
     }
@@ -759,6 +785,7 @@ fn main() {
     let server = match tiny_http::Server::http(&address) {
         Ok(server) => Arc::new(server),
         Err(err) => {
+            crate::applog::error(format!("cannot listen on {address}: {err}"));
             eprintln!("cannot listen on {}: {}", address, err);
             std::process::exit(1);
         }
@@ -797,23 +824,21 @@ mod tests {
         fs::write(edit.join("index.html"), "edit").unwrap();
         fs::write(dir.join("app.js"), "js").unwrap();
 
-        assert!(resolve_static(&dir, "/")
-            .unwrap()
-            .ends_with("index.html"));
-        assert!(resolve_static(&dir, "/server")
-            .unwrap()
-            .ends_with("server\\index.html")
-            || resolve_static(&dir, "/server")
+        assert!(resolve_static(&dir, "/").unwrap().ends_with("index.html"));
+        assert!(
+            resolve_static(&dir, "/server")
                 .unwrap()
-                .ends_with("server/index.html"));
+                .ends_with("server\\index.html")
+                || resolve_static(&dir, "/server")
+                    .unwrap()
+                    .ends_with("server/index.html")
+        );
         assert!(resolve_static(&dir, "/server/edit?id=abc")
             .unwrap()
             .display()
             .to_string()
             .contains("edit"));
-        assert!(resolve_static(&dir, "/app.js")
-            .unwrap()
-            .ends_with("app.js"));
+        assert!(resolve_static(&dir, "/app.js").unwrap().ends_with("app.js"));
         assert!(resolve_static(&dir, "/missing").is_none());
         assert!(resolve_static(&dir, "/../secret").is_none());
     }
