@@ -50,6 +50,7 @@
   async function load() {
     try {
       const r = await api.site.list();
+      if (r.success === false) error = $tt(r.msg) || r.msg;
       rows = Array.isArray(r.obj) ? r.obj : [];
     } catch {
       error = $tt('failed');
@@ -78,7 +79,8 @@
 
   async function drop(row) {
     if (!confirm($tt('confirmDel'))) return;
-    await api.site.remove(row.id);
+    const r = await api.site.remove(row.id);
+    if (!r.success) error = $tt(r.msg) || r.msg || $tt('failed');
     load();
   }
 </script>

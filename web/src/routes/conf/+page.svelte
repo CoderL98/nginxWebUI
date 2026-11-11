@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api } from '$lib/api';
+  import { api, isRemote } from '$lib/api';
   import { tt } from '$lib/i18n';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
@@ -19,10 +19,20 @@
   let busy = $state(false);
   let editing = $state(false);
   let draft = $state('');
+  const remote = isRemote();
+
+  /** `obj.success` (current) or `obj.ok` (older agents). */
+  function passed(r) {
+    const out = (r && r.obj) || {};
+    if (typeof out.success === 'boolean') return out.success;
+    if (typeof out.ok === 'boolean') return out.ok;
+    return false;
+  }
 
   async function load() {
     try {
       const r = await api.conf.show();
+      if (r.success === false) error = $tt(r.msg) || r.msg;
       data = r.obj || {};
       files = data.files || [];
       draft = data.conf || '';
@@ -40,7 +50,7 @@
     message = '';
     const r = await api.conf.check();
     const out = r.obj || {};
-    message = (out.success ? '✓\n' : '✗\n') + (out.output || '');
+    message = r.success === false ? $tt(r.msg) || r.msg : (passed(r) ? '✓\n' : '✗\n') + (out.output || '');
     busy = false;
   }
 
@@ -49,7 +59,7 @@
     message = '';
     const r = await api.conf.reload();
     const out = r.obj || {};
-    message = (out.output || '') + (out.success ? '\n✓' : '\n✗');
+    message = r.success === false ? $tt(r.msg) || r.msg : (out.output || '') + (passed(r) ? '\n✓' : '\n✗');
     busy = false;
   }
 
@@ -98,6 +108,18 @@
       <Label>nginx prefix</Label>
       <Input value={data.nginxDir || ''} readonly />
     </div>
+    <details class="sm:col-span-2">
+      <summary class="text-muted-foreground cursor-pointer text-xs">{$tt('effectivePaths')}</summary>
+      <dl class="mt-2 grid gap-x-4 gap-y-1 font-mono text-xs sm:grid-cols-[auto_1fr]">
+        <dt class="text-muted-foreground">sites-available</dt><dd>{data.sitesAvailable || '—'}</dd>
+        <dt class="text-muted-foreground">sites-enabled</dt><dd>{data.sitesEnabled || '—'}</dd>
+        <dt class="text-muted-foreground">ssl</dt><dd>{data.sslDir || '—'}</dd>
+        <dt class="text-muted-foreground">ssl-params</dt><dd>{data.sslParams || '—'}</dd>
+        <dt class="text-muted-foreground">{$tt('webRoot')}</dt><dd>{data.webRoot || '—'}</dd>
+        <dt class="text-muted-foreground">{$tt('reloadCmd')}</dt><dd>{data.reloadCmd || '—'}</dd>
+        <dt class="text-muted-foreground">nginx</dt><dd>{data.nginxExe || '—'}</dd>
+      </dl>
+    </details>
     <div class="flex flex-wrap items-center gap-2 sm:col-span-2">
       <Badge variant={data.running ? 'default' : 'destructive'}>
         {data.running ? $tt('running') : $tt('stopped')}
@@ -107,8 +129,14 @@
     <div class="flex flex-wrap gap-2 sm:col-span-2">
       <Button variant="outline" onclick={check} disabled={busy}>{$tt('check')}</Button>
       <Button onclick={reload} disabled={busy}>{$tt('reload')}</Button>
+      {#if remote}
+        <span class="text-muted-foreground self-center text-xs">{$tt('remoteConfHint')}</span>
+      {:else}
       <Button variant="outline" onclick={writeGenerated} disabled={busy || data.canOverwrite === false}>{$tt('writeConf')}</Button>
-      {#if editing}
+      {/if}
+      {#if remote}
+        <!-- whole-file edits stay on the panel host -->
+      {:else if editing}
         <Button onclick={saveFiles} disabled={busy}>{$tt('save')}</Button>
         <Button variant="ghost" onclick={() => (editing = false)}>{$tt('cancel')}</Button>
       {:else}

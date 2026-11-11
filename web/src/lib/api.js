@@ -20,6 +20,10 @@ export function getCurrentNode() {
   return currentNode || 'local';
 }
 
+export function isRemote() {
+  return !!currentNode && currentNode !== 'local';
+}
+
 export function setCurrentNode(id) {
   currentNode = id || 'local';
   try {
@@ -41,7 +45,8 @@ function query(params) {
 }
 
 async function call(path, init = {}) {
-  const headers = { ...(init.headers || {}) };
+  // CSRF guard: the server refuses state-changing requests without it
+  const headers = { 'X-Requested-With': 'nginxwebui', ...(init.headers || {}) };
   if (currentNode && currentNode !== 'local') {
     headers['X-NginxWebUI-Node'] = currentNode;
   }
@@ -102,7 +107,9 @@ export const api = {
     renew: (id, force = true) => post('/adminPage/cert/renew', { id, force }),
     cron: () => post('/adminPage/cert/cron', {}),
     progress: () => get('/adminPage/cert/progress'),
-    status: () => get('/adminPage/cert/status')
+    status: () => get('/adminPage/cert/status'),
+    dns: () => get('/adminPage/cert/dns'),
+    dnsSave: (body) => post('/adminPage/cert/dnsSave', body)
   },
   site: {
     list: () => get('/adminPage/site/list'),
@@ -172,7 +179,9 @@ export const api = {
   node: {
     list: () => get('/adminPage/node/list'),
     save: (row) => post('/adminPage/node/save', row),
-    token: (id) => post('/adminPage/node/token', { id }),
+    token: (id, panelUrl) => post('/adminPage/node/token', { id, panelUrl }),
+    config: () => get('/adminPage/node/config'),
+    saveConfig: (panelUrl) => post('/adminPage/node/config', { panelUrl }),
     revoke: (id) => post('/adminPage/node/revoke', { id }),
     remove: (id) => post('/adminPage/node/del', { id })
   },

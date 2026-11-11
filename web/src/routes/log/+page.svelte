@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api } from '$lib/api';
+  import { api, isRemote } from '$lib/api';
   import { tt } from '$lib/i18n';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Label } from '$lib/components/ui/label/index.js';
@@ -16,10 +16,12 @@
   let error = $state('');
   let busy = $state(false);
   let ops = $state([]);
+  const remote = isRemote();
 
   async function loadNames() {
     try {
       const r = await api.log.names();
+      if (r.success === false) error = $tt(r.msg) || r.msg;
       const data = r.obj || {};
       dir = data.dir || '';
       names = data.names || [];
@@ -37,6 +39,7 @@
     busy = true;
     try {
       const r = await api.log.tail(current, lines);
+      if (r.success === false) error = $tt(r.msg) || r.msg;
       text = (r.obj || {}).text || '';
     } catch {
       error = $tt('failed');
@@ -48,7 +51,7 @@
 </script>
 
 <h1 class="mb-1 text-lg font-semibold">{$tt('log')}</h1>
-<p class="text-muted-foreground mb-4 text-sm">{$tt('logHint')}</p>
+<p class="text-muted-foreground mb-4 text-sm">{remote ? $tt('remoteLogHint') : $tt('logHint')}</p>
 
 {#if error}
   <Alert.Root variant="destructive" class="mb-3"><Alert.Title>{error}</Alert.Title></Alert.Root>
@@ -57,16 +60,16 @@
 <Card.Root class="mb-4">
   <Card.Content class="flex flex-wrap items-end gap-3 pt-6">
     <div class="grid min-w-40 gap-1.5">
-      <Label>{$tt('type')}</Label>
-      <NativeSelect.Root bind:value={current} onchange={loadTail}>
+      <Label for="log-name">{$tt('type')}</Label>
+      <NativeSelect.Root id="log-name" bind:value={current} onchange={loadTail}>
         {#each names as name}
           <NativeSelect.Option value={name}>{name}</NativeSelect.Option>
         {/each}
       </NativeSelect.Root>
     </div>
     <div class="grid min-w-28 gap-1.5">
-      <Label>lines</Label>
-      <NativeSelect.Root bind:value={lines} onchange={loadTail}>
+      <Label for="log-lines">lines</Label>
+      <NativeSelect.Root id="log-lines" bind:value={lines} onchange={loadTail}>
         <NativeSelect.Option value={100}>100</NativeSelect.Option>
         <NativeSelect.Option value={200}>200</NativeSelect.Option>
         <NativeSelect.Option value={500}>500</NativeSelect.Option>
@@ -81,7 +84,7 @@
 {#if ops.length}
   <Card.Root class="mt-4">
     <Card.Header>
-      <Card.Title>{$tt('operateLog')}</Card.Title>
+      <Card.Title>{$tt('panelOperateLog')}</Card.Title>
     </Card.Header>
     <Card.Content class="overflow-x-auto">
       <pre class="code">{ops.map((row) => [row.time, row.adminName, row.type, row.name, row.success, row.msg].filter(Boolean).join('  ')).join('\n')}</pre>

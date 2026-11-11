@@ -1,6 +1,6 @@
 <script>
   import { onMount, tick } from 'svelte';
-  import { api } from '$lib/api';
+  import { api, isRemote } from '$lib/api';
   import { tt } from '$lib/i18n';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
@@ -25,6 +25,41 @@
   let logEl = $state(null);
   let jobKind = $state('');
   let jobCertId = $state('');
+  const remote = isRemote();
+  let dns = $state({});
+  let dnsForm = $state({ CF_Token: '', CF_Account_ID: '', GCORE_Key: '', acmeEmail: '' });
+  let dnsNote = $state('');
+  const dnsKeys = ['CF_Token', 'CF_Account_ID', 'GCORE_Key'];
+
+  async function loadDns() {
+    try {
+      const r = await api.cert.dns();
+      if (r.success) {
+        dns = r.obj || {};
+        dnsForm = { CF_Token: '', CF_Account_ID: '', GCORE_Key: '', acmeEmail: dns.acmeEmail || '' };
+      }
+    } catch {
+      /* older agent */
+    }
+  }
+
+  async function saveDns(clearKey) {
+    dnsNote = '';
+    const body = { acmeEmail: dnsForm.acmeEmail };
+    for (const key of dnsKeys) {
+      if (dnsForm[key]) body[key] = dnsForm[key];
+    }
+    if (clearKey) body['clear_' + clearKey] = true;
+    const r = await api.cert.dnsSave(body);
+    if (r.success) {
+      dns = r.obj || {};
+      dnsForm = { CF_Token: '', CF_Account_ID: '', GCORE_Key: '', acmeEmail: dns.acmeEmail || '' };
+      dnsNote = $tt('dnsSaved');
+      await load();
+    } else {
+      error = $tt(r.msg) || r.msg || $tt('failed');
+    }
+  }
 
   const blank = {
     domain: '',
@@ -47,6 +82,7 @@
   async function load() {
     try {
       const r = await api.cert.list();
+      if (r.success === false) error = $tt(r.msg) || r.msg;
       const obj = r.obj || {};
       rows = Array.isArray(obj.certs) ? obj.certs : [];
       sslFiles = obj.sslFiles || [];
@@ -97,6 +133,7 @@
   }
 
   onMount(async () => {
+    loadDns();
     const job = await load();
     if (job && job.running) {
       busy = true;
@@ -169,6 +206,9 @@
 <p class="text-muted-foreground mb-4 text-sm">
   {$tt('compatHint')}
 </p>
+{#if remote}
+  <p class="text-muted-foreground mb-4 text-sm">{$tt('remoteCertHint')}</p>
+{/if}
 
 {#if error}
   <Alert.Root variant="destructive" class="mb-3"><Alert.Title>{error}</Alert.Title></Alert.Root>
@@ -189,12 +229,45 @@
     <Badge variant={acme.hasCf ? 'default' : 'outline'}>CF {acme.hasCf ? 'ok' : '—'}</Badge>
     <Badge variant={acme.hasGcore ? 'default' : 'outline'}>Gcore {acme.hasGcore ? 'ok' : '—'}</Badge>
     <Button variant="outline" onclick={runCron} disabled={busy || !acme.found}>acme.sh --cron</Button>
-    {#if !acme.found && canInstall}
+    {#if !acme.found && canInstall && !remote}
       <Button variant="outline" disabled={busy} onclick={async () => { busy = true; log = $tt('installing'); const r = await api.install.acme(); log = (r.obj || {}).output || r.msg || ''; busy = false; load(); }}>{$tt('installAcme')}</Button>
     {/if}
-    <Button variant="outline" href="/about">{$tt('settings')}</Button>
+    {#if !remote}
+      <Button variant="outline" href="/about">{$tt('settings')}</Button>
+    {/if}
     <Button variant="outline" disabled={busy} onclick={async () => { busy = true; const r = await api.cert.scan(); log = JSON.stringify((r.obj || {}).adopted || {}, null, 2); busy = false; load(); }}>{$tt('scanCerts')}</Button>
     <Button onclick={startNew}>{$tt('add')}</Button>
+  </Card.Content>
+</Card.Root>
+
+<Card.Root class="mb-4">
+  <Card.Header>
+    <Card.Title>{remote ? $tt('dnsDeviceTitle') : $tt('dnsCreds')}</Card.Title>
+    <Card.Description>{$tt('dnsCredsHint')} {$tt('secretKeep')}</Card.Description>
+  </Card.Header>
+  <Card.Content class="grid gap-3 sm:grid-cols-2">
+    {#each dnsKeys as key}
+      <div class="grid gap-1.5">
+        <Label for={'dns-' + key}>
+          {key}
+          {#if dns[key] && dns[key].set}<Badge variant="outline" class="ml-1">{$tt('secretSet')}</Badge>{/if}
+        </Label>
+        <div class="flex gap-2">
+          <Input id={'dns-' + key} type="password" autocomplete="off" bind:value={dnsForm[key]} placeholder={dns[key] && dns[key].set ? '••••••' : ''} />
+          {#if dns[key] && dns[key].set}
+            <Button variant="ghost" size="sm" aria-label={`${$tt('clearValue')} ${key}`} onclick={() => saveDns(key)}>{$tt('clearValue')}</Button>
+          {/if}
+        </div>
+      </div>
+    {/each}
+    <div class="grid gap-1.5">
+      <Label for="dns-acmeEmail">acme e-mail</Label>
+      <Input id="dns-acmeEmail" type="email" autocomplete="off" bind:value={dnsForm.acmeEmail} />
+    </div>
+    <div class="flex items-center gap-3 sm:col-span-2">
+      <Button variant="outline" onclick={() => saveDns('')} disabled={busy}>{$tt('save')}</Button>
+      {#if dnsNote}<span class="text-muted-foreground text-xs" role="status">{dnsNote}</span>{/if}
+    </div>
   </Card.Content>
 </Card.Root>
 
