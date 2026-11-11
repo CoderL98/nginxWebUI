@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Remote agents (v2 hardening)
+
+- Remote RPC now runs the same API handlers as the local panel (`{query, body}` params). Fixes remote `site/apply` by id wiping the row, partial saves dropping fields, and `conf/check` showing failure. Legacy agent replies (`{ok}`) are normalized.
+- Remote mapping covers sites (incl. save/del/findCert), certs (list/scan/save/del/apply/renew/cron), per-device DNS credentials (`cert/dns`, write-only), log names/tail, nginx status/test/reload/signal, `install/status` (read-only). Panel settings, admins, devices, export and backups always stay local; other areas return `notSupportedOnNode`.
+- Agents seed nginx paths like the panel, adopt existing sites/certs, run the acme renewal cron, and print effective paths.
+- Offline nodes fail fast with `nodeOfflineErr`; only mutating RPCs are written to the operate log.
+- One waiter per node: a newer poll supersedes the older one, timed-out polls are cleaned up, and a shared credential is flagged as a conflict.
+- Join no longer issues a credential when the database write fails; hello only writes when something changed.
+
+### Security (v2)
+
+- Admin writes require `X-Requested-With: nginxwebui` (403 `csrfRequired`).
+- `trusted_proxies` (off by default): forwarded headers are honored only from listed CIDRs.
+- Body limits (413) and per-IP rate limits on `/agent/install.sh`, `/agent/download`, `/agent/v1/join` (429).
+- Agent credentials are read only from the `Authorization` header; `agent.json` is written 0600 atomically; `NGINXWEBUI_AGENT_CREDENTIAL` supported. `--insecure` removed.
+- Import keeps existing device credential hashes, cert secrets and password-type settings.
+- `install.sh` installs a systemd service as root, refuses non-loopback `http://` unless `NGINXWEBUI_ALLOW_HTTP=1`.
+- Install commands use the configured panel URL (`agentPanelUrl`) and warn about loopback or plain-http URLs.
+
+### Packaging & UI (v2)
+
+- Release builds and the Docker image ship `nginxwebui-agent`; `agent_threads` is configurable (default 32).
+- Device switcher on small screens, remote-mode banners, panel-only items hidden or tagged, device page with panel URL, revoke vs delete, rename, conflict flag and auto-refresh.
+- Clippy is clean and CI runs `clippy -D warnings`.
+
 ### Security
 
 - Default listen address is `127.0.0.1`; Docker images still bind `0.0.0.0` and compose publishes the panel to `127.0.0.1:8080`.

@@ -29,6 +29,14 @@ SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调�
 
 面板可作为注册中心，被控端运行出站 `nginxwebui-agent`，无需开放入站端口。本机仍是默认节点。说明见 [docs/remote-registry.md](docs/remote-registry.md)。多机模式下面板需要能被 agent 访问（建议 HTTPS 反代）。
 
+要点（详见文档）：
+
+- 被控端需预装 nginx 与 acme.sh；远程 DNS 凭据按设备保存；agent 自带证书续签。
+- 在「设备」页设置面板地址；安装脚本以 root 安装为 systemd 服务，拒绝非回环 `http://`（`NGINXWEBUI_ALLOW_HTTP=1` 可放行）；`--insecure` 已移除。
+- 面板在反代后面时设置 `trusted_proxies`（默认不信任转发头）；设备多时调大 `agent_threads`。
+- 自写脚本调用后台写接口需带请求头 `X-Requested-With: nginxwebui`。
+- 设备凭证不进导出 / 备份；面板与 agent 请保持同一版本。
+
 ## 目录
 
 - `server/` — Rust 进程：JSON API + 托管 `web/build`
