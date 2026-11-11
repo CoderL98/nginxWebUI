@@ -234,7 +234,15 @@ fn layout(db: &mut Db) -> Result<String, String> {
 
     let log_dir = site::access_log_dir(db);
     let _ = crate::privfs::mkdir_all(&log_dir);
-    let _ = site::ensure_main_includes_sites(db);
+    match site::ensure_main_includes_sites(db) {
+        Ok(site::SitesIncludeOutcome::NeedsConfirm { include_line, .. }) => {
+            crate::applog::warn(format!(
+                "nginx.conf has no active http block (only a commented one); not inserting `{include_line}` automatically"
+            ));
+        }
+        Err(err) => crate::applog::warn(format!("ensure sites-enabled include: {err}")),
+        _ => {}
+    }
     Ok("layout ready".into())
 }
 

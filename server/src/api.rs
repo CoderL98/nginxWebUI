@@ -127,6 +127,16 @@ fn actor(ctx: &Ctx, req: &Req) -> String {
         .unwrap_or_else(|| "system".into())
 }
 
+pub fn record_system_operate(
+    store: &mut Store,
+    action: &str,
+    target: &str,
+    ok: bool,
+    detail: &str,
+) {
+    record_operate(store, "system", action, target, ok, detail);
+}
+
 fn record_operate(
     store: &mut Store,
     who: &str,
@@ -240,10 +250,9 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             };
             let sessions = ctx.sessions.lock().unwrap();
             let signed_in = sessions.is_signed_in(&token);
-            let name = sessions
-                .get(&token)
-                .map(|s| s.admin_name.clone())
-                .unwrap_or_default();
+            let session = sessions.get(&token);
+            let name = session.map(|s| s.admin_name.clone()).unwrap_or_default();
+            let admin_id = session.map(|s| s.admin_id.clone()).unwrap_or_default();
             drop(sessions);
             ok(json!({
                 "adminCount": admin_count,
@@ -251,6 +260,7 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 "needInitToken": admin_count == 0,
                 "signedIn": signed_in,
                 "name": name,
+                "adminId": admin_id,
                 "lang": lang,
                 "version": crate::VERSION,
                 "javaFree": true,
@@ -574,8 +584,111 @@ fn monitor(ctx: &Ctx) -> Reply {
 
 // ---------------------------------------------------------------------- conf
 
+fn sites_include_obj(db: &crate::store::Db) -> Value {
+    match crate::site::peek_sites_include(db) {
+        Ok(crate::site::InsertPlanView::NeedsConfirm {
+            include_line,
+            preview,
+            reason,
+        }) => json!({
+            "status": "needsConfirm",
+            "includeLine": include_line,
+            "preview": preview,
+            "reason": reason,
+        }),
+        Ok(crate::site::InsertPlanView::Ready { new_text }) => json!({
+            "status": "ready",
+            "preview": new_text,
+        }),
+        Ok(crate::site::InsertPlanView::AlreadyPresent) => json!({
+            "status": "alreadyPresent",
+        }),
+        Err(err) => json!({ "status": "error", "error": err }),
+    }
+}
+
+fn fail_maybe_include(db: &crate::store::Db, err: &str, extra: Value) -> Reply {
+    if err == "needsSitesIncludeConfirm" {
+        let mut obj = extra;
+        if let Value::Object(map) = &mut obj {
+            if let Value::Object(src) = sites_include_obj(db) {
+                for (k, v) in src {
+                    map.insert(k, v);
+                }
+            }
+        }
+        return json_reply(
+            200,
+            &json!({
+                "success": false,
+                "msg": err,
+                "obj": obj,
+            }),
+        );
+    }
+    if extra == Value::Null {
+        return fail(err);
+    }
+    json_reply(
+        200,
+        &json!({
+            "success": false,
+            "msg": err,
+            "obj": extra,
+        }),
+    )
+}
+
 fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
     match action {
+        "sitesInclude" => {
+            let confirm = bool_of(&body(req), "confirm", false);
+            let store = ctx.store.lock().unwrap();
+            if confirm {
+                match crate::site::apply_sites_include(&store.db, true) {
+                    Ok(crate::site::SitesIncludeOutcome::Written) => {
+                        ok(json!({ "status": "written" }))
+                    }
+                    Ok(crate::site::SitesIncludeOutcome::AlreadyPresent) => {
+                        ok(json!({ "status": "alreadyPresent" }))
+                    }
+                    Ok(crate::site::SitesIncludeOutcome::NeedsConfirm {
+                        include_line,
+                        preview,
+                        reason,
+                    }) => json_reply(
+                        200,
+                        &json!({
+                            "success": false,
+                            "msg": "needsSitesIncludeConfirm",
+                            "obj": {
+                                "status": "needsConfirm",
+                                "includeLine": include_line,
+                                "preview": preview,
+                                "reason": reason,
+                            }
+                        }),
+                    ),
+                    Err(err) => fail(&err),
+                }
+            } else {
+                let obj = sites_include_obj(&store.db);
+                if obj.get("status").and_then(|v| v.as_str()) == Some("needsConfirm") {
+                    json_reply(
+                        200,
+                        &json!({
+                            "success": false,
+                            "msg": "needsSitesIncludeConfirm",
+                            "obj": obj,
+                        }),
+                    )
+                } else if obj.get("status").and_then(|v| v.as_str()) == Some("error") {
+                    fail(obj.get("error").and_then(|v| v.as_str()).unwrap_or("error"))
+                } else {
+                    ok(obj)
+                }
+            }
+        }
         "show" => {
             let store = ctx.store.lock().unwrap();
             let preview = nginx::preview(&store.db);
@@ -1113,6 +1226,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         "save" => {
             let body = body(req);
             let apply_now = bool_of(&body, "apply", false);
+            let confirm_include = bool_of(&body, "confirmInclude", false);
             let mut row = body.clone();
             let kind = crate::site::site_kind(&row);
             let mut domain = field(&body, "domain").trim().to_string();
@@ -1132,6 +1246,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 map.insert("domain".into(), domain.clone().into());
                 map.insert("kind".into(), kind.clone().into());
                 map.remove("apply");
+                map.remove("confirmInclude");
                 if kind == "forward" {
                     map.insert("ssl".into(), false.into());
                     map.insert("redirect".into(), false.into());
@@ -1167,7 +1282,12 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 map.insert("locations".into(), Value::Array(locs));
             }
             let id = store.db.upsert("site", row.clone());
-            let saved = store.db.get("site", &id).unwrap_or(row);
+            let mut saved = store.db.get("site", &id).unwrap_or(row);
+            if confirm_include {
+                if let Value::Object(map) = &mut saved {
+                    map.insert("confirmInclude".into(), true.into());
+                }
+            }
             let mut output = String::new();
             if apply_now {
                 if crate::install::should_ensure(&store.db)
@@ -1207,14 +1327,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                         if let Err(reply) = persist(&store) {
                             return reply;
                         }
-                        return json_reply(
-                            200,
-                            &json!({
-                                "success": false,
-                                "obj": { "id": id },
-                                "msg": err
-                            }),
-                        );
+                        return fail_maybe_include(&store.db, &err, json!({ "id": id }));
                     }
                 }
             }
@@ -1240,7 +1353,9 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             ok(json!({ "tested": ok_t, "output": out }))
         }
         "apply" => {
-            let id = field(&body(req), "id");
+            let req_body = body(req);
+            let id = field(&req_body, "id");
+            let confirm_include = bool_of(&req_body, "confirmInclude", false);
             let who = actor(ctx, req);
             let (row, db) = {
                 let mut store = ctx.store.lock().unwrap();
@@ -1258,7 +1373,14 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     }
                 }
                 match store.db.get("site", &id) {
-                    Some(row) => (row, store.db.clone()),
+                    Some(mut row) => {
+                        if confirm_include {
+                            if let Value::Object(map) = &mut row {
+                                map.insert("confirmInclude".into(), true.into());
+                            }
+                        }
+                        (row, store.db.clone())
+                    }
                     None => return fail("not found"),
                 }
             };
@@ -1275,7 +1397,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     let mut store = ctx.store.lock().unwrap();
                     record_operate(&mut store, &who, "site.apply", &id, false, &err);
                     let _ = persist(&store);
-                    fail(&err)
+                    fail_maybe_include(&db, &err, json!({ "id": id }))
                 }
             }
         }
@@ -1615,21 +1737,42 @@ fn admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         }
         "save" => {
             let body = body(req);
-            let mut row = body.clone();
-            if !row.is_object() {
-                return fail("badRequest");
+            let name = field(&body, "name").trim().to_string();
+            if name.is_empty() {
+                return fail("nameRequired");
             }
             let pass = field(&body, "pass");
-            if !pass.is_empty() {
-                let hashed = match hash_password(&pass) {
-                    Ok(h) => h,
-                    Err(_) => return fail("passTooShort"),
-                };
-                if let Value::Object(map) = &mut row {
+            let id_in = field(&body, "id");
+            let mut store = ctx.store.lock().unwrap();
+            let mut row = if !id_in.is_empty() {
+                store
+                    .db
+                    .get("admin", &id_in)
+                    .unwrap_or_else(|| json!({ "id": id_in }))
+            } else {
+                json!({})
+            };
+            if let Value::Object(map) = &mut row {
+                map.insert("name".into(), name.into());
+                if pass.is_empty() {
+                    let existing = map
+                        .get("pass")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if existing.is_empty() {
+                        return fail("passRequired");
+                    }
+                } else {
+                    let hashed = match hash_password(&pass) {
+                        Ok(h) => h,
+                        Err(_) => return fail("passTooShort"),
+                    };
                     map.insert("pass".into(), hashed.into());
                 }
+            } else {
+                return fail("badRequest");
             }
-            let mut store = ctx.store.lock().unwrap();
             let id = store.db.upsert("admin", row);
             record_operate(&mut store, &actor(ctx, req), "admin.save", &id, true, "");
             if let Err(reply) = persist(&store) {
@@ -1639,6 +1782,21 @@ fn admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         }
         "del" => {
             let id = field(&body(req), "id");
+            if id.is_empty() {
+                return fail("badRequest");
+            }
+            let me = {
+                let token = token_of(req);
+                ctx.sessions
+                    .lock()
+                    .unwrap()
+                    .get(&token)
+                    .map(|s| s.admin_id.clone())
+                    .unwrap_or_default()
+            };
+            if !me.is_empty() && me == id {
+                return fail("cannotDeleteSelf");
+            }
             let mut store = ctx.store.lock().unwrap();
             if store.db.rows("admin").len() <= 1 {
                 return fail("lastAdmin");
@@ -2355,5 +2513,73 @@ mod tests {
             ),
         );
         assert_eq!(body_of(&reply)["msg"], "unsafeCommand");
+    }
+
+    #[test]
+    fn cannot_delete_current_admin() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        {
+            let mut store = ctx.store.lock().unwrap();
+            store
+                .db
+                .upsert("admin", json!({ "id": "1", "name": "tester", "pass": "x" }));
+            store
+                .db
+                .upsert("admin", json!({ "id": "2", "name": "other", "pass": "y" }));
+            store.flush().unwrap();
+        }
+        let reply = handle(
+            &ctx,
+            &test_req("/adminPage/admin/del", json!({ "id": "1" }), &token),
+        );
+        assert_eq!(body_of(&reply)["msg"], "cannotDeleteSelf");
+        assert_eq!(ctx.store.lock().unwrap().db.rows("admin").len(), 2);
+
+        let reply = handle(
+            &ctx,
+            &test_req("/adminPage/admin/del", json!({ "id": "2" }), &token),
+        );
+        assert_eq!(body_of(&reply)["success"], true);
+        assert_eq!(ctx.store.lock().unwrap().db.rows("admin").len(), 1);
+    }
+
+    #[test]
+    fn admin_save_without_password_keeps_existing_hash() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        {
+            let mut store = ctx.store.lock().unwrap();
+            store.db.upsert(
+                "admin",
+                json!({ "id": "9", "name": "keep", "pass": "hashed-old" }),
+            );
+            store.flush().unwrap();
+        }
+        let reply = handle(
+            &ctx,
+            &test_req(
+                "/adminPage/admin/save",
+                json!({ "id": "9", "name": "keep-renamed" }),
+                &token,
+            ),
+        );
+        assert_eq!(body_of(&reply)["success"], true);
+        let row = ctx.store.lock().unwrap().db.get("admin", "9").unwrap();
+        assert_eq!(row["name"], "keep-renamed");
+        assert_eq!(row["pass"], "hashed-old");
+    }
+
+    #[test]
+    fn cron_failure_writes_operate_log() {
+        let ctx = test_ctx();
+        {
+            let mut store = ctx.store.lock().unwrap();
+            record_system_operate(&mut store, "acme.cron", "", false, "acme failed");
+            store.flush().unwrap();
+            assert!(store.db.rows("operateLog").iter().any(|row| {
+                str_of(row, "type") == "acme.cron" && str_of(row, "success") == "false"
+            }));
+        }
     }
 }

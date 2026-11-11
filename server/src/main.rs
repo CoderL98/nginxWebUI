@@ -707,7 +707,15 @@ fn main() {
     let mut store = Store::open(&data_dir);
     seed(&mut store.db, &home, options.reload_cmd.as_deref());
     let _ = crate::compat::adopt(&mut store.db);
-    let _ = crate::site::ensure_main_includes_sites(&store.db);
+    match crate::site::ensure_main_includes_sites(&store.db) {
+        Ok(crate::site::SitesIncludeOutcome::NeedsConfirm { include_line, .. }) => {
+            crate::applog::warn(format!(
+                "nginx.conf has no active http block (only a commented one); not inserting `{include_line}` automatically"
+            ));
+        }
+        Err(err) => crate::applog::warn(format!("ensure sites-enabled include: {err}")),
+        _ => {}
+    }
     let _ = store.flush();
 
     let web_dir = find_web_dir(&options, &exe_dir);
@@ -771,6 +779,21 @@ fn main() {
             }
             let (ok, out) = crate::acme::cron(&snapshot);
             crate::acme::job_finish(ok, &out);
+            if !ok {
+                let mut store = app.store.lock().unwrap();
+                crate::api::record_system_operate(
+                    &mut store,
+                    "acme.cron",
+                    "",
+                    false,
+                    if out.trim().is_empty() {
+                        "acme.sh --cron failed"
+                    } else {
+                        &out
+                    },
+                );
+                let _ = store.flush();
+            }
             if !out.trim().is_empty() {
                 crate::applog::info(format!(
                     "acme.sh --cron (ok={}): {}",
