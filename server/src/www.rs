@@ -10,6 +10,10 @@ use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 
+pub const MAX_ZIP_ENTRIES: usize = 2000;
+pub const MAX_ZIP_FILE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_ZIP_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
 pub fn web_root(db: &Db) -> PathBuf {
     site::web_root_base(db)
 }
@@ -115,7 +119,11 @@ pub fn unzip_bytes(bytes: &[u8], dest: &Path) -> Result<Vec<String>, String> {
     crate::privfs::mkdir_www(dest)?;
     let dest_canon = fs::canonicalize(dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err("zipTooManyFiles".into());
+    }
     let mut written: Vec<String> = Vec::new();
+    let mut total = 0u64;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
         let name = file.name().to_string();
@@ -131,9 +139,12 @@ pub fn unzip_bytes(bytes: &[u8], dest: &Path) -> Result<Vec<String>, String> {
         if let Some(parent) = dest_path.parent() {
             crate::privfs::mkdir_all(parent)?;
         }
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-        crate::privfs::write(&dest_path, &buf)?;
+        let n = crate::privfs::write_limited(&dest_path, &mut file, MAX_ZIP_FILE_BYTES)?;
+        total = total.saturating_add(n);
+        if total > MAX_ZIP_TOTAL_BYTES {
+            let _ = crate::privfs::remove_file(&dest_path);
+            return Err("zipTooLarge".into());
+        }
         written.push(rel.display().to_string());
     }
     Ok(written)
@@ -289,6 +300,43 @@ mod tests {
             safe_zip_name("site/css/app.css").unwrap(),
             PathBuf::from("site/css/app.css")
         );
+    }
+
+    fn zip_bytes(name: &str, payload: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file(name, options).unwrap();
+            writer.write_all(payload).unwrap();
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn unzip_rejects_oversize_file() {
+        let dest = std::env::temp_dir().join(format!("nginxwebui-zip-oversize-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&dest).unwrap();
+        let payload = vec![b'x'; (MAX_ZIP_FILE_BYTES as usize) + 1];
+        let bytes = zip_bytes("huge.txt", &payload);
+        let err = unzip_bytes(&bytes, &dest).unwrap_err();
+        assert!(err.contains("zipTooLarge"), "{err}");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn unzip_writes_small_file() {
+        let dest = std::env::temp_dir().join(format!("nginxwebui-zip-ok-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir_all(&dest).unwrap();
+        let bytes = zip_bytes("ok.txt", b"hello");
+        let written = unzip_bytes(&bytes, &dest).unwrap();
+        assert_eq!(written, vec!["ok.txt".to_string()]);
+        assert_eq!(fs::read_to_string(dest.join("ok.txt")).unwrap(), "hello");
+        let _ = fs::remove_dir_all(&dest);
     }
 
     #[test]
