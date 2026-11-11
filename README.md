@@ -12,9 +12,9 @@ SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调�
 | --- | --- |
 | 登录 / 管理员 | 有 |
 | 静态站 / 反代 / 路径规则 | 有（表单对齐原项目；文件写 Debian sites-available，nginx -t 失败回滚） |
-| 静态站 zip 上传 | 有（解压到 /var/www，16MB，拒绝 zip-slip） |
+| 静态站 zip 上传 | 有（解压到 /var/www；条目/单文件/合计未压缩大小受限，拒绝 zip-slip） |
 | 证书签发续签 | 有（本机 acme.sh，Cloudflare / Gcore DNS） |
-| nginx / acme.sh 缺失时安装 | 有（Linux 包管理器 + 官方 acme.sh 安装脚本；可关闭自动安装） |
+| nginx / acme.sh 缺失时安装 | 有（默认关闭自动安装；需在设置页二次确认。Linux 包管理器 + 官方 acme.sh 安装脚本） |
 | nginx -t / reload / 启停 | 有（本机 nginx / systemctl） |
 | 日志尾部 | 有 |
 | SQLite | 有（进程内 rusqlite，无独立数据库服务） |
@@ -36,7 +36,7 @@ Linux：
 
 ```bash
 chmod +x script/linux/*.sh
-sudo script/linux/setup-sudo.sh   # 一次性：给当前用户免密写 nginx，不要 sudo 启动 UI
+sudo script/linux/setup-sudo.sh   # 一次性：给当前用户免密写 nginx；不授权 apt/dnf，不要 sudo 启动 UI
 script/linux/deploy.sh            # 普通用户
 ```
 
@@ -54,11 +54,13 @@ script\windows\build-linux.ps1
 
 产物在 `dist/linux-x86_64/nginxwebui`。ARM 用 `-Target aarch64-unknown-linux-musl`。说明见 `script/README.md`。
 
-浏览器打开配置里的端口（默认 `http://127.0.0.1:8080`）。数据、日志、pid 默认在 `{仓库}/.run-home`。
+浏览器打开配置里的端口（默认只监听 `http://127.0.0.1:8080`）。远程访问请在 `nginxwebui.conf` 设 `bind = 0.0.0.0`，**不要把面板裸奔在公网**，公网请经 HTTPS 反向代理。数据、日志、pid 默认在 `{仓库}/.run-home`。
+
+第一次启动且还没有管理员时，控制台 / 日志会打印一次性初始化令牌（也可用 `NGINXWEBUI_INIT_TOKEN` 指定）。登录页创建管理员必须填写该令牌和验证码。
 
 ## Docker
 
-容器内已装 nginx + acme.sh，监听 `0.0.0.0:8080`（以及 80/443）。reload 用 `nginx -s reload`，不必再指定绑定地址。
+容器内已装 nginx + acme.sh。镜像和 compose **必须**把管理面板绑到 `0.0.0.0`（`bind = 0.0.0.0` / `NGINXWEBUI_BIND=0.0.0.0`），否则端口映射会失效；同时监听 80/443。公网请在前面加 HTTPS 反代。reload 用 `nginx -s reload`。
 
 ```bash
 docker compose up -d --build

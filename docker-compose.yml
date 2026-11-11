@@ -10,8 +10,10 @@ services:
       - "443:443"
     # 端口、路径改 volume 里的 /home/nginxWebUI/nginxwebui.conf
     # 这里的 8080:8080 要和配置文件里的 port 一致
+    # 镜像默认 bind=0.0.0.0（否则端口映射失效）。公网请在前面加 HTTPS 反代，不要裸奔。
     environment:
       NGINXWEBUI_START_NGINX: "1"
+      NGINXWEBUI_BIND: "0.0.0.0"
     volumes:
       - nginxwebui-data:/home/nginxWebUI
       - nginxwebui-sites-available:/etc/nginx/sites-available

@@ -2,6 +2,7 @@
 # Allow the nginxWebUI process user to write site files under /etc/nginx and /var/www.
 # Usage: sudo script/linux/setup-sudo.sh
 # Does not start the UI as root. The process stays a normal user.
+# Does not grant apt/dnf/yum — package installs still need a separate privilege.
 set -euo pipefail
 # shellcheck source=env.sh
 source "$(cd "$(dirname "$0")" && pwd)/env.sh"

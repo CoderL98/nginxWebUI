@@ -13,17 +13,22 @@
 
 ```
 port = 9000
+bind = 127.0.0.1
 home = .run-home
 web_dir = .run-home/web
 ```
 
 相对路径相对于配置文件所在目录。优先顺序：命令行 > 环境变量 > 配置文件 > 默认值。也可设 `NGINXWEBUI_CONFIG` 指向另一份文件。
 
+默认 `bind = 127.0.0.1`。需要局域网/远程访问时改为 `0.0.0.0`（或 `NGINXWEBUI_BIND`），并经 HTTPS 反向代理，不要裸奔面板。Docker 镜像默认 `0.0.0.0`，否则端口映射无效。
+
+管理员表为空时，启动日志会打印一次性初始化令牌（可用 `NGINXWEBUI_INIT_TOKEN` 覆盖）。浏览器创建第一个管理员必须填写该令牌和验证码。
+
 ## Linux
 
 ```bash
 chmod +x script/linux/*.sh
-sudo script/linux/setup-sudo.sh # 一次性：助手 + sudoers（不要 sudo 启动 UI）
+sudo script/linux/setup-sudo.sh # 一次性：助手 + sudoers（不要 sudo 启动 UI；不授权 apt/dnf）
 script/linux/deploy.sh          # 前后端一起构建并启动（普通用户）
 script/linux/deploy-web.sh      # 只构建前端
 script/linux/deploy-server.sh   # 只构建并重启后端
@@ -34,7 +39,7 @@ script/linux/stop.sh            # 停止后端（以及开发用 Vite）；会�
 
 **不要用 `sudo script/linux/start-server.sh` / `deploy.sh`。** 整个管理进程以 root 跑时，界面被打穿就是整机 root，pid/日志/数据目录也会变成 root 属主。
 
-正确做法：进程用当前用户启动。`setup-sudo.sh` 安装 root 属主的 `/usr/local/sbin/nginxwebui-priv`（只允许改 `/etc/nginx`、`/var/www`、`/var/log/nginx`，以及 `nginx -t` / 启停 reload、读日志）。并给该用户免密执行助手、`systemctl start|stop|reload|enable nginx`、`nginx -t`。普通用户直接跑 `nginx -t` 会因打不开 `/run/nginx.pid` 而误报失败。启动脚本若检测到 EUID=0 会退出（容器或 `NGINXWEBUI_ALLOW_ROOT=1` 除外）；若写不了 `/etc/nginx` 且助手未就绪也会退出。
+正确做法：进程用当前用户启动。`setup-sudo.sh` 安装 root 属主的 `/usr/local/sbin/nginxwebui-priv`（只允许改 `/etc/nginx`、`/var/www`、`/var/log/nginx`，以及 `nginx -t` / 启停 reload、读日志）。并给该用户免密执行助手、`systemctl start|stop|reload|enable nginx`、`nginx -t`。**不会**授权 `apt` / `dnf` / `yum`，因此设置页安装软件包仍需要另外的权限。普通用户直接跑 `nginx -t` 会因打不开 `/run/nginx.pid` 而误报失败。启动脚本若检测到 EUID=0 会退出（容器或 `NGINXWEBUI_ALLOW_ROOT=1` 除外）；若写不了 `/etc/nginx` 且助手未就绪也会退出。
 
 ## Windows
 
@@ -84,7 +89,7 @@ chmod 755 nginxwebui
 docker compose up -d --build
 ```
 
-- 管理端口 8080（已绑定 0.0.0.0）
+- 管理端口 8080（镜像默认 `bind = 0.0.0.0` / `NGINXWEBUI_BIND=0.0.0.0`，否则端口映射失效；公网请加 HTTPS 反代）
 - 容器内 nginx 占用 80/443
 - reload：`nginx -s reload`
 - 数据：`nginxwebui-data` 等 named volume

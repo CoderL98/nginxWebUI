@@ -41,6 +41,7 @@ load_conf_file() {
         key="$(printf '%s' "$key" | tr 'A-Z-' 'a-z_')"
         case "$key" in
             port|server.port|server_port) CONF_PORT="$val" ;;
+            bind|listen|server.bind|server_bind) CONF_BIND="$val" ;;
             home|project.home|project_home) CONF_HOME="$(resolve_conf_path "$base" "$val")" ;;
             web_dir|web.dir|web) CONF_WEB="$(resolve_conf_path "$base" "$val")" ;;
             threads) CONF_THREADS="$val" ;;
@@ -54,6 +55,7 @@ load_conf_file() {
 
 CONF_FILE=""
 CONF_PORT=""
+CONF_BIND=""
 CONF_HOME=""
 CONF_WEB=""
 CONF_THREADS=""
@@ -71,6 +73,7 @@ elif [[ -f /etc/nginxwebui.conf ]]; then
 fi
 
 PORT="${NGINXWEBUI_PORT:-${CONF_PORT:-8080}}"
+BIND="${NGINXWEBUI_BIND:-${CONF_BIND:-127.0.0.1}}"
 HOME_DIR="${NGINXWEBUI_HOME:-${CONF_HOME:-$ROOT/.run-home}}"
 WEB_DIR="${NGINXWEBUI_WEB_DIR:-${CONF_WEB:-$ROOT/web/build}}"
 BIN_DIR="${NGINXWEBUI_BIN_DIR:-$HOME_DIR/bin}"

@@ -33,6 +33,7 @@ RUN chmod 755 /opt/nginxwebui/nginxwebui /entrypoint.sh \
     && mkdir -p /home/nginxWebUI /etc/nginx/ssl /var/www
 
 ENV NGINXWEBUI_PORT=8080 \
+    NGINXWEBUI_BIND=0.0.0.0 \
     NGINXWEBUI_HOME=/home/nginxWebUI \
     NGINXWEBUI_WEB_DIR=/opt/nginxwebui/web \
     NGINXWEBUI_RELOAD_CMD="nginx -s reload" \

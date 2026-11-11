@@ -6,7 +6,7 @@ source "$(cd "$(dirname "$0")" && pwd)/env.sh"
 require_not_root
 
 if is_running "$PID_FILE"; then
-    echo "后端已在运行 pid=$(cat "$PID_FILE")  http://127.0.0.1:$PORT"
+    echo "后端已在运行 pid=$(cat "$PID_FILE")  http://$BIND:$PORT"
     exit 0
 fi
 rm -f "$PID_FILE"
@@ -17,7 +17,7 @@ if [[ -n "$orphans" ]] || port_busy; then
     stop_backend
 fi
 if port_busy; then
-    echo "无法绑定 0.0.0.0:$PORT，地址已被占用。" >&2
+    echo "无法绑定 $BIND:$PORT，地址已被占用。" >&2
     echo "stop.sh 只靠 pid 文件时会漏掉这类进程。" >&2
     port_hint
     exit 1
@@ -36,7 +36,7 @@ if [[ ! -f "$WEB_DIR/index.html" ]]; then
 fi
 require_nginx_write
 
-ARGS=(--server.port="$PORT" --project.home="$HOME_DIR" --web.dir="$WEB_DIR")
+ARGS=(--server.port="$PORT" --bind="$BIND" --project.home="$HOME_DIR" --web.dir="$WEB_DIR")
 if [[ -n "${CONF_FILE:-}" ]]; then
     ARGS=(--config="$CONF_FILE" "${ARGS[@]}")
 fi
@@ -48,7 +48,8 @@ echo $! >"$PID_FILE"
 sleep 0.4
 if is_running "$PID_FILE"; then
     echo "后端已启动 pid=$(cat "$PID_FILE")"
-    echo "  http://127.0.0.1:$PORT"
+    echo "  监听 http://$BIND:$PORT"
+    [[ "$BIND" = "0.0.0.0" || "$BIND" = "::" ]] && echo "  警告: 监听所有接口。公网请经 HTTPS 反向代理，不要裸奔面板。"
     [[ -n "${CONF_FILE:-}" ]] && echo "  config=$CONF_FILE"
     echo "  home=$HOME_DIR"
     echo "  log=$LOG_FILE"

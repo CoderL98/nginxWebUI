@@ -30,6 +30,7 @@ if [ ! -f "$USER_CONF" ] && [ -f "$DEFAULT_CONF" ]; then
 fi
 
 PORT=""
+BIND=""
 WEB_DIR=""
 START_NGINX="${NGINXWEBUI_START_NGINX:-}"
 if [ -f "$USER_CONF" ]; then
@@ -41,6 +42,7 @@ if [ -f "$USER_CONF" ]; then
     val=$(printf '%s' "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
     case "$key" in
       port|server.port|server_port) PORT="$val" ;;
+      bind|listen|server.bind|server_bind) BIND="$val" ;;
       home|project.home|project_home) HOME_DIR="$val" ;;
       web_dir|web.dir|web) WEB_DIR="$val" ;;
       start_nginx) START_NGINX="$val" ;;
@@ -50,6 +52,7 @@ if [ -f "$USER_CONF" ]; then
 fi
 
 PORT="${NGINXWEBUI_PORT:-${PORT:-8080}}"
+BIND="${NGINXWEBUI_BIND:-${BIND:-0.0.0.0}}"
 HOME_DIR="${NGINXWEBUI_HOME:-${HOME_DIR:-/home/nginxWebUI}}"
 WEB_DIR="${NGINXWEBUI_WEB_DIR:-${WEB_DIR:-/opt/nginxwebui/web}}"
 START_NGINX="${NGINXWEBUI_START_NGINX:-${START_NGINX:-1}}"
@@ -85,7 +88,7 @@ set -- /opt/nginxwebui/nginxwebui
 if [ -f "$USER_CONF" ]; then
   set -- "$@" --config="$USER_CONF"
 fi
-set -- "$@" --server.port="$PORT" --project.home="$HOME_DIR" --web.dir="$WEB_DIR"
+set -- "$@" --server.port="$PORT" --bind="$BIND" --project.home="$HOME_DIR" --web.dir="$WEB_DIR"
 
 "$@" &
 child=$!
