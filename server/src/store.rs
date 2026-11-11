@@ -2,12 +2,13 @@
 //! the rest of the server can keep using a small in-memory `Db`. WAL mode
 //! gives crash-safe writes without a database server process.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const TABLES: [&str; 19] = [
@@ -86,8 +87,7 @@ impl Db {
 
     /// Remove rows of `table` whose `column` equals `value`.
     pub fn delete_where(&mut self, table: &str, column: &str, value: &str) {
-        self.rows_mut(table)
-            .retain(|r| str_of(r, column) != value);
+        self.rows_mut(table).retain(|r| str_of(r, column) != value);
     }
 
     pub fn setting(&self, key: &str) -> String {
@@ -117,6 +117,7 @@ pub struct Store {
     pub dir: PathBuf,
     pub db_path: PathBuf,
     pub db: Db,
+    conn: Mutex<Connection>,
 }
 
 impl Store {
@@ -142,22 +143,30 @@ impl Store {
             dir: dir.to_path_buf(),
             db_path,
             db,
+            conn: Mutex::new(conn),
         };
         let _ = store.flush();
         store
     }
 
-    /// Write the whole database in one SQLite transaction.
+    /// Persist in-memory rows with INSERT OR REPLACE and delete orphans.
+    /// Keeps the existing `records(tbl, id, data)` schema.
     pub fn flush(&self) -> std::io::Result<()> {
-        let conn = open_sqlite(&self.db_path);
-        conn.execute_batch("BEGIN IMMEDIATE;")
-            .map_err(io_err)?;
-        conn.execute("DELETE FROM records", [])
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(io_err)?;
         {
-            let mut stmt = conn
-                .prepare("INSERT INTO records (tbl, id, data) VALUES (?1, ?2, ?3)")
+            let mut upsert = tx
+                .prepare(
+                    "INSERT INTO records (tbl, id, data) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(tbl, id) DO UPDATE SET data = excluded.data",
+                )
                 .map_err(io_err)?;
+            let mut keep: HashSet<(String, String)> = HashSet::new();
             for (table, rows) in &self.db.t {
                 for row in rows {
                     let id = str_of(row, "id");
@@ -165,11 +174,31 @@ impl Store {
                         continue;
                     }
                     let data = serde_json::to_string(row).unwrap_or_else(|_| "{}".into());
-                    stmt.execute(params![table, id, data]).map_err(io_err)?;
+                    upsert.execute(params![table, id, data]).map_err(io_err)?;
+                    keep.insert((table.clone(), id));
+                }
+            }
+            drop(upsert);
+
+            let existing: Vec<(String, String)> = {
+                let mut stmt = tx.prepare("SELECT tbl, id FROM records").map_err(io_err)?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(io_err)?;
+                rows.flatten().collect()
+            };
+            let mut delete = tx
+                .prepare("DELETE FROM records WHERE tbl = ?1 AND id = ?2")
+                .map_err(io_err)?;
+            for (table, id) in existing {
+                if !keep.contains(&(table.clone(), id.clone())) {
+                    delete.execute(params![table, id]).map_err(io_err)?;
                 }
             }
         }
-        conn.execute_batch("COMMIT;").map_err(io_err)?;
+        tx.commit().map_err(io_err)?;
         Ok(())
     }
 }
@@ -295,4 +324,84 @@ pub fn ordered(db: &Db, table: &str, asc: bool) -> Vec<Value> {
     list
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::thread;
 
+    fn temp_store(label: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "nginxwebui-store-{}-{}-{}",
+            label,
+            std::process::id(),
+            new_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Store::open(&dir)
+    }
+
+    #[test]
+    fn flush_keeps_updates_and_deletes_without_full_wipe() {
+        let mut store = temp_store("upsert");
+        store.db.set_setting("hello", "world");
+        let id = store.db.upsert("site", json!({ "name": "a" }));
+        store.flush().unwrap();
+
+        store.db.set_setting("hello", "there");
+        store.db.delete("site", &id);
+        let id2 = store.db.upsert("site", json!({ "name": "b" }));
+        store.flush().unwrap();
+
+        let reopened = Store::open(&store.dir);
+        assert_eq!(reopened.db.setting("hello"), "there");
+        assert!(reopened.db.get("site", &id).is_none());
+        assert_eq!(str_of(&reopened.db.get("site", &id2).unwrap(), "name"), "b");
+        assert_eq!(reopened.db.rows("site").len(), 1);
+    }
+
+    #[test]
+    fn concurrent_flushes_do_not_corrupt_rows() {
+        let mut store = temp_store("conc");
+        for i in 0..24 {
+            store.db.upsert(
+                "site",
+                json!({ "id": format!("s{i}"), "name": format!("n{i}") }),
+            );
+        }
+        store.flush().unwrap();
+        let shared = Arc::new(StdMutex::new(store));
+        let mut handles = Vec::new();
+        for t in 0..6 {
+            let shared = shared.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..24 {
+                    let mut guard = shared.lock().unwrap();
+                    let id = format!("s{i}");
+                    if let Some(mut row) = guard.db.get("site", &id) {
+                        if let Value::Object(map) = &mut row {
+                            map.insert("name".into(), format!("t{t}-{i}").into());
+                        }
+                        guard.db.upsert("site", row);
+                    }
+                    guard.flush().unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let guard = shared.lock().unwrap();
+        let dir = guard.dir.clone();
+        drop(guard);
+        let reopened = Store::open(&dir);
+        assert_eq!(reopened.db.rows("site").len(), 24);
+        for i in 0..24 {
+            let row = reopened.db.get("site", &format!("s{i}")).unwrap();
+            let name = str_of(&row, "name");
+            assert!(name.contains(&format!("-{i}")), "{name}");
+        }
+    }
+}
