@@ -47,7 +47,7 @@
 ### 备份
 
 - 原版：bak 列表、查看、恢复、 bakSub。
-- 现版：写入主 conf 前自动留最近 20 份；`/bak` 可看内容。**没有一键恢复**。该页未挂到主菜单。
+- 现版：写入主 conf 前自动留最近 20 份；`/bak` 已挂主菜单，可查看并一键恢复（恢复前先 `nginx -t`）。备份只针对面板本机，远程设备不提供。
 
 ### 其它页面 / API
 
@@ -58,14 +58,17 @@
 | 配置 / reload | 有 | `/conf` | 有 |
 | 日志尾部 | 有 | `/log` | 有 |
 | 上游 / stream / http / basic | 有 | 有 | advanced |
-| 密码文件（htpasswd） | 有 | `/password` | 无 |
-| 黑白名单 | 有 | `/deny-allow` | 无 |
-| 配置备份 | 有（只读） | `/bak` | 无 |
+| 密码文件（htpasswd） | 有 | `/password` | 有 |
+| 黑白名单 | 有 | `/deny-allow` | 有 |
+| 配置备份 / 恢复 | 有 | `/bak` | 有 |
 | nginx 参数模板 | 有 | 无 | 无 |
-| 配置导入导出 JSON | 有（导出不含 admin） | 无 | 无 |
-| 操作日志 | 有（`/adminPage/log/operate`） | 无 | 无 |
-| 多管理员 CRUD | 有 | 无（首次创建 + 登录改密接口在） | 无 |
-| 改密码 | `login/changePass` | 设置页未接该按钮 | — |
+| 配置导入导出 JSON | 有（导出不含 admin、设备凭证与密钥；导入保留现有密钥哈希） | 无 | 无 |
+| 操作日志 | 有（`/adminPage/log/operate`） | `/log`「面板操作日志」 | 有 |
+| 多管理员 CRUD | 有 | `/admins` | 有 |
+| 改密码 | `login/changePass` | 设置页 | — |
+| 设备（远程 agent） | 有 | `/nodes` + 顶栏切换 | 有 |
+
+选中远程设备时，仅站点、证书、配置检查/reload、日志、监控走远程；www、密码文件、黑白名单、advanced 只作用于面板本机；管理员、设备、备份、设置始终属于面板。
 
 ### 运行形态
 
@@ -74,14 +77,14 @@
 | 进程 | JVM + Solon | 单个 Rust 二进制 |
 | 前端 | 服务端渲染 Freemarker | SvelteKit 静态多页，Rust 托管 `web/build` |
 | 数据库 | H2 文件，可选外部 SQL | rusqlite，无独立数据库进程 |
-| 定时任务 | Solon `@Scheduled` | 证书 cron 线程 + 本机 acme.sh |
+| 定时任务 | Solon `@Scheduled` | 证书 cron 线程 + 本机 acme.sh（远程 agent 各自跑） |
 | Docker | Java jar + 外部 nginx 常见 | 镜像内 nginx + acme.sh + webui |
 | Windows | 可跑 Java | 可跑 webui；nginx/acme 仍按 Linux 本机约定，交叉编译出 Linux musl 包 |
 
 ### 登录与安全
 
 - 两边都有验证码、首次创建管理员。
-- 现版无 2FA、无 API Token、无远程 creditKey。
+- 现版无 2FA、无 API Token、无远程 creditKey。后台写接口要求 `X-Requested-With: nginxwebui` 请求头（防 CSRF）；反代后面需配置 `trusted_proxies` 才采信转发头。
 - 现版 zip 上传限 合计未压缩 ≤ 64MB、拒绝 `..`（zip-slip）；代理目标做注入过滤；`nginx -t` 失败会回滚站点文件。
 
 ## 现版多出来的（原版没有或很弱）
@@ -95,8 +98,8 @@
 
 ## 迁移时不要指望自动过来的东西
 
-- H2 库里的 server/http/upstream 行、远程机器列表、SSO、邮件 SMTP、API Token。
+- H2 库里的 server/http/upstream 行、远程机器列表（需在被控端重新安装 agent 加入）、SSO、邮件 SMTP、API Token。
 - 库里的证书 DNS 密钥（阿里云等）；Cloudflare Token / Gcore 请在设置页重填，或继续用 `~/.acme.sh/account.conf`。
 - 把 `--project.home` / `NGINXWEBUI_HOME` 指到旧数据目录，只会收养**磁盘文件**（`.acme.sh`、`cert/`、上传的 pem）。
 
-日常管本机站点、证书、reload，用现版即可。需要多机集群、SSO、邮件告警或阿里云等 DNS 插件时，现版覆盖不了。
+日常管本机站点、证书、reload，用现版即可。多台机器可用出站 agent 注册中心统一管理站点、证书与 reload（不是原版互控集群，无配置同步 / 故障转移）。需要 SSO、邮件告警或阿里云等 DNS 插件时，现版覆盖不了。
