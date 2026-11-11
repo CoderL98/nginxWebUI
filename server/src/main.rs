@@ -13,6 +13,7 @@ mod config;
 mod install;
 mod nginx;
 mod privfs;
+mod secrets;
 mod site;
 mod store;
 mod sysinfo;
@@ -54,10 +55,12 @@ const NGINX_CONF_TEMPLATE: &str = "worker_processes  1;\n\nevents {\n    worker_
 
 struct Options {
     port: u16,
+    bind: String,
     home: PathBuf,
     web: Option<PathBuf>,
     threads: usize,
     reload_cmd: Option<String>,
+    secure_cookie: bool,
     config_path: Option<PathBuf>,
 }
 
@@ -75,6 +78,7 @@ fn parse_args() -> Options {
         println!("nginxWebUI (Rust backend)");
         println!("  --config=FILE        配置文件（默认寻找 nginxwebui.conf）");
         println!("  --server.port=8080   监听端口");
+        println!("  --bind=127.0.0.1     监听地址（默认本机；Docker 需 0.0.0.0）");
         println!("  --project.home=DIR   数据目录");
         println!("  --web.dir=DIR        静态前端目录");
         println!("  --threads=N          工作线程（默认 1）");
@@ -85,10 +89,12 @@ fn parse_args() -> Options {
 
     let mut options = Options {
         port: 8080,
+        bind: "127.0.0.1".into(),
         home: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         web: None,
         threads: 1,
         reload_cmd: None,
+        secure_cookie: false,
         config_path: None,
     };
 
@@ -109,6 +115,14 @@ fn parse_args() -> Options {
                     options.threads = threads.clamp(1, 64);
                 }
                 options.reload_cmd = file.reload_cmd;
+                if let Some(bind) = file.bind {
+                    if !bind.trim().is_empty() {
+                        options.bind = bind.trim().to_string();
+                    }
+                }
+                if let Some(secure) = file.secure_cookie {
+                    options.secure_cookie = secure;
+                }
                 options.config_path = Some(path);
             }
             Err(err) => {
@@ -141,6 +155,18 @@ fn parse_args() -> Options {
             options.reload_cmd = Some(cmd);
         }
     }
+    if let Ok(bind) = std::env::var("NGINXWEBUI_BIND") {
+        if !bind.trim().is_empty() {
+            options.bind = bind.trim().to_string();
+        }
+    }
+    if let Some(secure) = std::env::var("NGINXWEBUI_SECURE_COOKIE")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        options.secure_cookie = matches!(secure.as_str(), "1" | "true" | "yes" | "on");
+    }
 
     let mut index = 0;
     while index < args.len() {
@@ -164,6 +190,22 @@ fn parse_args() -> Options {
                 if let Some(value) = take(inline) {
                     options.port = value.trim().parse().unwrap_or(8080);
                 }
+            }
+            "--bind" | "--listen" => {
+                if let Some(value) = take(inline) {
+                    if !value.trim().is_empty() {
+                        options.bind = value.trim().to_string();
+                    }
+                }
+            }
+            "--secure-cookie" => {
+                options.secure_cookie = match take(inline) {
+                    Some(value) => matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on" | ""
+                    ),
+                    None => true,
+                };
             }
             "--project.home" | "--home" => {
                 if let Some(value) = take(inline) {
@@ -308,7 +350,7 @@ fn seed(db: &mut store::Db, home: &Path, reload_cmd: Option<&str>) {
         }
     }
     if db.setting("autoInstall").is_empty() {
-        db.set_setting("autoInstall", "true");
+        db.set_setting("autoInstall", "false");
     }
 
     if db.rows("basic").is_empty() {
@@ -489,6 +531,19 @@ fn respond(request: tiny_http::Request, reply: Reply) {
             response = response.with_header(header);
         }
     }
+    for (name, value) in [
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        (
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'",
+        ),
+        ("Referrer-Policy", "no-referrer"),
+    ] {
+        if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response = response.with_header(header);
+        }
+    }
     let _ = request.respond(response);
 }
 
@@ -496,10 +551,17 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
     let url = request.url().to_string();
     let method = format!("{}", request.method());
 
+    let url_preview = request.url().to_string();
+    let path_preview = url_preview.split('?').next().unwrap_or(&url_preview);
+    let max_body = if path_preview.starts_with("/adminPage/login") {
+        16 * 1024u64
+    } else {
+        16 * 1024 * 1024
+    };
     let mut body = Vec::new();
     {
         let reader = request.as_reader();
-        let _ = reader.take(16 * 1024 * 1024).read_to_end(&mut body);
+        let _ = reader.take(max_body).read_to_end(&mut body);
     }
 
     let (path, query_text) = match url.split_once('?') {
@@ -518,6 +580,8 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
 
     let mut cookies: HashMap<String, String> = HashMap::new();
     let mut content_type = String::new();
+    let mut forwarded_https = false;
+    let mut forwarded_ip = String::new();
     for header in request.headers() {
         if header.field.equiv("Cookie") {
             for part in header.value.as_str().split(';') {
@@ -529,7 +593,25 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
         if header.field.equiv("Content-Type") {
             content_type = header.value.as_str().to_string();
         }
+        if header.field.equiv("X-Forwarded-Proto") {
+            forwarded_https = header.value.as_str().split(',').next().unwrap_or("").trim().eq_ignore_ascii_case("https");
+        }
+        if header.field.equiv("X-Forwarded-For") {
+            forwarded_ip = header
+                .value
+                .as_str()
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
     }
+    let remote_ip = if !forwarded_ip.is_empty() {
+        forwarded_ip
+    } else {
+        request.remote_addr().map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".into())
+    };
 
     let is_api = path.starts_with("/adminPage/");
     let reply = if is_api {
@@ -540,6 +622,8 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
             body,
             cookies,
             content_type,
+            remote_ip,
+            secure_cookie: app.secure_cookie || forwarded_https,
         };
         api::handle(app, &req)
     } else {
@@ -610,17 +694,39 @@ fn main() {
     println!("  home      : {}", home.display());
     println!("  web pages : {}", web_dir.display());
     println!(
-        "  address   : http://127.0.0.1:{}  (user: admin - set on first visit)",
-        options.port
+        "  address   : http://{}:{}",
+        options.bind, options.port
     );
+    if options.bind == "0.0.0.0" || options.bind == "::" {
+        println!("  warning   : listening on all interfaces; do not expose this port on the public internet without HTTPS");
+    }
     println!("  sqlite    : {}", store.db_path.display());
     println!("  memory    : no JVM, local sqlite, {} worker threads", options.threads);
+
+    let init_token = if store.db.rows("admin").is_empty() {
+        let token = std::env::var("NGINXWEBUI_INIT_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| auth::random_token(32));
+        println!("============================================================");
+        println!("  First-run init token: {token}");
+        println!("  Enter it when creating the first administrator.");
+        println!("  You can also set NGINXWEBUI_INIT_TOKEN.");
+        println!("============================================================");
+        Some(token)
+    } else {
+        None
+    };
 
     let app = Arc::new(Ctx {
         home: home.clone(),
         web_dir,
         store: Mutex::new(store),
         sessions: Mutex::new(auth::Sessions::default()),
+        limits: Mutex::new(auth::RateLimiter::default()),
+        init_token: Mutex::new(init_token),
+        secure_cookie: options.secure_cookie,
     });
 
     {
@@ -649,7 +755,7 @@ fn main() {
         });
     }
 
-    let address = format!("0.0.0.0:{}", options.port);
+    let address = format!("{}:{}", options.bind, options.port);
     let server = match tiny_http::Server::http(&address) {
         Ok(server) => Arc::new(server),
         Err(err) => {

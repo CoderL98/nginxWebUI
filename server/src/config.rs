@@ -12,6 +12,8 @@ pub struct FileValues {
     pub web: Option<PathBuf>,
     pub threads: Option<usize>,
     pub reload_cmd: Option<String>,
+    pub bind: Option<String>,
+    pub secure_cookie: Option<bool>,
     pub bin: Option<PathBuf>,
     pub log: Option<PathBuf>,
     pub pid: Option<PathBuf>,
@@ -65,6 +67,14 @@ pub fn parse(text: &str, base: &Path) -> Result<FileValues, String> {
             }
             "reload_cmd" | "reload.cmd" | "reloadcmd" => {
                 values.reload_cmd = Some(value);
+            }
+            "bind" | "listen" | "listen_address" | "server.bind" | "server_bind" => {
+                values.bind = Some(value);
+            }
+            "secure_cookie" | "secure.cookie" | "secure_cookies" => {
+                values.secure_cookie = Some(parse_bool(&value).map_err(|_| {
+                    format!("line {}: invalid secure_cookie", index + 1)
+                })?);
             }
             "bin" => values.bin = Some(resolve(base, &value)),
             "log" => values.log = Some(resolve(base, &value)),
@@ -122,6 +132,14 @@ pub fn cli_config_path(args: &[String]) -> Option<PathBuf> {
     None
 }
 
+fn parse_bool(value: &str) -> Result<bool, ()> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(()),
+    }
+}
+
 fn strip_comment(line: &str) -> &str {
     let mut in_quote = false;
     for (i, ch) in line.char_indices() {
@@ -172,6 +190,8 @@ mod tests {
         let text = r#"
 # listen
 port = 9090
+bind = 127.0.0.1
+secure_cookie = false
 home = data
 web_dir = "web/build"
 threads = 4
@@ -179,6 +199,8 @@ reload_cmd = nginx -s reload
 "#;
         let values = parse(text, &dir).unwrap();
         assert_eq!(values.port, Some(9090));
+        assert_eq!(values.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(values.secure_cookie, Some(false));
         assert_eq!(values.home.as_deref(), Some(dir.join("data").as_path()));
         assert_eq!(
             values.web.as_deref(),
@@ -192,6 +214,12 @@ reload_cmd = nginx -s reload
     fn rejects_unknown_keys() {
         let err = parse("foo = bar\n", Path::new("/tmp")).unwrap_err();
         assert!(err.contains("unknown key"));
+    }
+
+    #[test]
+    fn parses_bind_aliases() {
+        let values = parse("listen = 0.0.0.0\n", Path::new("/tmp")).unwrap();
+        assert_eq!(values.bind.as_deref(), Some("0.0.0.0"));
     }
 
     #[test]
