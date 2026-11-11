@@ -43,3 +43,36 @@ jobs:
         run: pnpm run check
       - name: Build
         run: pnpm run build
+
+  # Release/CI artifacts for /agent/download layout: agents/linux-x86_64 and
+  # agents/linux-aarch64. Windows is not a supported managed nginx node.
+  agents:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64
+            linker: aarch64-linux-gnu-gcc
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install aarch64 linker
+        if: matrix.artifact == 'linux-aarch64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+        working-directory: .
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build agent
+        run: cargo build --release --target ${{ matrix.target }} --bin nginxwebui-agent
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nginxwebui-agent-${{ matrix.artifact }}
+          path: server/target/${{ matrix.target }}/release/nginxwebui-agent

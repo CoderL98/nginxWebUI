@@ -99,6 +99,11 @@ $builtAgent = Join-Path $Server "target\$Target\release\nginxwebui-agent"
 if (Test-Path $builtAgent) {
     $destAgent = Join-Path $outDir 'nginxwebui-agent'
     Copy-Item -Force $builtAgent $destAgent
-    Write-Host "agent 产物: $destAgent（与 nginxwebui 放在同一目录，设备页一键安装才能下载）"
+    $slot = Join-Path $outDir "agents\linux-$arch"
+    New-Item -ItemType Directory -Force -Path $slot | Out-Null
+    Copy-Item -Force $builtAgent (Join-Path $slot 'nginxwebui-agent')
+    Write-Host "agent 产物: $destAgent"
+    Write-Host "多架构目录: $slot\nginxwebui-agent（拷到面板 exe 旁的 agents/linux-$arch/）"
+    Write-Host "Windows 不是受支持的被控端（nginx/acme 仍按 Linux 约定）。"
 }
 Write-Host "拷到服务器后: chmod 755 nginxwebui nginxwebui-agent && ./nginxwebui"

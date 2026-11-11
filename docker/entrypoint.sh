@@ -13,7 +13,18 @@ mkdir -p \
   /etc/nginx/ssl \
   /etc/nginx/conf.d \
   /var/www \
-  /var/log/nginx
+  /var/log/nginx \
+  "$HOME_DIR/.acme.sh"
+
+# Old images used a volume at /root/.acme.sh; copy it once into the data home.
+if [ -d /root/.acme.sh ] && [ ! -f "$HOME_DIR/.acme.sh/acme.sh" ]; then
+  if [ -e /root/.acme.sh/acme.sh ] || [ -n "$(ls -A /root/.acme.sh 2>/dev/null || true)" ]; then
+    cp -a /root/.acme.sh/. "$HOME_DIR/.acme.sh/" || true
+  fi
+fi
+if [ ! -f "$HOME_DIR/.acme.sh/acme.sh" ] && [ -x /opt/acme.sh/acme.sh ]; then
+  /opt/acme.sh/acme.sh --install --home "$HOME_DIR/.acme.sh" -m nginxwebui@localhost || true
+fi
 
 if [ ! -f /etc/nginx/ssl-params.conf ]; then
   cat >/etc/nginx/ssl-params.conf <<'EOF'
@@ -84,12 +95,25 @@ term() {
 }
 trap term TERM INT
 
+# Panel process runs as nginxwebui. nginx (80/443) stays a root master
+# if it was started above. reload falls back to nginxwebui-priv via sudo.
+if id nginxwebui >/dev/null 2>&1; then
+  chown -R nginxwebui:nginxwebui "$HOME_DIR" || true
+  RUNUSER="runuser"
+else
+  RUNUSER=""
+fi
+
 set -- /opt/nginxwebui/nginxwebui
 if [ -f "$USER_CONF" ]; then
   set -- "$@" --config="$USER_CONF"
 fi
 set -- "$@" --server.port="$PORT" --bind="$BIND" --project.home="$HOME_DIR" --web.dir="$WEB_DIR"
 
-"$@" &
+if [ -n "$RUNUSER" ]; then
+  runuser -u nginxwebui -- env HOME="$HOME_DIR" "$@" &
+else
+  "$@" &
+fi
 child=$!
 wait "$child"
