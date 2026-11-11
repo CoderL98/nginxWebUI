@@ -1,7 +1,10 @@
 //! The JSON API the web pages talk to. Each entry point answers with the same
 //! envelope the Java version used: `{ success, obj, msg }`.
 
-use crate::auth::{captcha_svg, encode_pass, random_code, Sessions};
+use crate::auth::{
+    captcha_svg, codes_match, first_admin_allowed, hash_password, password_needs_upgrade,
+    random_code, verify_password, RateLimiter, Sessions,
+};
 use crate::nginx;
 use crate::store::{bool_of, int_of, new_id, now_ms, ordered, str_of, Db, Store};
 use serde_json::{json, Map, Value};
@@ -14,6 +17,9 @@ pub struct Ctx {
     pub web_dir: PathBuf,
     pub store: Mutex<Store>,
     pub sessions: Mutex<Sessions>,
+    pub limits: Mutex<RateLimiter>,
+    pub init_token: Mutex<Option<String>>,
+    pub secure_cookie: bool,
 }
 
 pub struct Req {
@@ -23,6 +29,8 @@ pub struct Req {
     pub body: Vec<u8>,
     pub cookies: HashMap<String, String>,
     pub content_type: String,
+    pub remote_ip: String,
+    pub secure_cookie: bool,
 }
 
 pub struct Reply {
@@ -80,12 +88,28 @@ fn token_of(req: &Req) -> String {
     req.cookies.get(COOKIE).cloned().unwrap_or_default()
 }
 
-fn with_cookie(mut reply: Reply, token: &str) -> Reply {
-    reply.set_cookie = Some(format!(
+fn cookie_header(req: &Req, token: &str) -> String {
+    let mut cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800",
         COOKIE, token
-    ));
+    );
+    if req.secure_cookie {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn with_cookie(mut reply: Reply, req: &Req, token: &str) -> Reply {
+    reply.set_cookie = Some(cookie_header(req, token));
     reply
+}
+
+fn persist(store: &Store) -> Result<(), Reply> {
+    persist_result(store.flush())
+}
+
+fn persist_result(result: std::io::Result<()>) -> Result<(), Reply> {
+    result.map_err(|err| fail(&format!("saveFailed: {err}")))
 }
 
 // ------------------------------------------------------------------ dispatch
@@ -98,8 +122,13 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
     let kind = parts[1];
     let action = parts[2];
 
-    // sign-in endpoints are open; everything else needs a signed-in session
-    if kind == "login" {
+    // only a short allow-list is public; changeLang / changePass require a session
+    if kind == "login"
+        && matches!(
+            action,
+            "info" | "getCode" | "login" | "addAdmin" | "loginOut"
+        )
+    {
         return login(ctx, action, req);
     }
 
@@ -114,7 +143,7 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
             reply.status = 401;
             if token.is_empty() {
                 let fresh = sessions.new_session();
-                reply = with_cookie(reply, &fresh);
+                reply = with_cookie(reply, req, &fresh);
             }
             return reply;
         }
@@ -123,7 +152,7 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
 
     match (kind, action) {
         ("main", "monitor") => monitor(ctx),
-        ("login", _) => fail("not found"),
+        ("login", _) => login(ctx, action, req),
         ("conf", _) => conf(ctx, action, req),
         ("bak", _) => bak(ctx, action, req),
         ("log", _) => log(ctx, action, req),
@@ -168,6 +197,7 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             ok(json!({
                 "adminCount": admin_count,
                 "needInit": admin_count == 0,
+                "needInitToken": admin_count == 0,
                 "signedIn": signed_in,
                 "name": name,
                 "lang": lang,
@@ -176,6 +206,12 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }))
         }
         "getCode" => {
+            {
+                let mut limits = ctx.limits.lock().unwrap();
+                if let Err(msg) = limits.allow_captcha(&req.remote_ip) {
+                    return fail(msg);
+                }
+            }
             let code = random_code();
             let mut sessions = ctx.sessions.lock().unwrap();
             let token = if sessions.touch(&token) {
@@ -191,10 +227,7 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 set_cookie: None,
                 extra_headers: vec![("Cache-Control".to_string(), "no-store".to_string())],
             };
-            reply.set_cookie = Some(format!(
-                "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800",
-                COOKIE, token
-            ));
+            reply.set_cookie = Some(cookie_header(req, &token));
             reply
         }
         "login" => {
@@ -203,24 +236,32 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let pass = field(&body, "pass");
             let code = field(&body, "code");
 
+            {
+                let limits = ctx.limits.lock().unwrap();
+                if let Err(msg) = limits.allow_login(&req.remote_ip, &name) {
+                    return fail(msg);
+                }
+            }
+
             let mut sessions = ctx.sessions.lock().unwrap();
             if !sessions.touch(&token) {
+                drop(sessions);
+                ctx.limits.lock().unwrap().fail_login(&req.remote_ip, &name);
                 return fail("codeError");
             }
             let expected = sessions
                 .get(&token)
                 .map(|s| s.code.clone())
                 .unwrap_or_default();
-            if expected.is_empty()
-                || code.trim().is_empty()
-                || expected.to_lowercase() != code.to_lowercase()
-            {
+            if expected.is_empty() || !codes_match(&expected, &code) {
+                drop(sessions);
+                ctx.limits.lock().unwrap().fail_login(&req.remote_ip, &name);
                 return fail("codeError");
             }
             sessions.set_code(&token, "");
             drop(sessions);
 
-            let store = ctx.store.lock().unwrap();
+            let mut store = ctx.store.lock().unwrap();
             let admin = store
                 .db
                 .rows("admin")
@@ -229,13 +270,31 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 .cloned();
             let admin = match admin {
                 Some(admin) => admin,
-                None => return fail("adminError"),
+                None => {
+                    drop(store);
+                    ctx.limits.lock().unwrap().fail_login(&req.remote_ip, &name);
+                    return fail("adminError");
+                }
             };
-            if str_of(&admin, "pass") != encode_pass(&pass) {
+            let stored = str_of(&admin, "pass");
+            if !verify_password(&pass, &stored) {
+                drop(store);
+                ctx.limits.lock().unwrap().fail_login(&req.remote_ip, &name);
                 return fail("adminError");
+            }
+            if password_needs_upgrade(&stored) {
+                if let Ok(upgraded) = hash_password(&pass) {
+                    let mut updated = admin.clone();
+                    if let Value::Object(map) = &mut updated {
+                        map.insert("pass".into(), upgraded.into());
+                    }
+                    store.db.upsert("admin", updated);
+                    let _ = persist(&store);
+                }
             }
             drop(store);
 
+            ctx.limits.lock().unwrap().succeed_login(&req.remote_ip, &name);
             let mut sessions = ctx.sessions.lock().unwrap();
             let token = if sessions.touch(&token) {
                 token.clone()
@@ -243,12 +302,50 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 sessions.new_session()
             };
             sessions.sign_in(&token, &str_of(&admin, "id"), &name);
-            with_cookie(ok_empty(), &token)
+            with_cookie(ok_empty(), req, &token)
         }
         "addAdmin" => {
             let body = body(req);
             let name = field(&body, "name");
             let pass = field(&body, "pass");
+            let code = field(&body, "code");
+            let init = field(&body, "initToken");
+
+            {
+                let limits = ctx.limits.lock().unwrap();
+                if let Err(msg) = limits.allow_login(&req.remote_ip, &name) {
+                    return fail(msg);
+                }
+            }
+
+            let expected_init = ctx.init_token.lock().unwrap().clone();
+            if let Err(msg) = first_admin_allowed(expected_init.as_deref(), &init) {
+                ctx.limits.lock().unwrap().fail_login(&req.remote_ip, &name);
+                return fail(msg);
+            }
+
+            let mut sessions = ctx.sessions.lock().unwrap();
+            if !sessions.touch(&token) {
+                drop(sessions);
+                ctx.limits.lock().unwrap().fail_login(&req.remote_ip, &name);
+                return fail("codeError");
+            }
+            let expected = sessions
+                .get(&token)
+                .map(|s| s.code.clone())
+                .unwrap_or_default();
+            if expected.is_empty() || !codes_match(&expected, &code) {
+                drop(sessions);
+                ctx.limits.lock().unwrap().fail_login(&req.remote_ip, &name);
+                return fail("codeError");
+            }
+            sessions.set_code(&token, "");
+            drop(sessions);
+
+            let hashed = match hash_password(&pass) {
+                Ok(h) => h,
+                Err(_) => return fail("passTooShort"),
+            };
             let mut store = ctx.store.lock().unwrap();
             if !store.db.rows("admin").is_empty() {
                 return fail("adminExists");
@@ -262,10 +359,15 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut admin = Map::new();
             admin.insert("id".into(), new_id().into());
             admin.insert("name".into(), name.trim().into());
-            admin.insert("pass".into(), encode_pass(&pass).into());
+            admin.insert("pass".into(), hashed.into());
             admin.insert("type".into(), "0".into());
             store.db.upsert("admin", Value::Object(admin));
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
+            drop(store);
+            *ctx.init_token.lock().unwrap() = None;
+            ctx.limits.lock().unwrap().succeed_login(&req.remote_ip, &name);
             ok_empty()
         }
         "loginOut" => {
@@ -278,18 +380,20 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let lang = field(&body, "lang");
             let mut store = ctx.store.lock().unwrap();
             store.db.set_setting("lang", if lang == "en" { "en" } else { "zh" });
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
             ok_empty()
         }
         "changePass" => {
-            let admin_name = {
+            let (admin_name, admin_id) = {
                 let sessions = ctx.sessions.lock().unwrap();
                 if !sessions.is_signed_in(&token) {
                     return fail("not signed in");
                 }
                 sessions
                     .get(&token)
-                    .map(|s| s.admin_name.clone())
+                    .map(|s| (s.admin_name.clone(), s.admin_id.clone()))
                     .unwrap_or_default()
             };
             if admin_name.is_empty() {
@@ -312,15 +416,23 @@ fn login(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 None => return fail("adminError"),
             };
             let current = store.db.rows("admin")[index].clone();
-            if str_of(&current, "pass") != encode_pass(&old_pass) {
+            if !verify_password(&old_pass, &str_of(&current, "pass")) {
                 return fail("oldPassError");
             }
+            let hashed = match hash_password(&new_pass) {
+                Ok(h) => h,
+                Err(_) => return fail("passTooShort"),
+            };
             let mut updated = current.clone();
             if let Value::Object(map) = &mut updated {
-                map.insert("pass".into(), encode_pass(&new_pass).into());
+                map.insert("pass".into(), hashed.into());
             }
             store.db.upsert("admin", updated);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
+            drop(store);
+            ctx.sessions.lock().unwrap().revoke_others(&token, &admin_id);
             ok_empty()
         }
         _ => fail("not found"),
@@ -402,24 +514,7 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 .unwrap_or_default();
             let mut store = ctx.store.lock().unwrap();
             store.db.set_setting("decompose", if decompose { "true" } else { "false" });
-            // keep a backup so the previous configuration can be restored
-            let main_path = nginx::nginx_path(&store.db);
-            if let Ok(previous) = crate::privfs::read_to_string(&main_path) {
-                if !previous.trim().is_empty() {
-                    let time = now_ms().to_string();
-                    let mut bak = Map::new();
-                    bak.insert("id".into(), time.clone().into());
-                    bak.insert("time".into(), time.clone().into());
-                    bak.insert("content".into(), previous.into());
-                    store.db.upsert("bak", Value::Object(bak));
-                }
-            }
-            if let Some(parent) = main_path.parent() {
-                if let Err(err) = crate::privfs::mkdir_all(parent) {
-                    return fail(&err);
-                }
-            }
-            if let Err(err) = crate::privfs::write(&main_path, &conf_text) {
+            if let Err(err) = nginx::install_main_conf(&mut store, &conf_text, true) {
                 return fail(&err);
             }
             if decompose {
@@ -437,7 +532,7 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     }
                 }
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         "check" => {
@@ -496,14 +591,20 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 "autoInstall",
             ] {
                 if body.get(key).is_some() {
-                    store.db.set_setting(key, field(&body, key).trim());
+                    let value = field(&body, key);
+                    if crate::secrets::is_secret_setting(key)
+                        && !crate::secrets::should_store_secret(&value)
+                    {
+                        continue;
+                    }
+                    store.db.set_setting(key, value.trim());
                 }
             }
             if body.get("decompose").is_some() {
                 let decompose = bool_of(&body, "decompose", false);
                 store.db.set_setting("decompose", if decompose { "true" } else { "false" });
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({
                 "nginxPath": nginx::nginx_path(&store.db).display().to_string(),
                 "nginxDir": nginx::nginx_dir(&store.db).display().to_string(),
@@ -529,7 +630,7 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut store = ctx.store.lock().unwrap();
             match nginx::write_conf(&mut store) {
                 Ok(written) => {
-                    let _ = store.flush();
+                    if let Err(reply) = persist(&store) { return reply; }
                     ok(json!({ "written": written }))
                 }
                 Err(err) => fail(&err),
@@ -562,6 +663,30 @@ fn bak(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         "detail" => {
             let id = req.query.get("id").cloned().unwrap_or_default();
             ok(store.db.get("bak", &id).unwrap_or(Value::Null))
+        }
+        "restore" => {
+            drop(store);
+            let id = field(&body(req), "id");
+            if id.is_empty() {
+                return fail("not found");
+            }
+            let mut store = ctx.store.lock().unwrap();
+            let Some(row) = store.db.get("bak", &id) else {
+                return fail("not found");
+            };
+            let content = str_of(&row, "content");
+            if content.trim().is_empty() {
+                return fail("emptyBackup");
+            }
+            match nginx::install_main_conf(&mut store, &content, false) {
+                Ok(output) => {
+                    if let Err(reply) = persist(&store) {
+                        return reply;
+                    }
+                    ok(json!({ "output": output }))
+                }
+                Err(err) => fail(&err),
+            }
         }
         _ => fail("not found"),
     }
@@ -619,7 +744,7 @@ fn setting(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         "get" => {
             let key = req.query.get("key").cloned().unwrap_or_default();
             let store = ctx.store.lock().unwrap();
-            ok(json!({ "key": key, "value": store.db.setting(&key) }))
+            ok(crate::secrets::setting_view(&key, &store.db.setting(&key)))
         }
         "set" => {
             let body = body(req);
@@ -628,9 +753,14 @@ fn setting(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             if key.is_empty() {
                 return fail("badKey");
             }
+            if crate::secrets::is_secret_setting(&key)
+                && !crate::secrets::should_store_secret(&value)
+            {
+                return ok_empty();
+            }
             let mut store = ctx.store.lock().unwrap();
             store.db.set_setting(&key, &value);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -648,8 +778,22 @@ fn export(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 if name == "admin" {
                     continue; // passwords are never exported
                 }
-                out.insert(name.clone(), Value::Array(rows.clone()));
+                let mut cloned = rows.clone();
+                if name == "cert" {
+                    for row in &mut cloned {
+                        crate::secrets::strip_object_secrets(row, crate::secrets::SECRET_CERT_KEYS);
+                    }
+                }
+                if name == "password" {
+                    for row in &mut cloned {
+                        if let Value::Object(map) = row {
+                            map.remove("pass");
+                        }
+                    }
+                }
+                out.insert(name.clone(), Value::Array(cloned));
             }
+            crate::secrets::mask_settings_in_export(&mut out);
             ok(Value::Object(out))
         }
         "set" => {
@@ -665,7 +809,7 @@ fn export(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     }
                 }
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -679,7 +823,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         "list" => {
             let mut store = ctx.store.lock().unwrap();
             let _ = crate::compat::adopt(&mut store.db);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             let list: Vec<Value> = ordered(&store.db, "site", true)
                 .into_iter()
                 .map(|row| {
@@ -820,7 +964,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     match crate::install::ensure_nginx(&mut store.db) {
                         Ok(log) => output.push_str(&log),
                         Err(err) => {
-                            let _ = store.flush();
+                            if let Err(reply) = persist(&store) { return reply; }
                             return fail(&err);
                         }
                     }
@@ -830,7 +974,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                         output = format!("{}\n{}\n{}", output, path, log);
                     }
                     Err(err) => {
-                        let _ = store.flush();
+                        if let Err(reply) = persist(&store) { return reply; }
                         return json_reply(
                             200,
                             &json!({
@@ -842,7 +986,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     }
                 }
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id, "output": output }))
         }
         "del" => {
@@ -852,7 +996,7 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 crate::site::remove_files(&store.db, &row);
             }
             store.db.delete("site", &id);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             let (ok_t, out) = nginx::test_conf(&store.db);
             if ok_t {
                 let _ = nginx::reload(&store.db);
@@ -870,13 +1014,13 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 && !crate::install::nginx_present(&store.db)
             {
                 if let Err(err) = crate::install::ensure_nginx(&mut store.db) {
-                    let _ = store.flush();
+                    if let Err(reply) = persist(&store) { return reply; }
                     return fail(&err);
                 }
             }
             match crate::site::apply(&mut store, &row) {
                 Ok((path, log)) => {
-                    let _ = store.flush();
+                    if let Err(reply) = persist(&store) { return reply; }
                     ok(json!({ "path": path, "output": log }))
                 }
                 Err(err) => fail(&err),
@@ -989,7 +1133,7 @@ fn server(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
                 store.db.upsert("param", param);
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1000,7 +1144,7 @@ fn server(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 store.db.delete_where("location", "serverId", id);
                 store.db.delete_where("param", "serverId", id);
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         "enable" => {
@@ -1013,7 +1157,7 @@ fn server(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     map.insert("enable".into(), enable.into());
                 }
                 store.db.upsert("server", row);
-                let _ = store.flush();
+                if let Err(reply) = persist(&store) { return reply; }
             }
             ok_empty()
         }
@@ -1088,7 +1232,7 @@ fn upstream(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
                 store.db.upsert("param", param);
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1099,7 +1243,7 @@ fn upstream(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 store.db.delete_where("upstreamServer", "upstreamId", id);
                 store.db.delete_where("param", "upstreamId", id);
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1148,7 +1292,7 @@ fn template(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
                 store.db.upsert("param", param);
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1158,7 +1302,7 @@ fn template(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 store.db.delete("template", id);
                 store.db.delete_where("param", "templateId", id);
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1187,13 +1331,17 @@ fn admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }
             let pass = field(&body, "pass");
             if !pass.is_empty() {
+                let hashed = match hash_password(&pass) {
+                    Ok(h) => h,
+                    Err(_) => return fail("passTooShort"),
+                };
                 if let Value::Object(map) = &mut row {
-                    map.insert("pass".into(), encode_pass(&pass).into());
+                    map.insert("pass".into(), hashed.into());
                 }
             }
             let mut store = ctx.store.lock().unwrap();
             let id = store.db.upsert("admin", row);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1203,7 +1351,7 @@ fn admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 return fail("lastAdmin");
             }
             store.db.delete("admin", &id);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1222,9 +1370,9 @@ fn password(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     json!({
                         "id": str_of(&row, "id"),
                         "name": str_of(&row, "name"),
-                        "pass": str_of(&row, "pass"),
                         "descr": str_of(&row, "descr"),
                         "path": str_of(&row, "path"),
+                        "hasPass": std::path::Path::new(&str_of(&row, "path")).is_file(),
                     })
                 })
                 .collect();
@@ -1242,6 +1390,7 @@ fn password(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             if let Value::Object(map) = &mut row {
                 map.insert("name".into(), name.clone().into());
                 map.insert("path".into(), path.display().to_string().into());
+                map.remove("pass");
             }
             if let Err(err) =
                 nginx::write_password_file(&store, &path, &name, &field(&body, "pass"))
@@ -1249,7 +1398,7 @@ fn password(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 return fail(&err.to_string());
             }
             let id = store.db.upsert("password", row);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id }))
         }
         "del" => {
@@ -1262,7 +1411,7 @@ fn password(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
             }
             store.db.delete("password", &id);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1276,7 +1425,7 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
         "list" | "scan" => {
             let mut store = ctx.store.lock().unwrap();
             let adopted = crate::compat::adopt(&mut store.db);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             let certs: Vec<Value> = ordered(&store.db, "cert", true)
                 .into_iter()
                 .map(|row| {
@@ -1287,6 +1436,10 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                             crate::compat::normalize_cert_kind(&row).into(),
                         );
                     }
+                    crate::secrets::strip_object_secrets(
+                        &mut item,
+                        crate::secrets::SECRET_CERT_KEYS,
+                    );
                     item
                 })
                 .collect();
@@ -1350,13 +1503,16 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                 }
                 map.remove("pemContent");
                 map.remove("keyContent");
+                for key in crate::secrets::SECRET_CERT_KEYS {
+                    map.remove(*key);
+                }
                 if map.get("kind").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
                     map.insert("kind".into(), "dns_cf".into());
                 }
             }
             let mut store = ctx.store.lock().unwrap();
             let id = store.db.upsert("cert", row);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id }))
         }
         "apply" | "renew" => {
@@ -1374,10 +1530,10 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                     && !crate::install::acme_present(&store.db)
                 {
                     if let Err(err) = crate::install::ensure_acme(&mut store.db) {
-                        let _ = store.flush();
+                        if let Err(reply) = persist(&store) { return reply; }
                         return fail(&err);
                     }
-                    let _ = store.flush();
+                    if let Err(reply) = persist(&store) { return reply; }
                 }
                 match store.db.get("cert", &id) {
                     Some(row) => (store.db.clone(), row),
@@ -1401,7 +1557,10 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                 {
                     let mut store = ctx.store.lock().unwrap();
                     store.db.upsert("cert", updated);
-                    let _ = store.flush();
+                    if persist(&store).is_err() {
+                        crate::acme::job_finish(false, "saveFailed");
+                        return;
+                    }
                 }
                 crate::acme::job_finish(ok_apply, &log);
             });
@@ -1448,7 +1607,7 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
                 }
             }
             store.db.delete("cert", &id);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1551,7 +1710,7 @@ fn www(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 }
             }
             let id = store.db.upsert("www", row);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({
                 "id": id,
                 "path": dest.display().to_string(),
@@ -1579,7 +1738,7 @@ fn www(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let id = field(&body(req), "id");
             let mut store = ctx.store.lock().unwrap();
             store.db.delete("www", &id);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
@@ -1596,7 +1755,7 @@ fn install(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut store = ctx.store.lock().unwrap();
             match crate::install::install_nginx(&mut store.db) {
                 Ok(log) => {
-                    let _ = store.flush();
+                    if let Err(reply) = persist(&store) { return reply; }
                     ok(json!({ "output": log, "status": crate::install::status(&store.db) }))
                 }
                 Err(err) => fail(&err),
@@ -1606,7 +1765,7 @@ fn install(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut store = ctx.store.lock().unwrap();
             match crate::install::install_acme(&mut store.db) {
                 Ok(log) => {
-                    let _ = store.flush();
+                    if let Err(reply) = persist(&store) { return reply; }
                     ok(json!({ "output": log, "status": crate::install::status(&store.db) }))
                 }
                 Err(err) => fail(&err),
@@ -1619,7 +1778,7 @@ fn install(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             store
                 .db
                 .set_setting("autoInstall", if enable { "true" } else { "false" });
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "autoInstall": enable }))
         }
         _ => fail("not found"),
@@ -1694,7 +1853,7 @@ fn simple_table(ctx: &Ctx, kind: &str, action: &str, req: &Req) -> Reply {
                 }
             }
             let id = store.db.upsert(table, row);
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok(json!({ "id": id }))
         }
         ("POST", "del") => {
@@ -1703,9 +1862,23 @@ fn simple_table(ctx: &Ctx, kind: &str, action: &str, req: &Req) -> Reply {
             for id in ids.split(',').filter(|s| !s.is_empty()) {
                 store.db.delete(table, id);
             }
-            let _ = store.flush();
+            if let Err(reply) = persist(&store) { return reply; }
             ok_empty()
         }
         _ => fail("not found"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persist_maps_flush_errors() {
+        let err = std::io::Error::new(std::io::ErrorKind::Other, "disk full");
+        let reply = persist_result(Err(err)).expect_err("flush error must become API fail");
+        let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(body["success"], false);
+        assert_eq!(body["msg"], "saveFailed: disk full");
     }
 }
