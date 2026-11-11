@@ -1,9 +1,15 @@
 //! Outbound agent: join a panel, then long-poll for whitelist RPC jobs.
+//!
+//! The agent never listens on a port. It keeps its own SQLite under its home
+//! directory, seeds it with the same system nginx layout the panel uses, and
+//! runs each job through the panel's own API handlers (see `rpc.rs`).
 
+use crate::api::Ctx;
 use crate::store::{str_of, Store};
 use serde_json::{json, Value};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -11,7 +17,6 @@ struct AgentConfig {
     url: String,
     node_id: String,
     credential: String,
-    insecure: bool,
     ca_file: String,
     fingerprint: String,
     home: PathBuf,
@@ -31,32 +36,68 @@ impl AgentConfig {
             url: str_of(&value, "url"),
             node_id: str_of(&value, "nodeId"),
             credential: str_of(&value, "credential"),
-            insecure: value
-                .get("insecure")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
             ca_file: str_of(&value, "ca"),
             fingerprint: str_of(&value, "fingerprint"),
             home: home.to_path_buf(),
         })
     }
 
+    /// Write agent.json atomically with mode 0600: it holds the long-lived
+    /// credential that lets this host take nginx jobs from the panel.
     fn save(&self) -> Result<(), String> {
-        let _ = std::fs::create_dir_all(&self.home);
+        create_private_dir(&self.home)?;
         let value = json!({
             "url": self.url,
             "nodeId": self.node_id,
             "credential": self.credential,
-            "insecure": self.insecure,
             "ca": self.ca_file,
             "fingerprint": self.fingerprint,
         });
-        std::fs::write(
-            Self::path(&self.home),
-            serde_json::to_vec_pretty(&value).unwrap_or_default(),
-        )
-        .map_err(|err| format!("cannot write agent.json: {err}"))
+        let path = Self::path(&self.home);
+        let tmp = self.home.join(".agent.json.tmp");
+        let bytes = serde_json::to_vec_pretty(&value).unwrap_or_default();
+        write_private(&tmp, &bytes).map_err(|err| format!("cannot write agent.json: {err}"))?;
+        std::fs::rename(&tmp, &path).map_err(|err| format!("cannot write agent.json: {err}"))?;
+        restrict(&path).map_err(|err| format!("cannot chmod agent.json: {err}"))
     }
+}
+
+fn create_private_dir(dir: &Path) -> Result<(), String> {
+    let existed = dir.is_dir();
+    std::fs::create_dir_all(dir)
+        .map_err(|err| format!("cannot create {}: {err}", dir.display()))?;
+    #[cfg(unix)]
+    if !existed {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let _ = existed;
+    Ok(())
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let _ = std::fs::remove_file(path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn restrict(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path;
+    Ok(())
 }
 
 fn default_home() -> PathBuf {
@@ -82,7 +123,6 @@ fn parse_args() -> Result<(String, AgentConfig), String> {
         url: String::new(),
         node_id: String::new(),
         credential: String::new(),
-        insecure: false,
         ca_file: String::new(),
         fingerprint: String::new(),
         home: default_home(),
@@ -104,8 +144,12 @@ fn parse_args() -> Result<(String, AgentConfig), String> {
                 i += 2;
             }
             "--insecure" => {
-                cfg.insecure = true;
-                i += 1;
+                return Err(
+                    "--insecure was removed: TLS certificates are always verified. Use an HTTPS \
+                     reverse proxy with a trusted certificate, add your CA to the system trust \
+                     store, or use http:// only on a trusted network."
+                        .into(),
+                );
             }
             "--tls-ca" => {
                 cfg.ca_file = args.get(i + 1).cloned().unwrap_or_default();
@@ -134,14 +178,19 @@ fn print_help() {
     println!("  run  [--url https://panel.example]");
     println!("  --home DIR          config/data directory");
     println!("  --tls-ca FILE       extra CA certificate (PEM)");
-    println!("  --tls-fingerprint   SHA-256 hex of the panel certificate");
-    println!("  --insecure          skip TLS verification (development only)");
+    println!("  --tls-fingerprint   recorded only; not enforced (see docs/remote-registry.md)");
+    println!();
+    println!("environment:");
+    println!("  NGINXWEBUI_AGENT_HOME        config/data directory");
+    println!("  NGINXWEBUI_AGENT_CREDENTIAL  credential to use instead of agent.json");
+    println!("  NGINXWEBUI_RELOAD_CMD        reload command default (allow-listed values only)");
 }
 
 fn build_agent(cfg: &AgentConfig) -> Result<ureq::Agent, String> {
-    if cfg.insecure {
+    if cfg.url.starts_with("http://") && !is_loopback(&cfg.url) {
         eprintln!(
-            "warning: --insecure disables nothing here if the URL is https://; this client verifies certificates by default. Use http:// only on a trusted network, or --tls-ca for a private CA."
+            "warning: {} is plain http; the credential and every job travel unencrypted. Use HTTPS.",
+            cfg.url
         );
     }
     if !cfg.ca_file.is_empty() {
@@ -161,6 +210,17 @@ fn build_agent(cfg: &AgentConfig) -> Result<ureq::Agent, String> {
         .timeout_read(Duration::from_secs(40))
         .timeout_write(Duration::from_secs(15))
         .build())
+}
+
+fn is_loopback(url: &str) -> bool {
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("");
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    host == "localhost" || host.starts_with("127.") || host == "[::1]"
 }
 
 fn post_json(
@@ -234,18 +294,48 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// Open the agent's store and give it the same defaults the panel would
+/// have on this host (Debian `/etc/nginx` layout, reload command, ...).
+pub fn open_node_context(home: &Path) -> Arc<Ctx> {
+    let data = home.join("data");
+    let _ = std::fs::create_dir_all(&data);
+    crate::applog::init(home, None);
+    if !crate::seed::has_system_nginx() {
+        let _ = crate::seed::write_default_files(home);
+    }
+    let mut store = Store::open(&data);
+    let reload = std::env::var("NGINXWEBUI_RELOAD_CMD").ok();
+    crate::seed::seed(&mut store.db, home, reload.as_deref());
+    let _ = crate::compat::adopt(&mut store.db);
+    if let Err(err) = crate::site::ensure_main_includes_sites(&store.db) {
+        crate::applog::warn(format!("ensure sites-enabled include: {err}"));
+    }
+    if let Err(err) = store.flush() {
+        eprintln!("warning: cannot save agent database: {err}");
+    }
+    println!(
+        "  nginx.conf : {}",
+        crate::nginx::nginx_path(&store.db).display()
+    );
+    println!(
+        "  sites      : {}",
+        crate::site::sites_available(&store.db).display()
+    );
+    println!("  reload     : {}", store.db.setting("reloadCmd"));
+    let mut ctx = Ctx::standalone(home.to_path_buf(), store);
+    ctx.agent_mode = true;
+    Arc::new(ctx)
+}
+
 fn do_run(agent: &ureq::Agent, cfg: &AgentConfig) -> Result<(), String> {
     if cfg.credential.is_empty() {
         return Err("not joined; run `nginxwebui-agent join` first".into());
     }
-    let _ = std::fs::create_dir_all(cfg.home.join("data"));
-    let mut store = Store::open(&cfg.home.join("data"));
-    if store.db.setting("home").is_empty() {
-        store
-            .db
-            .set_setting("home", &cfg.home.display().to_string());
-        let _ = store.flush();
-    }
+    println!("nginxwebui-agent {} → {}", crate::VERSION, cfg.url);
+    let ctx = open_node_context(&cfg.home);
+    // certificates issued on this node are renewed on this node
+    crate::api::spawn_acme_cron(ctx.clone());
+    let instance = crate::auth::random_token(16);
     let base = cfg.url.trim_end_matches('/').to_string();
     let hello = format!("{base}/agent/v1/hello");
     let poll = format!("{base}/agent/v1/poll");
@@ -264,7 +354,12 @@ fn do_run(agent: &ureq::Agent, cfg: &AgentConfig) -> Result<(), String> {
             continue;
         }
         backoff = 1;
-        match post_json(agent, &poll, &cfg.credential, json!({})) {
+        match post_json(
+            agent,
+            &poll,
+            &cfg.credential,
+            json!({ "instance": instance }),
+        ) {
             Ok(value) => {
                 let jobs = value
                     .get("obj")
@@ -273,28 +368,19 @@ fn do_run(agent: &ureq::Agent, cfg: &AgentConfig) -> Result<(), String> {
                     .unwrap_or_else(|| value.get("jobs").cloned().unwrap_or(Value::Array(vec![])));
                 if let Value::Array(jobs) = jobs {
                     for job in jobs {
-                        let job_id = str_of(&job, "id");
-                        let method = str_of(&job, "method");
-                        let params = job.get("params").cloned().unwrap_or(Value::Null);
-                        let outcome = crate::rpc::execute(&mut store.db, &method, &params);
-                        let _ = store.flush();
-                        let body = match outcome {
-                            Ok(result) => json!({
-                                "jobId": job_id,
-                                "ok": true,
-                                "result": result
-                            }),
-                            Err(err) => json!({
-                                "jobId": job_id,
-                                "ok": false,
-                                "error": err
-                            }),
-                        };
+                        let body = run_job(&ctx, &job);
                         if let Err(err) = post_json(agent, &result_url, &cfg.credential, body) {
                             eprintln!("result upload failed: {err}");
                         }
                     }
                 }
+            }
+            Err(err) if err == "pollSuperseded" => {
+                eprintln!(
+                    "poll superseded by another connection with the same credential; \
+                     if this repeats, agent.json was copied to a second host"
+                );
+                std::thread::sleep(Duration::from_secs(5));
             }
             Err(err) => {
                 eprintln!("poll failed: {err}");
@@ -302,6 +388,26 @@ fn do_run(agent: &ureq::Agent, cfg: &AgentConfig) -> Result<(), String> {
                 backoff = (backoff * 2).min(30);
             }
         }
+    }
+}
+
+/// Largest result the panel accepts on /agent/v1/result (minus envelope).
+const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024 - 4096;
+
+fn run_job(ctx: &Arc<Ctx>, job: &Value) -> Value {
+    let job_id = str_of(job, "id");
+    let method = str_of(job, "method");
+    let params = job.get("params").cloned().unwrap_or(Value::Null);
+    match crate::rpc::execute(ctx, &method, &params) {
+        Ok(result) => {
+            let size = serde_json::to_vec(&result).map(|v| v.len()).unwrap_or(0);
+            if size > MAX_RESULT_BYTES {
+                json!({ "jobId": job_id, "ok": false, "error": "resultTooLarge" })
+            } else {
+                json!({ "jobId": job_id, "ok": true, "result": result })
+            }
+        }
+        Err(err) => json!({ "jobId": job_id, "ok": false, "error": err }),
     }
 }
 
@@ -318,9 +424,6 @@ pub fn run() -> Result<(), String> {
             if cfg.node_id.is_empty() {
                 cfg.node_id = saved.node_id;
             }
-            if !cfg.insecure {
-                cfg.insecure = saved.insecure;
-            }
             if cfg.ca_file.is_empty() {
                 cfg.ca_file = saved.ca_file;
             }
@@ -329,16 +432,67 @@ pub fn run() -> Result<(), String> {
             }
         }
     }
+    if let Ok(cred) = std::env::var("NGINXWEBUI_AGENT_CREDENTIAL") {
+        if cmd != "join" && !cred.trim().is_empty() {
+            cfg.credential = cred.trim().to_string();
+        }
+    }
     if cfg.url.is_empty() {
         return Err("--url is required (or save it via join)".into());
     }
-    if cfg.insecure && !cfg.url.starts_with("https://") && !cfg.url.starts_with("http://") {
-        return Err("url must start with http:// or https://".into());
+    if !cfg.url.starts_with("https://") && !cfg.url.starts_with("http://") {
+        return Err("url must start with https:// (or http:// on a trusted network)".into());
     }
     let agent = build_agent(&cfg)?;
     match cmd.as_str() {
         "join" => do_join(&agent, &mut cfg),
         "run" => do_run(&agent, &cfg),
         other => Err(format!("unknown command: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_json_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!(
+            "nginxwebui-agentcfg-{}-{}",
+            std::process::id(),
+            crate::store::new_id()
+        ));
+        let cfg = AgentConfig {
+            url: "https://panel.example".into(),
+            node_id: "n1".into(),
+            credential: "nwk_secret".into(),
+            ca_file: String::new(),
+            fingerprint: String::new(),
+            home: home.clone(),
+        };
+        cfg.save().unwrap();
+        // saving again over an existing (wider) file still ends at 0600
+        std::fs::set_permissions(
+            AgentConfig::path(&home),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        cfg.save().unwrap();
+        let mode = std::fs::metadata(AgentConfig::path(&home))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let loaded = AgentConfig::load(&home).unwrap();
+        assert_eq!(loaded.credential, "nwk_secret");
+    }
+
+    #[test]
+    fn loopback_detection() {
+        assert!(is_loopback("http://127.0.0.1:8080"));
+        assert!(is_loopback("http://localhost/x"));
+        assert!(!is_loopback("http://10.0.0.2:8080"));
     }
 }

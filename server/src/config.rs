@@ -14,6 +14,8 @@ pub struct FileValues {
     pub reload_cmd: Option<String>,
     pub bind: Option<String>,
     pub secure_cookie: Option<bool>,
+    pub trusted_proxies: Option<String>,
+    pub agent_threads: Option<usize>,
     pub bin: Option<PathBuf>,
     pub log: Option<PathBuf>,
     pub pid: Option<PathBuf>,
@@ -75,6 +77,18 @@ pub fn parse(text: &str, base: &Path) -> Result<FileValues, String> {
                 values.secure_cookie = Some(
                     parse_bool(&value)
                         .map_err(|_| format!("line {}: invalid secure_cookie", index + 1))?,
+                );
+            }
+            "trusted_proxies" | "trusted.proxies" | "trusted_proxy" => {
+                crate::net::parse_list(&value)
+                    .map_err(|err| format!("line {}: {err}", index + 1))?;
+                values.trusted_proxies = Some(value);
+            }
+            "agent_threads" | "agent.threads" => {
+                values.agent_threads = Some(
+                    value
+                        .parse()
+                        .map_err(|_| format!("line {}: invalid agent_threads", index + 1))?,
                 );
             }
             "bin" => values.bin = Some(resolve(base, &value)),
@@ -206,6 +220,21 @@ reload_cmd = nginx -s reload
         assert_eq!(values.web.as_deref(), Some(dir.join("web/build").as_path()));
         assert_eq!(values.threads, Some(4));
         assert_eq!(values.reload_cmd.as_deref(), Some("nginx -s reload"));
+    }
+
+    #[test]
+    fn parses_trusted_proxies_and_agent_threads() {
+        let values = parse(
+            "trusted_proxies = 127.0.0.1, 172.16.0.0/12\nagent_threads = 64\n",
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        assert_eq!(
+            values.trusted_proxies.as_deref(),
+            Some("127.0.0.1, 172.16.0.0/12")
+        );
+        assert_eq!(values.agent_threads, Some(64));
+        assert!(parse("trusted_proxies = nope\n", Path::new("/tmp")).is_err());
     }
 
     #[test]

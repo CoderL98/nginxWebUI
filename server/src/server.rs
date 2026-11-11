@@ -11,20 +11,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
 use tiny_http::{Header, Response, StatusCode};
-
-// The default nginx files, taken from the same conf.zip the Java version ships.
-const MIME_TYPES: &str = include_str!("../assets/conf/mime.types");
-const FASTCGI_CONF: &str = include_str!("../assets/conf/fastcgi.conf");
-const FASTCGI_PARAMS: &str = include_str!("../assets/conf/fastcgi_params");
-const SCGI_PARAMS: &str = include_str!("../assets/conf/scgi_params");
-const UWSGI_PARAMS: &str = include_str!("../assets/conf/uwsgi_params");
-const KOI_UTF: &str = include_str!("../assets/conf/koi-utf");
-const KOI_WIN: &str = include_str!("../assets/conf/koi-win");
-const WIN_UTF: &str = include_str!("../assets/conf/win-utf");
-
-const NGINX_CONF_TEMPLATE: &str =
-    "worker_processes  1;\n\nevents {\n    worker_connections  1024;\n}\n";
 
 struct Options {
     port: u16,
@@ -35,6 +23,39 @@ struct Options {
     reload_cmd: Option<String>,
     secure_cookie: bool,
     config_path: Option<PathBuf>,
+    trusted_proxies: Vec<crate::net::IpNet>,
+    agent_threads: usize,
+}
+
+const DEFAULT_AGENT_THREADS: usize = 32;
+/// Body limits. Login is tiny; agent endpoints are public (no session), so
+/// they get a small cap; result uploads carry RPC output (log tails, site
+/// lists) and get a larger but still bounded one.
+const LOGIN_BODY_LIMIT: u64 = 16 * 1024;
+const AGENT_BODY_LIMIT: u64 = 64 * 1024;
+const AGENT_RESULT_LIMIT: u64 = 4 * 1024 * 1024;
+const ADMIN_BODY_LIMIT: u64 = 16 * 1024 * 1024;
+
+fn body_limit(path: &str) -> u64 {
+    if path.starts_with("/adminPage/login") {
+        LOGIN_BODY_LIMIT
+    } else if path == "/agent/v1/result" {
+        AGENT_RESULT_LIMIT
+    } else if path.starts_with("/agent/") {
+        AGENT_BODY_LIMIT
+    } else {
+        ADMIN_BODY_LIMIT
+    }
+}
+
+fn parse_proxies_or_exit(text: &str) -> Vec<crate::net::IpNet> {
+    match crate::net::parse_list(text) {
+        Ok(list) => list,
+        Err(err) => {
+            eprintln!("trusted_proxies: {err}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -55,6 +76,10 @@ fn parse_args() -> Options {
         println!("  --project.home=DIR   数据目录");
         println!("  --web.dir=DIR        静态前端目录");
         println!("  --threads=N          工作线程（默认 2）");
+        println!("  --agent-threads=N    agent 长轮询线程池（默认 32，即最多 32 台设备同时在线）");
+        println!(
+            "  --trusted-proxies=L  受信反代地址/网段（逗号分隔），仅这些来源的 X-Forwarded-* 生效"
+        );
         println!();
         println!("优先顺序：命令行 > 环境变量 > 配置文件 > 默认值");
         std::process::exit(0);
@@ -69,6 +94,8 @@ fn parse_args() -> Options {
         reload_cmd: None,
         secure_cookie: false,
         config_path: None,
+        trusted_proxies: Vec::new(),
+        agent_threads: DEFAULT_AGENT_THREADS,
     };
 
     let cli_config = crate::config::cli_config_path(&args);
@@ -95,6 +122,12 @@ fn parse_args() -> Options {
                 }
                 if let Some(secure) = file.secure_cookie {
                     options.secure_cookie = secure;
+                }
+                if let Some(list) = &file.trusted_proxies {
+                    options.trusted_proxies = parse_proxies_or_exit(list);
+                }
+                if let Some(n) = file.agent_threads {
+                    options.agent_threads = n.clamp(1, 1024);
                 }
                 options.config_path = Some(path);
             }
@@ -139,6 +172,18 @@ fn parse_args() -> Options {
         .filter(|s| !s.is_empty())
     {
         options.secure_cookie = matches!(secure.as_str(), "1" | "true" | "yes" | "on");
+    }
+
+    if let Ok(list) = std::env::var("NGINXWEBUI_TRUSTED_PROXIES") {
+        if !list.trim().is_empty() {
+            options.trusted_proxies = parse_proxies_or_exit(&list);
+        }
+    }
+    if let Some(n) = std::env::var("NGINXWEBUI_AGENT_THREADS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        options.agent_threads = n.clamp(1, 1024);
     }
 
     let mut index = 0;
@@ -190,6 +235,20 @@ fn parse_args() -> Options {
                     options.web = Some(PathBuf::from(value));
                 }
             }
+            "--trusted-proxies" => {
+                if let Some(value) = take(inline) {
+                    options.trusted_proxies = parse_proxies_or_exit(&value);
+                }
+            }
+            "--agent-threads" => {
+                if let Some(value) = take(inline) {
+                    options.agent_threads = value
+                        .trim()
+                        .parse()
+                        .unwrap_or(DEFAULT_AGENT_THREADS)
+                        .clamp(1, 1024);
+                }
+            }
             "--threads" => {
                 if let Some(value) = take(inline) {
                     options.threads = value.trim().parse().unwrap_or(2).clamp(1, 64);
@@ -200,161 +259,6 @@ fn parse_args() -> Options {
         index += 1;
     }
     options
-}
-
-/// Write the small standard nginx files the first time, like the Java version did
-/// when it unpacked conf.zip.
-fn write_default_files(home: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(home)?;
-    let files: [(&str, &str); 8] = [
-        ("mime.types", MIME_TYPES),
-        ("fastcgi.conf", FASTCGI_CONF),
-        ("fastcgi_params", FASTCGI_PARAMS),
-        ("scgi_params", SCGI_PARAMS),
-        ("uwsgi_params", UWSGI_PARAMS),
-        ("koi-utf", KOI_UTF),
-        ("koi-win", KOI_WIN),
-        ("win-utf", WIN_UTF),
-    ];
-    for (name, content) in files {
-        let path = home.join(name);
-        if !path.exists() {
-            std::fs::write(path, content)?;
-        }
-    }
-    let conf_path = home.join("nginx.conf");
-    if !conf_path.exists() {
-        std::fs::write(conf_path, NGINX_CONF_TEMPLATE)?;
-    }
-    Ok(())
-}
-
-fn seed(db: &mut crate::store::Db, home: &Path, reload_cmd: Option<&str>) {
-    db.set_setting("home", &home.display().to_string());
-    if db.setting("lang").is_empty() {
-        db.set_setting("lang", "zh");
-    }
-    let system_nginx = crate::nginx::unix_is_file("/etc/nginx/nginx.conf");
-    if db.setting("nginxPath").is_empty() {
-        if system_nginx {
-            db.set_setting("nginxPath", "/etc/nginx/nginx.conf");
-        } else {
-            db.set_setting("nginxPath", &home.join("nginx.conf").display().to_string());
-        }
-    }
-    if db.setting("nginxDir").is_empty() {
-        if system_nginx {
-            db.set_setting("nginxDir", "/etc/nginx");
-        } else {
-            db.set_setting("nginxDir", &home.display().to_string());
-        }
-    }
-    let fallback = |name: &str| home.join(name).display().to_string();
-    if db.setting("sitesAvailable").is_empty() {
-        let value = if crate::nginx::unix_is_dir("/etc/nginx/sites-available") {
-            "/etc/nginx/sites-available".to_string()
-        } else {
-            fallback("sites-available")
-        };
-        db.set_setting("sitesAvailable", &value);
-    }
-    if db.setting("sitesEnabled").is_empty() {
-        let value = if crate::nginx::unix_is_dir("/etc/nginx/sites-enabled") {
-            "/etc/nginx/sites-enabled".to_string()
-        } else {
-            fallback("sites-enabled")
-        };
-        db.set_setting("sitesEnabled", &value);
-    }
-    if db.setting("sslDir").is_empty() {
-        let value = if crate::nginx::unix_is_dir("/etc/nginx/ssl") {
-            "/etc/nginx/ssl".to_string()
-        } else {
-            fallback("ssl")
-        };
-        db.set_setting("sslDir", &value);
-    }
-    if db.setting("sslParams").is_empty() {
-        let value = if crate::nginx::unix_is_file("/etc/nginx/ssl-params.conf")
-            || crate::nginx::unix_is_dir("/etc/nginx")
-        {
-            "/etc/nginx/ssl-params.conf".to_string()
-        } else {
-            fallback("ssl-params.conf")
-        };
-        db.set_setting("sslParams", &value);
-    }
-    if db.setting("webRoot").is_empty() {
-        let value = if crate::nginx::unix_is_dir("/var/www") {
-            "/var/www".to_string()
-        } else {
-            fallback("www")
-        };
-        db.set_setting("webRoot", &value);
-    }
-    if db.setting("reloadCmd").is_empty() {
-        let cmd = reload_cmd
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                if Path::new("/.dockerenv").exists() {
-                    "nginx -s reload".into()
-                } else {
-                    "sudo -n systemctl reload nginx".into()
-                }
-            });
-        db.set_setting("reloadCmd", &cmd);
-    } else if db.setting("reloadCmd") == "sudo systemctl reload nginx" {
-        db.set_setting("reloadCmd", "sudo -n systemctl reload nginx");
-    }
-    if db.setting("decompose").is_empty() {
-        db.set_setting("decompose", "false");
-    }
-    if db.setting("denyAllow").is_empty() {
-        db.set_setting("denyAllow", "0");
-    }
-    if db.setting("denyAllowStream").is_empty() {
-        db.set_setting("denyAllowStream", "0");
-    }
-    if db.setting("acmeSh").is_empty() {
-        let found = crate::acme::resolve_bin(db);
-        if found.exists() {
-            db.set_setting("acmeSh", &found.display().to_string());
-        }
-    }
-    if db.setting("autoInstall").is_empty() {
-        db.set_setting("autoInstall", "false");
-    }
-
-    if db.rows("basic").is_empty() {
-        db.upsert(
-            "basic",
-            serde_json::json!({ "name": "worker_processes", "value": "auto", "seq": 1 }),
-        );
-        db.upsert(
-            "basic",
-            serde_json::json!({
-                "name": "events",
-                "value": "{\n    worker_connections  1024;\n    accept_mutex on;\n}",
-                "seq": 2
-            }),
-        );
-    }
-    if db.rows("http").is_empty() {
-        db.upsert(
-            "http",
-            serde_json::json!({ "name": "include", "value": "mime.types", "enable": true, "seq": 0 }),
-        );
-        db.upsert(
-            "http",
-            serde_json::json!({
-                "name": "default_type",
-                "value": "application/octet-stream",
-                "enable": true,
-                "seq": 1
-            }),
-        );
-    }
 }
 
 fn find_web_dir(options: &Options, exe_dir: &Path) -> PathBuf {
@@ -528,16 +432,27 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
     let method = format!("{}", request.method());
 
     let url_preview = request.url().to_string();
-    let path_preview = url_preview.split('?').next().unwrap_or(&url_preview);
-    let max_body = if path_preview.starts_with("/adminPage/login") {
-        16 * 1024u64
-    } else {
-        16 * 1024 * 1024
-    };
+    let path_preview = url_preview
+        .split('?')
+        .next()
+        .unwrap_or(&url_preview)
+        .to_string();
+    let max_body = body_limit(&path_preview);
     let mut body = Vec::new();
     {
         let reader = request.as_reader();
-        let _ = reader.take(max_body).read_to_end(&mut body);
+        let _ = reader.take(max_body + 1).read_to_end(&mut body);
+    }
+    if body.len() as u64 > max_body {
+        let mut reply = crate::api::json_reply(
+            413,
+            &serde_json::json!({ "success": false, "msg": "bodyTooLarge" }),
+        );
+        reply
+            .extra_headers
+            .push(("Connection".into(), "close".into()));
+        respond(request, reply);
+        return;
     }
 
     let (path, query_text) = match url.split_once('?') {
@@ -559,6 +474,7 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
     let mut forwarded_https = false;
     let mut forwarded_ip = String::new();
     let mut node_header = String::new();
+    let mut requested_with = String::new();
     let mut authorization = String::new();
     let mut host = String::new();
     for header in request.headers() {
@@ -585,6 +501,9 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
         if header.field.equiv("X-NginxWebUI-Node") {
             node_header = header.value.as_str().trim().to_string();
         }
+        if header.field.equiv("X-Requested-With") {
+            requested_with = header.value.as_str().trim().to_string();
+        }
         if header.field.equiv("Authorization") {
             authorization = header.value.as_str().trim().to_string();
         }
@@ -592,24 +511,17 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
             host = header.value.as_str().trim().to_string();
         }
         if header.field.equiv("X-Forwarded-For") {
-            forwarded_ip = header
-                .value
-                .as_str()
-                .split(',')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            if !forwarded_ip.is_empty() {
+                forwarded_ip.push(',');
+            }
+            forwarded_ip.push_str(header.value.as_str());
         }
     }
-    let remote_ip = if !forwarded_ip.is_empty() {
-        forwarded_ip
-    } else {
-        request
-            .remote_addr()
-            .map(|addr| addr.ip().to_string())
-            .unwrap_or_else(|| "unknown".into())
-    };
+    // X-Forwarded-* only count when the TCP peer is a configured proxy
+    let peer = request.remote_addr().map(|addr| addr.ip());
+    let behind_trusted_proxy = crate::net::is_trusted(peer, &app.trusted_proxies);
+    let forwarded_https = forwarded_https && behind_trusted_proxy;
+    let remote_ip = crate::net::client_ip(peer, &forwarded_ip, &app.trusted_proxies);
 
     if path == "/healthz" || path == "/readyz" {
         let reply = crate::api::ok(serde_json::json!({
@@ -643,7 +555,33 @@ fn handle_request(app: &Arc<Ctx>, mut request: tiny_http::Request) {
         node: node_header,
         authorization,
         panel_base,
+        requested_with,
     };
+
+    // unauthenticated agent endpoints: per-IP fixed windows
+    let bucket = match path.as_str() {
+        "/agent/install.sh" => Some(("install", 30u32)),
+        "/agent/download" => Some(("download", 10)),
+        "/agent/v1/join" => Some(("join", 10)),
+        _ => None,
+    };
+    if let Some((name, max)) = bucket {
+        let key = format!("{name}:{}", req.remote_ip);
+        if app
+            .limits
+            .lock()
+            .unwrap()
+            .allow_bucket(&key, 60, max)
+            .is_err()
+        {
+            let reply = crate::api::json_reply(
+                429,
+                &serde_json::json!({ "success": false, "msg": "tooManyAttempts" }),
+            );
+            respond(request, reply);
+            return;
+        }
+    }
 
     if path == "/agent/install.sh" {
         let reply = registry::install_script(&req);
@@ -727,12 +665,12 @@ pub fn run() {
     let _ = std::fs::create_dir_all(&data_dir);
     let _ = std::fs::create_dir_all(home.join("logs"));
     crate::applog::init(&home, None);
-    if !crate::nginx::unix_is_file("/etc/nginx/nginx.conf") {
-        let _ = write_default_files(&home);
+    if !crate::seed::has_system_nginx() {
+        let _ = crate::seed::write_default_files(&home);
     }
 
     let mut store = Store::open(&data_dir);
-    seed(&mut store.db, &home, options.reload_cmd.as_deref());
+    crate::seed::seed(&mut store.db, &home, options.reload_cmd.as_deref());
     let _ = crate::compat::adopt(&mut store.db);
     match crate::site::ensure_main_includes_sites(&store.db) {
         Ok(crate::site::SitesIncludeOutcome::NeedsConfirm { include_line, .. }) => {
@@ -760,9 +698,17 @@ pub fn run() {
     }
     println!("  sqlite    : {}", store.db_path.display());
     println!(
-        "  memory    : no JVM, local sqlite, {} worker threads",
-        options.threads
+        "  memory    : no JVM, local sqlite, {} worker threads, {} agent poll threads",
+        options.threads, options.agent_threads
     );
+    if options.trusted_proxies.is_empty() {
+        println!("  proxies   : none trusted (X-Forwarded-For / -Proto ignored)");
+    } else {
+        println!(
+            "  proxies   : trusting X-Forwarded-* from {} address range(s)",
+            options.trusted_proxies.len()
+        );
+    }
 
     let init_token = if store.db.rows("admin").is_empty() {
         let token = std::env::var("NGINXWEBUI_INIT_TOKEN")
@@ -780,59 +726,16 @@ pub fn run() {
         None
     };
 
-    let app = Arc::new(Ctx {
-        home: home.clone(),
-        web_dir,
-        store: Mutex::new(store),
-        sessions: Mutex::new(crate::auth::Sessions::default()),
-        limits: Mutex::new(crate::auth::RateLimiter::default()),
-        init_token: Mutex::new(init_token),
-        secure_cookie: options.secure_cookie,
-        hub: registry::Hub::new(),
-        agent_pool: registry::AgentPool::new(32),
-        exe_dir,
-    });
+    let mut ctx = Ctx::standalone(home.clone(), store);
+    ctx.web_dir = web_dir;
+    ctx.exe_dir = exe_dir;
+    ctx.init_token = Mutex::new(init_token);
+    ctx.secure_cookie = options.secure_cookie;
+    ctx.agent_pool = registry::AgentPool::new(options.agent_threads);
+    ctx.trusted_proxies = options.trusted_proxies.clone();
+    let app = Arc::new(ctx);
 
-    {
-        let app = app.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(2 * 60 * 60));
-            let snapshot = {
-                let store = app.store.lock().unwrap();
-                store.db.clone()
-            };
-            if crate::acme::resolve_bin(&snapshot).as_os_str().is_empty() {
-                continue;
-            }
-            if crate::acme::try_begin("cron", "").is_err() {
-                continue;
-            }
-            let (ok, out) = crate::acme::cron(&snapshot);
-            crate::acme::job_finish(ok, &out);
-            if !ok {
-                let mut store = app.store.lock().unwrap();
-                crate::api::record_system_operate(
-                    &mut store,
-                    "acme.cron",
-                    "",
-                    false,
-                    if out.trim().is_empty() {
-                        "acme.sh --cron failed"
-                    } else {
-                        &out
-                    },
-                );
-                let _ = store.flush();
-            }
-            if !out.trim().is_empty() {
-                crate::applog::info(format!(
-                    "acme.sh --cron (ok={}): {}",
-                    ok,
-                    out.chars().take(400).collect::<String>()
-                ));
-            }
-        });
-    }
+    crate::api::spawn_acme_cron(app.clone());
 
     let address = format!("{}:{}", options.bind, options.port);
     let server = match tiny_http::Server::http(&address) {

@@ -23,8 +23,42 @@ pub struct Ctx {
     pub hub: crate::registry::Hub,
     pub agent_pool: std::sync::Arc<crate::registry::AgentPool>,
     pub exe_dir: PathBuf,
+    /// Peers allowed to set `X-Forwarded-For` / `X-Forwarded-Proto`.
+    pub trusted_proxies: Vec<crate::net::IpNet>,
+    /// True inside `nginxwebui-agent`: the API handlers run against the
+    /// node's own SQLite and nginx, driven by whitelisted RPC jobs.
+    pub agent_mode: bool,
 }
 
+impl Ctx {
+    /// A context with no sessions, no agent pool and default policy. Used by
+    /// the agent (which never serves HTTP) and by tests.
+    pub fn standalone(home: PathBuf, store: Store) -> Ctx {
+        Ctx {
+            web_dir: home.clone(),
+            exe_dir: home.clone(),
+            home,
+            store: Mutex::new(store),
+            sessions: Mutex::new(Sessions::default()),
+            limits: Mutex::new(RateLimiter::default()),
+            init_token: Mutex::new(None),
+            secure_cookie: false,
+            hub: crate::registry::Hub::new(),
+            agent_pool: crate::registry::AgentPool::disabled(),
+            trusted_proxies: Vec::new(),
+            agent_mode: false,
+        }
+    }
+}
+
+/// Header the web UI sends on every request. Browsers cannot add a custom
+/// header to a cross-site form post without a CORS preflight (which this
+/// server never grants), so requiring it on state-changing requests blocks
+/// CSRF even where `SameSite=Lax` cookies are not honoured.
+pub const CSRF_HEADER: &str = "X-Requested-With";
+pub const CSRF_VALUE: &str = "nginxwebui";
+
+#[derive(Default)]
 pub struct Req {
     pub method: String,
     pub path: String,
@@ -37,6 +71,35 @@ pub struct Req {
     pub node: String,
     pub authorization: String,
     pub panel_base: String,
+    /// Value of the `X-Requested-With` header (CSRF guard).
+    pub requested_with: String,
+}
+
+impl Req {
+    /// A request built inside the process (agent RPC jobs), never from HTTP.
+    pub fn internal(method: &str, path: &str, query: HashMap<String, String>, body: Value) -> Req {
+        Req {
+            method: method.to_string(),
+            path: path.to_string(),
+            query,
+            body: if body.is_null() {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&body).unwrap_or_default()
+            },
+            content_type: "application/json".into(),
+            remote_ip: "agent".into(),
+            requested_with: CSRF_VALUE.into(),
+            ..Req::default()
+        }
+    }
+}
+
+pub fn csrf_ok(req: &Req) -> bool {
+    if matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return true;
+    }
+    req.requested_with.trim().eq_ignore_ascii_case(CSRF_VALUE)
 }
 
 pub struct Reply {
@@ -200,6 +263,10 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
     let kind = parts[1];
     let action = parts[2];
 
+    if !csrf_ok(req) {
+        return json_reply(403, &json!({ "success": false, "msg": "csrfRequired" }));
+    }
+
     // only a short allow-list is public; changeLang / changePass require a session
     if kind == "login"
         && matches!(
@@ -239,6 +306,13 @@ pub fn handle(ctx: &Arc<Ctx>, req: &Req) -> Reply {
         }
     }
 
+    dispatch_local(ctx, kind, action, req)
+}
+
+/// Run one API action against this process's own store and nginx, after the
+/// session / CSRF checks. The agent calls this for whitelisted RPC jobs so a
+/// remote node answers with exactly the same JSON as the local panel.
+pub fn dispatch_local(ctx: &Arc<Ctx>, kind: &str, action: &str, req: &Req) -> Reply {
     match (kind, action) {
         ("main", "monitor") => monitor(ctx),
         ("login", _) => login(ctx, action, req),
@@ -300,13 +374,14 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     }
                     let mut obj = crate::registry::public_node(&row, &ctx.hub);
                     if let Some((token, expires)) = issued {
+                        let base = panel_url_for(&store.db, req, &body);
+                        let (command, warning) = install_command(&base, &token);
                         if let Value::Object(map) = &mut obj {
                             map.insert("token".into(), token.clone().into());
                             map.insert("expires".into(), expires.to_string().into());
-                            map.insert(
-                                "installCommand".into(),
-                                install_command(&req.panel_base, &token).into(),
-                            );
+                            map.insert("panelUrl".into(), base.into());
+                            map.insert("installCommand".into(), command.into());
+                            map.insert("installWarning".into(), warning.into());
                         }
                     }
                     ok(obj)
@@ -315,7 +390,8 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }
         }
         "token" => {
-            let id = field(&body(req), "id");
+            let body = body(req);
+            let id = field(&body, "id");
             let mut store = ctx.store.lock().unwrap();
             match crate::registry::issue_join_token(&mut store.db, &id) {
                 Ok((token, expires)) => {
@@ -323,15 +399,48 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     if let Err(reply) = persist(&store) {
                         return reply;
                     }
+                    let base = panel_url_for(&store.db, req, &body);
+                    let (command, warning) = install_command(&base, &token);
                     ok(json!({
                         "id": id,
                         "token": token,
                         "expires": expires.to_string(),
-                        "installCommand": install_command(&req.panel_base, &token),
+                        "panelUrl": base,
+                        "installCommand": command,
+                        "installWarning": warning,
                     }))
                 }
                 Err(err) => fail(&err),
             }
+        }
+        "config" => {
+            let mut store = ctx.store.lock().unwrap();
+            if req.method == "POST" {
+                let body = body(req);
+                let url = field(&body, "panelUrl")
+                    .trim()
+                    .trim_end_matches('/')
+                    .to_string();
+                if !url.is_empty() && !valid_panel_url(&url) {
+                    return fail("badPanelUrl");
+                }
+                store.db.set_setting("agentPanelUrl", &url);
+                if let Err(reply) = persist(&store) {
+                    return reply;
+                }
+            }
+            let saved = store.db.setting("agentPanelUrl");
+            let effective = if saved.is_empty() {
+                req.panel_base.clone()
+            } else {
+                saved.clone()
+            };
+            ok(json!({
+                "panelUrl": saved,
+                "detected": req.panel_base,
+                "effective": effective,
+                "warning": install_command(&effective, "x").1,
+            }))
         }
         "del" | "revoke" => {
             let id = field(&body(req), "id");
@@ -362,13 +471,67 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
     }
 }
 
-fn install_command(panel_base: &str, token: &str) -> String {
+/// The panel URL baked into install commands: an explicit `panelUrl` in the
+/// request body, then the saved `agentPanelUrl` setting, then the URL the
+/// browser used to reach the panel.
+fn panel_url_for(db: &Db, req: &Req, body: &Value) -> String {
+    let explicit = field(body, "panelUrl");
+    if !explicit.trim().is_empty() && valid_panel_url(&explicit) {
+        return explicit.trim().trim_end_matches('/').to_string();
+    }
+    let saved = db.setting("agentPanelUrl");
+    if !saved.trim().is_empty() {
+        return saved.trim().trim_end_matches('/').to_string();
+    }
+    req.panel_base.trim_end_matches('/').to_string()
+}
+
+pub fn valid_panel_url(url: &str) -> bool {
+    let url = url.trim();
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"));
+    match rest {
+        Some(rest) => {
+            !rest.is_empty()
+                && !rest.contains(char::is_whitespace)
+                && !rest.contains(['\'', '"', '`', '$', ';', '|', '&', '<', '>', '\\'])
+        }
+        None => false,
+    }
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let host = url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("");
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    host == "localhost" || host.starts_with("127.") || host == "[::1]"
+}
+
+/// `(command, warning)` — warning is set when the URL is plain http:// (the
+/// agent binary and join token would travel unencrypted) or points at loopback
+/// (the remote host would try to reach itself).
+pub fn install_command(panel_base: &str, token: &str) -> (String, String) {
     let base = if panel_base.is_empty() {
         "https://panel.example".to_string()
     } else {
         panel_base.trim_end_matches('/').to_string()
     };
-    format!("curl -fsSL {base}/agent/install.sh | sh -s -- --url {base} --token {token}")
+    let warning = if is_loopback_url(&base) {
+        "installUrlLoopback"
+    } else if base.starts_with("http://") {
+        "installUrlInsecure"
+    } else {
+        ""
+    };
+    (
+        format!("curl -fsSL {base}/agent/install.sh | sh -s -- --url {base} --token {token}"),
+        warning.to_string(),
+    )
 }
 
 // --------------------------------------------------------------------- login
@@ -719,6 +882,49 @@ fn monitor(ctx: &Ctx) -> Reply {
         map.insert("canInstall".into(), crate::install::can_install().into());
     }
     ok(snapshot)
+}
+
+/// Every two hours run `acme.sh --cron` against this process's store. The
+/// panel and every agent run their own loop, so certificates issued on a
+/// remote node are renewed on that node.
+pub fn spawn_acme_cron(ctx: Arc<Ctx>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(2 * 60 * 60));
+        let snapshot = {
+            let store = ctx.store.lock().unwrap();
+            store.db.clone()
+        };
+        if crate::acme::resolve_bin(&snapshot).as_os_str().is_empty() {
+            continue;
+        }
+        if crate::acme::try_begin("cron", "").is_err() {
+            continue;
+        }
+        let (ok, out) = crate::acme::cron(&snapshot);
+        crate::acme::job_finish(ok, &out);
+        if !ok {
+            let mut store = ctx.store.lock().unwrap();
+            record_system_operate(
+                &mut store,
+                "acme.cron",
+                "",
+                false,
+                if out.trim().is_empty() {
+                    "acme.sh --cron failed"
+                } else {
+                    &out
+                },
+            );
+            let _ = store.flush();
+        }
+        if !out.trim().is_empty() {
+            crate::applog::info(format!(
+                "acme.sh --cron (ok={}): {}",
+                ok,
+                out.chars().take(400).collect::<String>()
+            ));
+        }
+    });
 }
 
 // ---------------------------------------------------------------------- conf
@@ -1274,7 +1480,8 @@ fn export(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                         continue;
                     }
                     if let Value::Array(rows) = rows {
-                        store.db.t.insert(name, rows);
+                        let merged = import_rows(&store.db, &name, rows);
+                        store.db.t.insert(name, merged);
                     }
                 }
             }
@@ -1287,7 +1494,83 @@ fn export(ctx: &Ctx, action: &str, req: &Req) -> Reply {
     }
 }
 
+/// Rows for an imported table. Exports never contain secrets (node hashes,
+/// DNS tokens, cert tokens, htpasswd passwords), so importing one must not
+/// blank them: secret fields are taken from the current row with the same id
+/// (or setting key), and secret fields present in the import are ignored.
+pub fn import_rows(db: &Db, table: &str, rows: Vec<Value>) -> Vec<Value> {
+    let mut out = import_rows_inner(db, table, rows);
+    if table == "setting" {
+        // keep secret settings the import file does not mention at all
+        for key in crate::secrets::SECRET_SETTING_KEYS {
+            if !out.iter().any(|r| str_of(r, "key") == *key) {
+                if let Some(row) = db.rows("setting").iter().find(|r| str_of(r, "key") == *key) {
+                    out.push(row.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn import_rows_inner(db: &Db, table: &str, rows: Vec<Value>) -> Vec<Value> {
+    let secret_keys: &[&str] = match table {
+        "node" => &["credHash", "joinTokenHash", "joinExpires"],
+        "cert" => crate::secrets::SECRET_CERT_KEYS,
+        "password" => &["pass"],
+        _ => &[],
+    };
+    rows.into_iter()
+        .map(|mut row| {
+            if table == "setting" {
+                let key = str_of(&row, "key");
+                if crate::secrets::is_secret_setting(&key) {
+                    let current = db.setting(&key);
+                    if let Value::Object(map) = &mut row {
+                        map.insert("value".into(), current.into());
+                        map.remove("set");
+                    }
+                }
+                return row;
+            }
+            if secret_keys.is_empty() {
+                return row;
+            }
+            let current = db.get(table, &str_of(&row, "id"));
+            if let Value::Object(map) = &mut row {
+                for key in secret_keys {
+                    map.remove(*key);
+                    if let Some(value) = current.as_ref().and_then(|c| c.get(*key)) {
+                        map.insert((*key).to_string(), value.clone());
+                    }
+                }
+                if table == "node" && !map.contains_key("credHash") {
+                    // an unknown node arrives without credentials: it has to
+                    // be given a fresh join token before an agent can connect
+                    map.insert("credHash".into(), "".into());
+                    map.insert("joinTokenHash".into(), "".into());
+                    map.insert("joinExpires".into(), "0".into());
+                }
+            }
+            row
+        })
+        .collect()
+}
+
 // -------------------------------------------------------- debian-style sites
+
+/// Overlay `patch` onto `base` (top-level keys only).
+pub fn merge_over(base: Option<Value>, patch: Value) -> Value {
+    match (base, patch) {
+        (Some(Value::Object(mut base)), Value::Object(patch)) => {
+            for (k, v) in patch {
+                base.insert(k, v);
+            }
+            Value::Object(base)
+        }
+        (_, patch) => patch,
+    }
+}
 
 fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
     match action {
@@ -1368,7 +1651,18 @@ fn site(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             }))
         }
         "save" => {
-            let body = body(req);
+            let body = {
+                // Never replace a stored site with a partial object: fields the
+                // client did not send keep their stored values.
+                let raw = body(req);
+                let id = field(&raw, "id");
+                let existing = if id.is_empty() {
+                    None
+                } else {
+                    ctx.store.lock().unwrap().db.get("site", &id)
+                };
+                merge_over(existing, raw)
+            };
             let apply_now = bool_of(&body, "apply", false);
             let confirm_include = bool_of(&body, "confirmInclude", false);
             let mut row = body.clone();
@@ -2022,6 +2316,18 @@ fn password(ctx: &Ctx, action: &str, req: &Req) -> Reply {
 
 // -------------------------------------------------------------------- certs
 
+fn dns_view(db: &Db) -> Value {
+    let mut map = Map::new();
+    for key in crate::secrets::SECRET_SETTING_KEYS {
+        map.insert(
+            (*key).to_string(),
+            json!({ "set": !db.setting(key).is_empty() }),
+        );
+    }
+    map.insert("acmeEmail".into(), db.setting("acmeEmail").into());
+    Value::Object(map)
+}
+
 fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
     match action {
         "list" | "scan" => {
@@ -2061,6 +2367,43 @@ fn cert(ctx: &Arc<Ctx>, action: &str, req: &Req) -> Reply {
             ok(crate::acme::summarize(&store.db))
         }
         "progress" | "job" => ok(crate::acme::job_snapshot().to_value()),
+        // DNS credentials for acme.sh on *this* machine (the panel, or — via
+        // RPC — the selected node). Secret values are write-only: the reply
+        // only says whether each one is set.
+        "dns" => {
+            let store = ctx.store.lock().unwrap();
+            ok(dns_view(&store.db))
+        }
+        "dnsSave" => {
+            let body = body(req);
+            let mut store = ctx.store.lock().unwrap();
+            for key in crate::secrets::SECRET_SETTING_KEYS {
+                if body.get(*key).is_none() {
+                    continue;
+                }
+                let value = field(&body, key);
+                if crate::secrets::should_store_secret(&value) {
+                    store.db.set_setting(key, value.trim());
+                }
+            }
+            if body.get("acmeEmail").is_some() {
+                let email = field(&body, "acmeEmail").trim().to_string();
+                if email.contains(char::is_whitespace) || email.contains(['"', '\'', '`', '$']) {
+                    return fail("badEmail");
+                }
+                store.db.set_setting("acmeEmail", &email);
+            }
+            for key in crate::secrets::SECRET_SETTING_KEYS {
+                if bool_of(&body, &format!("clear_{key}"), false) {
+                    store.db.set_setting(key, "");
+                }
+            }
+            record_operate(&mut store, &actor(ctx, req), "cert.dns", "", true, "");
+            if let Err(reply) = persist(&store) {
+                return reply;
+            }
+            ok(dns_view(&store.db))
+        }
         "save" => {
             let body = body(req);
             let domain = field(&body, "domain").trim().to_string();
@@ -2521,18 +2864,9 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         let store = Store::open(&dir);
-        Arc::new(Ctx {
-            home: dir.clone(),
-            web_dir: dir.clone(),
-            store: Mutex::new(store),
-            sessions: Mutex::new(Sessions::default()),
-            limits: Mutex::new(RateLimiter::default()),
-            init_token: Mutex::new(Some("init-secret".into())),
-            secure_cookie: false,
-            hub: crate::registry::Hub::new(),
-            agent_pool: crate::registry::AgentPool::new(2),
-            exe_dir: dir,
-        })
+        let ctx = Ctx::standalone(dir, store);
+        *ctx.init_token.lock().unwrap() = Some("init-secret".into());
+        Arc::new(ctx)
     }
 
     fn test_req(path: &str, payload: Value, token: &str) -> Req {
@@ -2552,6 +2886,7 @@ mod tests {
             node: String::new(),
             authorization: String::new(),
             panel_base: String::new(),
+            requested_with: CSRF_VALUE.into(),
         }
     }
 
@@ -2564,6 +2899,89 @@ mod tests {
 
     fn body_of(reply: &Reply) -> Value {
         serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    #[test]
+    fn state_changing_requests_need_the_csrf_header() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let mut req = test_req("/adminPage/node/save", json!({ "name": "x" }), &token);
+        req.requested_with = String::new();
+        let reply = handle(&ctx, &req);
+        assert_eq!(reply.status, 403);
+        assert_eq!(body_of(&reply)["msg"], "csrfRequired");
+        let mut login = test_req("/adminPage/login/login", json!({}), "");
+        login.requested_with = "other".into();
+        assert_eq!(handle(&ctx, &login).status, 403);
+        // reads do not need it
+        let mut get = test_req("/adminPage/node/list", Value::Null, &token);
+        get.method = "GET".into();
+        get.requested_with = String::new();
+        assert_eq!(body_of(&handle(&ctx, &get))["success"], true);
+    }
+
+    #[test]
+    fn import_keeps_node_hashes_and_secret_settings() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let node_id = {
+            let mut store = ctx.store.lock().unwrap();
+            let node = crate::registry::create_node(&mut store.db, "edge").unwrap();
+            let id = str_of(&node, "id");
+            let (join, _) = crate::registry::issue_join_token(&mut store.db, &id).unwrap();
+            crate::registry::join_with_token(&mut store.db, &join, &json!({})).unwrap();
+            store.db.set_setting("CF_Token", "real-token");
+            store.flush().unwrap();
+            id
+        };
+        let mut get = test_req("/adminPage/export/get", Value::Null, &token);
+        get.method = "GET".into();
+        let exported = body_of(&handle(&ctx, &get))["obj"].clone();
+        assert!(!exported.to_string().contains("credHash\":\"nginxwebui"));
+        assert!(!exported.to_string().contains("real-token"));
+        let mut tampered = exported.clone();
+        tampered["node"][0]["credHash"] = json!("attacker");
+        let reply = handle(&ctx, &test_req("/adminPage/export/set", tampered, &token));
+        assert_eq!(body_of(&reply)["success"], true);
+        let store = ctx.store.lock().unwrap();
+        let row = store.db.get("node", &node_id).unwrap();
+        let hash = str_of(&row, "credHash");
+        assert!(!hash.is_empty() && hash != "attacker");
+        assert_eq!(store.db.setting("CF_Token"), "real-token");
+    }
+
+    #[test]
+    fn install_command_warns_for_http_and_loopback() {
+        assert_eq!(install_command("https://p.example", "t").1, "");
+        assert_eq!(
+            install_command("http://p.example", "t").1,
+            "installUrlInsecure"
+        );
+        assert_eq!(
+            install_command("http://127.0.0.1:8080", "t").1,
+            "installUrlLoopback"
+        );
+        assert!(valid_panel_url("https://p.example:8443/base"));
+        assert!(!valid_panel_url("https://p.example; rm -rf /"));
+        assert!(!valid_panel_url("ftp://p.example"));
+    }
+
+    #[test]
+    fn remote_node_requests_are_proxied_or_refused() {
+        let ctx = test_ctx();
+        let token = signed_in(&ctx);
+        let id = {
+            let mut store = ctx.store.lock().unwrap();
+            let node = crate::registry::create_node(&mut store.db, "edge").unwrap();
+            str_of(&node, "id")
+        };
+        let mut req = test_req("/adminPage/www/upload", json!({}), &token);
+        req.node = id.clone();
+        assert_eq!(body_of(&handle(&ctx, &req))["msg"], "notSupportedOnNode");
+        // mapped but never connected: fail fast instead of a 30s timeout
+        let mut req = test_req("/adminPage/conf/check", json!({}), &token);
+        req.node = id;
+        assert_eq!(body_of(&handle(&ctx, &req))["msg"], "nodeOfflineErr");
     }
 
     #[test]

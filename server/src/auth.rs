@@ -294,6 +294,7 @@ struct CaptchaWindow {
 pub struct RateLimiter {
     login: HashMap<String, FailState>,
     captcha: HashMap<String, CaptchaWindow>,
+    buckets: HashMap<String, CaptchaWindow>,
 }
 
 impl RateLimiter {
@@ -333,6 +334,37 @@ impl RateLimiter {
         self.login.remove(&Self::login_key(ip, name));
     }
 
+    /// Fixed-window limiter for unauthenticated endpoints (agent join, agent
+    /// download, install.sh). `key` should include the client address.
+    pub fn allow_bucket(
+        &mut self,
+        key: &str,
+        window_secs: u64,
+        max: u32,
+    ) -> Result<(), &'static str> {
+        let now = now();
+        if self.buckets.len() > 4096 {
+            self.buckets
+                .retain(|_, w| now.saturating_sub(w.start) < window_secs.max(60));
+        }
+        let entry = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert(CaptchaWindow {
+                start: now,
+                count: 0,
+            });
+        if now.saturating_sub(entry.start) >= window_secs {
+            entry.start = now;
+            entry.count = 0;
+        }
+        if entry.count >= max {
+            return Err("tooManyAttempts");
+        }
+        entry.count = entry.count.saturating_add(1);
+        Ok(())
+    }
+
     pub fn allow_captcha(&mut self, ip: &str) -> Result<(), &'static str> {
         let now = now();
         let entry = self.captcha.entry(ip.to_string()).or_insert(CaptchaWindow {
@@ -354,6 +386,16 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bucket_limiter_blocks_after_max() {
+        let mut limits = RateLimiter::default();
+        for _ in 0..3 {
+            assert!(limits.allow_bucket("join:1.2.3.4", 60, 3).is_ok());
+        }
+        assert!(limits.allow_bucket("join:1.2.3.4", 60, 3).is_err());
+        assert!(limits.allow_bucket("join:5.6.7.8", 60, 3).is_ok());
+    }
 
     #[test]
     fn touch_does_not_revive_expired_session() {

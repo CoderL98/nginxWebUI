@@ -20,12 +20,33 @@ pub struct Hub {
     inner: Arc<Mutex<Inner>>,
 }
 
+/// What a parked long-poll is woken with.
+enum Wake {
+    Job(JobWire),
+    /// A newer poll for the same node took over (or the node was revoked).
+    Superseded,
+    Revoked,
+}
+
+struct Waiter {
+    id: u64,
+    tx: mpsc::Sender<Wake>,
+}
+
 struct Inner {
     queues: HashMap<String, VecDeque<JobWire>>,
-    waiters: HashMap<String, VecDeque<mpsc::Sender<Option<JobWire>>>>,
+    /// At most one parked poll per node: a newer poll supersedes the older
+    /// one, so a stale connection never swallows a job and two hosts sharing
+    /// one credential cannot silently split the work between them.
+    waiters: HashMap<String, Waiter>,
     inflight: HashMap<String, mpsc::Sender<Result<Value, String>>>,
     last_seen: HashMap<String, u64>,
     revoked: HashSet<String>,
+    /// last agent instance id seen per node, and when two different
+    /// instances were last seen polling within the online window
+    instances: HashMap<String, (String, u64)>,
+    conflicts: HashMap<String, u64>,
+    next_waiter: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -34,6 +55,17 @@ pub struct JobWire {
     pub method: String,
     pub params: Value,
 }
+
+#[derive(Debug)]
+pub enum Polled {
+    Job(JobWire),
+    Empty,
+    Superseded,
+}
+
+/// Window in which polls from two different agent instances count as a
+/// duplicated credential.
+pub const CONFLICT_SHOW_MS: u64 = 10 * 60 * 1000;
 
 impl Hub {
     pub fn new() -> Self {
@@ -44,6 +76,9 @@ impl Hub {
                 inflight: HashMap::new(),
                 last_seen: HashMap::new(),
                 revoked: HashSet::new(),
+                instances: HashMap::new(),
+                conflicts: HashMap::new(),
+                next_waiter: 1,
             })),
         }
     }
@@ -68,20 +103,48 @@ impl Hub {
         seen > 0 && now_ms().saturating_sub(seen) <= ONLINE_AFTER_MS
     }
 
+    /// Two agent processes recently polled with the same credential.
+    pub fn has_conflict(&self, node_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .conflicts
+            .get(node_id)
+            .map(|at| now_ms().saturating_sub(*at) <= CONFLICT_SHOW_MS)
+            .unwrap_or(false)
+    }
+
+    /// Record the agent instance id that is polling (sent by the agent on
+    /// every poll). A different instance inside the online window means the
+    /// credential is in use on two hosts.
+    pub fn note_instance(&self, node_id: &str, instance: &str) {
+        if instance.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let mut inner = self.inner.lock().unwrap();
+        if let Some((prev, at)) = inner.instances.get(node_id) {
+            if prev != instance && now.saturating_sub(*at) <= ONLINE_AFTER_MS {
+                inner.conflicts.insert(node_id.to_string(), now);
+            }
+        }
+        inner
+            .instances
+            .insert(node_id.to_string(), (instance.to_string(), now));
+    }
+
     pub fn revoke(&self, node_id: &str) {
         let mut inner = self.inner.lock().unwrap();
         inner.revoked.insert(node_id.to_string());
-        if let Some(waiters) = inner.waiters.remove(node_id) {
-            for waiter in waiters {
-                let _ = waiter.send(None);
-            }
+        if let Some(waiter) = inner.waiters.remove(node_id) {
+            let _ = waiter.tx.send(Wake::Revoked);
         }
         inner.queues.remove(node_id);
-        inner.inflight.retain(|_, _| true);
+        let prefix = format!("{node_id}:");
         let stale: Vec<String> = inner
             .inflight
             .keys()
-            .filter(|id| id.starts_with(&format!("{node_id}:")))
+            .filter(|id| id.starts_with(&prefix))
             .cloned()
             .collect();
         for id in stale {
@@ -95,30 +158,65 @@ impl Hub {
         self.inner.lock().unwrap().revoked.contains(node_id)
     }
 
+    /// Long-poll for one job.
     pub fn wait_job(&self, node_id: &str, timeout: Duration) -> Option<JobWire> {
-        let rx = {
+        match self.poll(node_id, timeout) {
+            Polled::Job(job) => Some(job),
+            _ => None,
+        }
+    }
+
+    pub fn poll(&self, node_id: &str, timeout: Duration) -> Polled {
+        let (rx, waiter_id) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.revoked.contains(node_id) {
-                return None;
+                return Polled::Empty;
             }
             inner.last_seen.insert(node_id.to_string(), now_ms());
             if let Some(queue) = inner.queues.get_mut(node_id) {
                 if let Some(job) = queue.pop_front() {
-                    return Some(job);
+                    return Polled::Job(job);
                 }
             }
             let (tx, rx) = mpsc::channel();
-            inner
-                .waiters
-                .entry(node_id.to_string())
-                .or_default()
-                .push_back(tx);
-            rx
+            let id = inner.next_waiter;
+            inner.next_waiter = inner.next_waiter.wrapping_add(1);
+            if let Some(old) = inner.waiters.insert(node_id.to_string(), Waiter { id, tx }) {
+                let _ = old.tx.send(Wake::Superseded);
+            }
+            (rx, id)
         };
-        match rx.recv_timeout(timeout) {
-            Ok(job) => job,
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
+        let outcome = rx.recv_timeout(timeout);
+        // whatever happened, make sure our own waiter is not left behind
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.waiters.get(node_id).map(|w| w.id) == Some(waiter_id) {
+                inner.waiters.remove(node_id);
+            }
         }
+        match outcome {
+            Ok(Wake::Job(job)) => Polled::Job(job),
+            Ok(Wake::Superseded) => Polled::Superseded,
+            Ok(Wake::Revoked) => Polled::Empty,
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
+                // dispatch may have handed us a job between the timeout and
+                // the cleanup above (it sends while holding the lock, so it
+                // is in the channel by now), or queued one
+                if let Ok(Wake::Job(job)) = rx.try_recv() {
+                    return Polled::Job(job);
+                }
+                let mut inner = self.inner.lock().unwrap();
+                match inner.queues.get_mut(node_id).and_then(|q| q.pop_front()) {
+                    Some(job) => Polled::Job(job),
+                    None => Polled::Empty,
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiter_count(&self) -> usize {
+        self.inner.lock().unwrap().waiters.len()
     }
 
     pub fn dispatch(
@@ -144,20 +242,21 @@ impl Hub {
                 return Err("nodeRevoked".into());
             }
             inner.inflight.insert(job_id.clone(), tx);
-            if let Some(waiters) = inner.waiters.get_mut(node_id) {
-                while let Some(waiter) = waiters.pop_front() {
-                    if waiter.send(Some(wire.clone())).is_ok() {
-                        // delivered to a waiting poll
-                        drop(inner);
-                        return recv_result(rx, timeout, &self.inner, &job_id);
-                    }
+            let mut pending = Some(wire);
+            if let Some(waiter) = inner.waiters.remove(node_id) {
+                if let Err(mpsc::SendError(Wake::Job(job))) =
+                    waiter.tx.send(Wake::Job(pending.take().unwrap()))
+                {
+                    pending = Some(job);
                 }
             }
-            inner
-                .queues
-                .entry(node_id.to_string())
-                .or_default()
-                .push_back(wire);
+            if let Some(wire) = pending {
+                inner
+                    .queues
+                    .entry(node_id.to_string())
+                    .or_default()
+                    .push_back(wire);
+            }
         }
         recv_result(rx, timeout, &self.inner, &job_id)
     }
@@ -204,6 +303,12 @@ pub struct AgentPool {
 }
 
 impl AgentPool {
+    /// A pool that accepts nothing (agent process, tests).
+    pub fn disabled() -> Arc<Self> {
+        let (tx, _rx) = mpsc::sync_channel::<PollTask>(0);
+        Arc::new(Self { tx })
+    }
+
     pub fn new(workers: usize) -> Arc<Self> {
         let (tx, rx) = mpsc::sync_channel::<PollTask>(workers.saturating_mul(2).max(8));
         let rx = Arc::new(Mutex::new(rx));
@@ -285,6 +390,7 @@ pub fn public_node(row: &Value, hub: &Hub) -> Value {
         "os": str_of(row, "os"),
         "agentVersion": str_of(row, "agentVersion"),
         "joined": !str_of(row, "credHash").is_empty(),
+        "conflict": !revoked && hub.has_conflict(&id),
     })
 }
 
@@ -446,6 +552,9 @@ pub fn node_by_credential<'a>(db: &'a Db, credential: &str) -> Option<Value> {
     None
 }
 
+/// The agent credential, from `Authorization: Bearer …` only. Query strings
+/// end up in access logs and bodies get echoed by debugging proxies, so
+/// neither is accepted.
 fn bearer(req: &Req) -> String {
     let header = req.authorization.trim();
     if let Some(rest) = header
@@ -454,12 +563,7 @@ fn bearer(req: &Req) -> String {
     {
         return rest.trim().to_string();
     }
-    let body = parse_body(req);
-    let from_body = str_of(&body, "credential");
-    if !from_body.is_empty() {
-        return from_body;
-    }
-    req.query.get("credential").cloned().unwrap_or_default()
+    String::new()
 }
 
 fn parse_body(req: &Req) -> Value {
@@ -480,9 +584,18 @@ pub fn handle_agent(ctx: &Ctx, req: &Req) -> Reply {
             let body = parse_body(req);
             let token = str_of(&body, "token");
             let mut store = ctx.store.lock().unwrap();
+            let before = store.db.t.get("node").cloned();
             match join_with_token(&mut store.db, &token, &body) {
                 Ok((row, cred)) => {
-                    let _ = store.flush();
+                    if let Err(err) = store.flush() {
+                        // do not hand out a credential the panel will forget
+                        // on restart; keep the join token usable for a retry
+                        if let Some(rows) = before {
+                            store.db.t.insert("node".into(), rows);
+                        }
+                        crate::applog::error(format!("agent join: cannot save node: {err}"));
+                        return json_reply(500, &json!({ "success": false, "msg": "saveFailed" }));
+                    }
                     ok(json!({
                         "nodeId": str_of(&row, "id"),
                         "name": str_of(&row, "name"),
@@ -513,37 +626,57 @@ pub fn handle_agent(ctx: &Ctx, req: &Req) -> Reply {
                     if !body.is_null() {
                         let mut store = ctx.store.lock().unwrap();
                         if let Some(mut row) = store.db.get("node", &id) {
+                            let mut changed = false;
                             if let Value::Object(map) = &mut row {
-                                if !str_of(&body, "hostname").is_empty() {
-                                    map.insert("hostname".into(), str_of(&body, "hostname").into());
+                                for (src, dst) in [
+                                    ("hostname", "hostname"),
+                                    ("os", "os"),
+                                    ("version", "agentVersion"),
+                                ] {
+                                    let value = str_of(&body, src);
+                                    if !value.is_empty()
+                                        && map.get(dst).and_then(|v| v.as_str())
+                                            != Some(value.as_str())
+                                    {
+                                        map.insert(dst.into(), value.into());
+                                        changed = true;
+                                    }
                                 }
-                                if !str_of(&body, "os").is_empty() {
-                                    map.insert("os".into(), str_of(&body, "os").into());
-                                }
-                                if !str_of(&body, "version").is_empty() {
-                                    map.insert(
-                                        "agentVersion".into(),
-                                        str_of(&body, "version").into(),
+                            }
+                            // hello runs before every poll; only write when
+                            // something actually changed
+                            if changed {
+                                let before = store.db.get("node", &id);
+                                store.db.upsert("node", row);
+                                if let Err(err) = store.flush() {
+                                    if let Some(old) = before {
+                                        store.db.upsert("node", old);
+                                    }
+                                    crate::applog::error(format!(
+                                        "agent hello: cannot save node: {err}"
+                                    ));
+                                    return json_reply(
+                                        500,
+                                        &json!({ "success": false, "msg": "saveFailed" }),
                                     );
                                 }
                             }
-                            store.db.upsert("node", row);
-                            let _ = store.flush();
                         }
                     }
                     ok(json!({ "nodeId": id, "ok": true }))
                 }
                 "poll" => {
-                    let job = ctx.hub.wait_job(&id, POLL_WAIT);
-                    let jobs = match job {
-                        Some(job) => vec![json!({
+                    let body = parse_body(req);
+                    ctx.hub.note_instance(&id, &str_of(&body, "instance"));
+                    match ctx.hub.poll(&id, POLL_WAIT) {
+                        Polled::Job(job) => ok(json!({ "jobs": [{
                             "id": job.id,
                             "method": job.method,
                             "params": job.params,
-                        })],
-                        None => Vec::new(),
-                    };
-                    ok(json!({ "jobs": jobs }))
+                        }] })),
+                        Polled::Empty => ok(json!({ "jobs": [] })),
+                        Polled::Superseded => fail("pollSuperseded"),
+                    }
                 }
                 "result" => {
                     let body = parse_body(req);
@@ -576,7 +709,7 @@ pub fn handle_agent(ctx: &Ctx, req: &Req) -> Reply {
 }
 
 pub fn proxy(ctx: &Ctx, req: &Req, node_id: &str, method: &str, params: Value) -> Reply {
-    if !crate::rpc::is_allowed(&method) {
+    if !crate::rpc::is_allowed(method) {
         return fail("unsupportedMethod");
     }
     let (name, revoked) = {
@@ -588,6 +721,11 @@ pub fn proxy(ctx: &Ctx, req: &Req, node_id: &str, method: &str, params: Value) -
     };
     if revoked || ctx.hub.is_revoked(node_id) {
         return fail("nodeRevoked");
+    }
+    // fail fast instead of making the user wait RPC_WAIT for a node that is
+    // not connected
+    if !ctx.hub.is_online(node_id) {
+        return fail("nodeOfflineErr");
     }
     let who = {
         let token = req
@@ -602,94 +740,49 @@ pub fn proxy(ctx: &Ctx, req: &Req, node_id: &str, method: &str, params: Value) -
             .map(|s| s.admin_name.clone())
             .unwrap_or_else(|| "admin".into())
     };
+    let target = format!("{name}/{node_id}");
+    let record = |ok: bool, detail: &str| {
+        // reads (lists, progress polling) would flood the 200-entry log
+        if !crate::rpc::is_mutating(method) {
+            return;
+        }
+        let mut store = ctx.store.lock().unwrap();
+        crate::api::record_user_operate(&mut store, &who, method, &target, ok, detail);
+        let _ = store.flush();
+    };
     match ctx.hub.dispatch(node_id, method, params, RPC_WAIT) {
         Ok(value) => {
-            let mut store = ctx.store.lock().unwrap();
-            crate::api::record_user_operate(
-                &mut store,
-                &who,
-                method,
-                &format!("{name}/{node_id}"),
-                true,
-                "ok",
+            let value = crate::rpc::normalize_result(method, value);
+            let good = value
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            record(
+                good,
+                if good {
+                    "ok"
+                } else {
+                    value.get("msg").and_then(|v| v.as_str()).unwrap_or("")
+                },
             );
-            // record_system_operate uses adminName=system; add a proper user log:
-            let _ = store.flush();
-            // wrap raw RPC results into the usual envelope when they aren't already
-            if value.get("success").is_some() {
-                json_reply(200, &value)
-            } else {
-                ok(value)
-            }
+            json_reply(200, &value)
         }
         Err(err) => {
-            let mut store = ctx.store.lock().unwrap();
-            crate::api::record_user_operate(
-                &mut store,
-                &who,
-                method,
-                &format!("{name}/{node_id}"),
-                false,
-                &err,
-            );
-            let _ = store.flush();
+            record(false, &err);
             fail(&err)
         }
     }
 }
 
+const INSTALL_SCRIPT: &str = include_str!("../assets/agent-install.sh");
+
 pub fn install_script(req: &Req) -> Reply {
-    let base = if req.panel_base.is_empty() {
-        "http://127.0.0.1:8080".into()
+    let base = if req.panel_base.is_empty() || !crate::api::valid_panel_url(&req.panel_base) {
+        "https://panel.example".to_string()
     } else {
         req.panel_base.clone()
     };
-    let script = format!(
-        r#"#!/bin/sh
-set -eu
-PANEL="{base}"
-TOKEN=""
-INSECURE=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --url) PANEL="$2"; shift 2 ;;
-    --token) TOKEN="$2"; shift 2 ;;
-    --insecure) INSECURE="--insecure"; shift ;;
-    --) shift; break ;;
-    *) echo "unknown arg: $1" >&2; exit 1 ;;
-  esac
-done
-if [ -z "$TOKEN" ]; then
-  echo "usage: sh install.sh --url https://panel.example --token <join-token>" >&2
-  exit 1
-fi
-OS="$(uname -s | tr 'A-Z' 'a-z')"
-ARCH="$(uname -m)"
-case "$ARCH" in
-  x86_64|amd64) ARCH=x86_64 ;;
-  aarch64|arm64) ARCH=aarch64 ;;
-esac
-DEST="${{NGINXWEBUI_AGENT_BIN:-./nginxwebui-agent}}"
-URL="$PANEL/agent/download?os=$OS&arch=$ARCH"
-if command -v curl >/dev/null 2>&1; then
-  if curl -fsSL "$URL" -o "$DEST"; then
-    chmod +x "$DEST"
-  else
-    echo "The panel did not serve an agent binary for $OS/$ARCH." >&2
-    echo "Copy nginxwebui-agent next to this script (build with: cargo build --release --bin nginxwebui-agent)." >&2
-    if [ ! -x "$DEST" ]; then
-      exit 1
-    fi
-  fi
-else
-  echo "curl is required to download the agent binary" >&2
-  exit 1
-fi
-"$DEST" join --url "$PANEL" --token "$TOKEN" $INSECURE
-echo "Starting agent (run under systemd/supervisor in production)..."
-exec "$DEST" run --url "$PANEL" $INSECURE
-"#
-    );
+    let script = INSTALL_SCRIPT.replace("__PANEL__", &base);
     Reply {
         status: 200,
         content_type: "text/x-shellscript; charset=utf-8".into(),
@@ -741,7 +834,201 @@ pub fn download_agent(ctx: &Ctx, req: &Req) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Db;
+    use crate::store::{Db, Store};
+
+    fn agent_ctx() -> Arc<Ctx> {
+        let dir = std::env::temp_dir().join(format!(
+            "nginxwebui-reg-{}-{}",
+            std::process::id(),
+            crate::store::new_id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = Store::open(&dir);
+        Arc::new(Ctx::standalone(dir, store))
+    }
+
+    fn agent_req(path: &str, body: Value, auth: &str) -> Req {
+        let mut req = Req::internal("POST", path, Default::default(), body);
+        req.authorization = auth.to_string();
+        req
+    }
+
+    fn reply_json(reply: &Reply) -> Value {
+        serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    fn break_sqlite(ctx: &Ctx) {
+        let path = ctx.store.lock().unwrap().db_path.clone();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("DROP TABLE records;").unwrap();
+    }
+
+    fn joined(ctx: &Ctx) -> (String, String) {
+        let mut store = ctx.store.lock().unwrap();
+        let node = create_node(&mut store.db, "edge").unwrap();
+        let id = str_of(&node, "id");
+        let (token, _) = issue_join_token(&mut store.db, &id).unwrap();
+        store.flush().unwrap();
+        (id, token)
+    }
+
+    #[test]
+    fn join_does_not_issue_credentials_when_flush_fails() {
+        let ctx = agent_ctx();
+        let (id, token) = joined(&ctx);
+        break_sqlite(&ctx);
+        let reply = handle_agent(
+            &ctx,
+            &agent_req(
+                "/agent/v1/join",
+                json!({ "token": token, "hostname": "h" }),
+                "",
+            ),
+        );
+        let body = reply_json(&reply);
+        assert_eq!(body["success"], false);
+        assert_eq!(body["msg"], "saveFailed");
+        assert!(!reply.body.windows(4).any(|w| w == b"nwk_"));
+        // the in-memory row is rolled back: token still valid, no credential
+        let store = ctx.store.lock().unwrap();
+        let row = store.db.get("node", &id).unwrap();
+        assert!(str_of(&row, "credHash").is_empty());
+        assert!(!str_of(&row, "joinTokenHash").is_empty());
+    }
+
+    #[test]
+    fn join_then_hello_and_query_credentials_are_rejected() {
+        let ctx = agent_ctx();
+        let (_, token) = joined(&ctx);
+        let reply = handle_agent(
+            &ctx,
+            &agent_req(
+                "/agent/v1/join",
+                json!({ "token": token, "hostname": "h" }),
+                "",
+            ),
+        );
+        let body = reply_json(&reply);
+        assert_eq!(body["success"], true, "{body}");
+        let cred = str_of(&body["obj"], "credential");
+        assert!(cred.starts_with("nwk_"));
+
+        let ok_reply = handle_agent(
+            &ctx,
+            &agent_req(
+                "/agent/v1/hello",
+                json!({ "hostname": "h" }),
+                &format!("Bearer {cred}"),
+            ),
+        );
+        assert_eq!(ok_reply.status, 200);
+        assert_eq!(reply_json(&ok_reply)["success"], true);
+
+        // credential in the query string or body is not accepted any more
+        let mut req = agent_req("/agent/v1/hello", json!({ "credential": cred }), "");
+        req.query.insert("credential".into(), cred.clone());
+        let denied = handle_agent(&ctx, &req);
+        assert_eq!(denied.status, 401);
+        assert_eq!(reply_json(&denied)["msg"], "unauthorizedAgent");
+    }
+
+    #[test]
+    fn hello_reports_flush_failure_only_when_it_writes() {
+        let ctx = agent_ctx();
+        let (_, token) = joined(&ctx);
+        let body = reply_json(&handle_agent(
+            &ctx,
+            &agent_req(
+                "/agent/v1/join",
+                json!({ "token": token, "hostname": "h", "os": "linux", "version": "1" }),
+                "",
+            ),
+        ));
+        let auth = format!("Bearer {}", str_of(&body["obj"], "credential"));
+        break_sqlite(&ctx);
+        // unchanged metadata: nothing to write, still fine
+        let same = handle_agent(
+            &ctx,
+            &agent_req(
+                "/agent/v1/hello",
+                json!({ "hostname": "h", "os": "linux", "version": "1" }),
+                &auth,
+            ),
+        );
+        assert_eq!(reply_json(&same)["success"], true);
+        let changed = handle_agent(
+            &ctx,
+            &agent_req("/agent/v1/hello", json!({ "hostname": "other" }), &auth),
+        );
+        assert_eq!(reply_json(&changed)["msg"], "saveFailed");
+    }
+
+    #[test]
+    fn timed_out_polls_do_not_leave_waiters() {
+        let hub = Hub::new();
+        for _ in 0..5 {
+            assert!(hub.wait_job("n1", Duration::from_millis(5)).is_none());
+        }
+        assert_eq!(hub.waiter_count(), 0);
+    }
+
+    #[test]
+    fn newer_poll_supersedes_older_one() {
+        let hub = Hub::new();
+        let first = {
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.poll("n1", Duration::from_secs(5)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        let second = {
+            let hub = hub.clone();
+            std::thread::spawn(move || hub.poll("n1", Duration::from_secs(5)))
+        };
+        assert!(matches!(first.join().unwrap(), Polled::Superseded));
+        std::thread::sleep(Duration::from_millis(20));
+        let dispatcher = {
+            let hub = hub.clone();
+            std::thread::spawn(move || {
+                hub.dispatch("n1", "ping", json!({}), Duration::from_secs(2))
+            })
+        };
+        match second.join().unwrap() {
+            Polled::Job(job) => {
+                assert_eq!(job.method, "ping");
+                hub.complete(&job.id, Ok(json!({ "pong": true })));
+            }
+            other => panic!("expected job, got {other:?}"),
+        }
+        assert_eq!(dispatcher.join().unwrap().unwrap()["pong"], true);
+        assert_eq!(hub.waiter_count(), 0);
+    }
+
+    #[test]
+    fn two_instances_with_one_credential_are_flagged() {
+        let hub = Hub::new();
+        hub.note_instance("n1", "a");
+        hub.note_instance("n1", "a");
+        assert!(!hub.has_conflict("n1"));
+        hub.note_instance("n1", "b");
+        assert!(hub.has_conflict("n1"));
+    }
+
+    #[test]
+    fn install_script_has_no_insecure_flag_and_warns_on_http() {
+        let mut req = Req::default();
+        req.panel_base = "https://panel.example".into();
+        let reply = install_script(&req);
+        let text = String::from_utf8(reply.body).unwrap();
+        assert!(text.contains("PANEL=\"https://panel.example\""));
+        assert!(text.contains("--foreground"));
+        assert!(text.contains("nginxwebui-agent.service"));
+        assert!(text.contains("NGINXWEBUI_ALLOW_HTTP"));
+        assert!(!text.contains("INSECURE="));
+        // a hostile Host header cannot inject shell
+        req.panel_base = "https://x\"; rm -rf /; \"".into();
+        let text = String::from_utf8(install_script(&req).body).unwrap();
+        assert!(text.contains("PANEL=\"https://panel.example\""));
+    }
 
     #[test]
     fn join_token_is_one_time_and_can_expire() {
