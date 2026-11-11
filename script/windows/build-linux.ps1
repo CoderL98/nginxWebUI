@@ -95,4 +95,10 @@ New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $dest = Join-Path $outDir 'nginxwebui'
 Copy-Item -Force $built $dest
 Write-Host "Linux 产物: $dest"
-Write-Host "拷到服务器后: chmod 755 nginxwebui && ./nginxwebui"
+$builtAgent = Join-Path $Server "target\$Target\release\nginxwebui-agent"
+if (Test-Path $builtAgent) {
+    $destAgent = Join-Path $outDir 'nginxwebui-agent'
+    Copy-Item -Force $builtAgent $destAgent
+    Write-Host "agent 产物: $destAgent（与 nginxwebui 放在同一目录，设备页一键安装才能下载）"
+}
+Write-Host "拷到服务器后: chmod 755 nginxwebui nginxwebui-agent && ./nginxwebui"

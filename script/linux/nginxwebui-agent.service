@@ -1,0 +1,31 @@
+# Example systemd unit for nginxwebui-agent (the panel's /agent/install.sh
+# writes an equivalent one automatically when run as root).
+#
+#   install -m 755 nginxwebui-agent /usr/local/bin/
+#   install -d -m 700 /var/lib/nginxwebui-agent
+#   NGINXWEBUI_AGENT_HOME=/var/lib/nginxwebui-agent \
+#     nginxwebui-agent join --url https://panel.example --token nwj_...
+#   cp nginxwebui-agent.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now nginxwebui-agent
+#
+# User=root lets the agent write /etc/nginx and reload nginx directly. To run
+# it unprivileged, create a user, chown the home directory to it, set User=,
+# and grant nginxwebui-priv via script/linux/setup-sudo.sh.
+[Unit]
+Description=nginxWebUI agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=NGINXWEBUI_AGENT_HOME=/var/lib/nginxwebui-agent
+# Optional instead of the credential stored in agent.json:
+# Environment=NGINXWEBUI_AGENT_CREDENTIAL=nwk_...
+ExecStart=/usr/local/bin/nginxwebui-agent run --home /var/lib/nginxwebui-agent
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

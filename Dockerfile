@@ -11,7 +11,7 @@ RUN pnpm run build
 FROM rust:1-bookworm AS server
 WORKDIR /src/server
 COPY server/ ./
-RUN cargo build --release
+RUN cargo build --release --bin nginxwebui --bin nginxwebui-agent
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -26,10 +26,12 @@ RUN apt-get update \
     && ln -sf /root/.acme.sh/acme.sh /usr/local/bin/acme.sh
 
 COPY --from=server /src/server/target/release/nginxwebui /opt/nginxwebui/nginxwebui
+# served to remote devices at /agent/download (same OS/arch as this image)
+COPY --from=server /src/server/target/release/nginxwebui-agent /opt/nginxwebui/nginxwebui-agent
 COPY --from=web /src/web/build /opt/nginxwebui/web
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/nginxwebui.conf /opt/nginxwebui/nginxwebui.conf
-RUN chmod 755 /opt/nginxwebui/nginxwebui /entrypoint.sh \
+RUN chmod 755 /opt/nginxwebui/nginxwebui /opt/nginxwebui/nginxwebui-agent /entrypoint.sh \
     && mkdir -p /home/nginxWebUI /etc/nginx/ssl /var/www
 
 ENV NGINXWEBUI_PORT=8080 \
