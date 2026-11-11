@@ -582,7 +582,7 @@ fn infer_nginx_priv(program: &str, args: &[String]) -> Option<NginxPriv> {
             tokens.push(a);
         }
     }
-    let has = |n: &str| tokens.iter().any(|t| *t == n);
+    let has = |n: &str| tokens.contains(&n);
     if has("-t") {
         return Some(NginxPriv::Test);
     }
@@ -724,7 +724,7 @@ pub fn write_password_file(
         let salt = crate::auth::random_token(8);
         format!("{}:{}", user, apr1(pass, &salt))
     };
-    crate::privfs::write(path, value).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    crate::privfs::write(path, value).map_err(std::io::Error::other)
 }
 
 #[cfg(test)]

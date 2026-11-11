@@ -280,13 +280,7 @@ pub fn int_of(v: &Value, key: &str) -> i64 {
     match v.get(key) {
         Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
         Some(Value::String(s)) => s.trim().parse().unwrap_or(0),
-        Some(Value::Bool(b)) => {
-            if *b {
-                1
-            } else {
-                0
-            }
-        }
+        Some(Value::Bool(b)) if *b => 1,
         _ => 0,
     }
 }

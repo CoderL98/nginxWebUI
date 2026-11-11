@@ -45,7 +45,7 @@ pub fn nginx_present(db: &Db) -> bool {
 
 pub fn acme_present(db: &Db) -> bool {
     let path = acme::resolve_bin(db);
-    path.as_os_str().len() > 0 && path.is_file()
+    !path.as_os_str().is_empty() && path.is_file()
 }
 
 pub fn status(db: &Db) -> Value {
@@ -298,7 +298,7 @@ fn maybe_sudo_env(program: &str, args: &[&str], env: &[(&str, &str)]) -> (bool, 
 fn running_as_root() -> bool {
     #[cfg(unix)]
     {
-        return unsafe { libc_geteuid() == 0 };
+        libc_geteuid() == 0
     }
     #[cfg(not(unix))]
     {

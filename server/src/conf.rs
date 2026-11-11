@@ -102,8 +102,7 @@ pub fn safe_name(raw: &str) -> String {
                 )
         })
         .collect::<String>()
-        .replace(':', "-")
-        .replace('/', "-")
+        .replace([':', '/'], "-")
 }
 
 fn get_or(value: &Value, key: &str, fallback: &str) -> String {
@@ -197,7 +196,7 @@ fn upstream_block(db: &Db, upstream: &Value) -> Block {
         .filter(|n| str_of(n, "upstreamId") == id)
         .cloned()
         .collect();
-    nodes.sort_by(|a, b| str_of(a, "id").cmp(&str_of(b, "id")));
+    nodes.sort_by_key(|a| str_of(a, "id"));
 
     for node in nodes {
         if !bool_of(&node, "enable", true) {
@@ -341,7 +340,7 @@ fn server_http_block(db: &Db, server: &Value) -> Block {
         .filter(|l| str_of(l, "serverId") == server_id)
         .cloned()
         .collect();
-    locations.sort_by(|a, b| str_of(a, "id").cmp(&str_of(b, "id")));
+    locations.sort_by_key(|a| str_of(a, "id"));
     for location in locations {
         if int_of(&location, "enable") == 0 {
             continue;

@@ -1077,7 +1077,7 @@ fn conf(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                     let mut store = ctx.store.lock().unwrap();
                     record_operate(&mut store, &who, "conf.replace", "", false, &err);
                     let _ = persist(&store);
-                    return fail(&err);
+                    fail(&err)
                 }
                 Ok((temp, _)) => {
                     let mut store = ctx.store.lock().unwrap();
@@ -1476,7 +1476,7 @@ fn export(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let mut store = ctx.store.lock().unwrap();
             if let Value::Object(map) = body {
                 for (name, rows) in map {
-                    if name == "admin" || store.db.t.get(&name).is_none() {
+                    if name == "admin" || !store.db.t.contains_key(&name) {
                         continue;
                     }
                     if let Value::Array(rows) = rows {
@@ -2612,7 +2612,7 @@ fn www(ctx: &Ctx, action: &str, req: &Req) -> Reply {
                 let zip = body
                     .get("zipBase64")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| decode_base64(s))
+                    .and_then(decode_base64)
                     .unwrap_or_default();
                 (body, zip)
             };
@@ -2849,7 +2849,7 @@ mod tests {
 
     #[test]
     fn persist_maps_flush_errors() {
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "disk full");
+        let err = std::io::Error::other("disk full");
         let reply = persist_result(Err(err)).expect_err("flush error must become API fail");
         let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["success"], false);

@@ -236,7 +236,7 @@ pub fn parse_multipart(body: &[u8], content_type: &str) -> Result<(Value, Vec<u8
                 fields.insert("filename".into(), header_filename(&header).into());
             } else if !name.is_empty() {
                 fields.insert(
-                    name.into(),
+                    name,
                     String::from_utf8_lossy(content)
                         .trim_end_matches(['\r', '\n'])
                         .into(),

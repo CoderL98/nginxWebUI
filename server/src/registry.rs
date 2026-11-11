@@ -272,6 +272,12 @@ impl Hub {
     }
 }
 
+impl Default for Hub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn recv_result(
     rx: Receiver<Result<Value, String>>,
     timeout: Duration,
@@ -334,9 +340,9 @@ impl AgentPool {
         Arc::new(Self { tx })
     }
 
-    pub fn submit(&self, task: PollTask) -> Result<(), PollTask> {
+    pub fn submit(&self, task: PollTask) -> Result<(), Box<PollTask>> {
         self.tx.try_send(task).map_err(|err| match err {
-            TrySendError::Full(task) | TrySendError::Disconnected(task) => task,
+            TrySendError::Full(task) | TrySendError::Disconnected(task) => Box::new(task),
         })
     }
 }
@@ -367,9 +373,8 @@ pub fn new_secret(prefix: &str) -> String {
 pub fn public_node(row: &Value, hub: &Hub) -> Value {
     let id = str_of(row, "id");
     let revoked = str_of(row, "revoked") == "true" || bool_flag(row, "revoked");
-    let pending = str_of(row, "joinTokenHash").is_empty() == false
-        && str_of(row, "credHash").is_empty()
-        && !revoked;
+    let pending =
+        !str_of(row, "joinTokenHash").is_empty() && str_of(row, "credHash").is_empty() && !revoked;
     let online = !revoked && hub.is_online(&id);
     let status = if revoked {
         "revoked"
@@ -536,7 +541,7 @@ pub fn join_with_token(db: &mut Db, token: &str, meta: &Value) -> Result<(Value,
     Ok((saved, cred))
 }
 
-pub fn node_by_credential<'a>(db: &'a Db, credential: &str) -> Option<Value> {
+pub fn node_by_credential(db: &Db, credential: &str) -> Option<Value> {
     if credential.is_empty() {
         return None;
     }
@@ -753,10 +758,16 @@ pub fn proxy(ctx: &Ctx, req: &Req, node_id: &str, method: &str, params: Value) -
     match ctx.hub.dispatch(node_id, method, params, RPC_WAIT) {
         Ok(value) => {
             let value = crate::rpc::normalize_result(method, value);
+            // check/reload report the nginx result in obj.success
             let good = value
                 .get("success")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && value
+                    .get("obj")
+                    .and_then(|o| o.get("success"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
             record(
                 good,
                 if good {
@@ -1015,8 +1026,10 @@ mod tests {
 
     #[test]
     fn install_script_has_no_insecure_flag_and_warns_on_http() {
-        let mut req = Req::default();
-        req.panel_base = "https://panel.example".into();
+        let mut req = Req {
+            panel_base: "https://panel.example".into(),
+            ..Req::default()
+        };
         let reply = install_script(&req);
         let text = String::from_utf8(reply.body).unwrap();
         assert!(text.contains("PANEL=\"https://panel.example\""));

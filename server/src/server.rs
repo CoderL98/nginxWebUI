@@ -751,10 +751,9 @@ pub fn run() {
     for _ in 0..options.threads {
         let server = server.clone();
         let app = app.clone();
-        handles.push(std::thread::spawn(move || loop {
-            match server.recv() {
-                Ok(request) => handle_request(&app, request),
-                Err(_) => break,
+        handles.push(std::thread::spawn(move || {
+            while let Ok(request) = server.recv() {
+                handle_request(&app, request);
             }
         }));
     }

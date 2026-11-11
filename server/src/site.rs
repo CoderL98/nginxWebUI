@@ -467,7 +467,7 @@ pub fn list_ssl_files(db: &Db) -> Vec<Value> {
             }
         }
     }
-    out.sort_by(|a, b| str_of(a, "name").cmp(&str_of(b, "name")));
+    out.sort_by_key(|a| str_of(a, "name"));
     out
 }
 
@@ -673,7 +673,7 @@ pub fn locations_of(db: &Db, site: &Value) -> Vec<Value> {
     }
 }
 
-fn primary_static<'a>(locations: &'a [Value]) -> Option<&'a Value> {
+fn primary_static(locations: &[Value]) -> Option<&Value> {
     if locations.len() == 1 {
         let loc = &locations[0];
         if loc_type(loc) == "static" && loc_path(loc) == "/" {
@@ -735,7 +735,7 @@ fn emit_upstream_block(db: &Db, out: &mut String, uniq: &str, name: &str) -> boo
     if nodes.is_empty() {
         return false;
     }
-    nodes.sort_by(|a, b| str_of(a, "id").cmp(&str_of(b, "id")));
+    nodes.sort_by_key(|a| str_of(a, "id"));
     out.push_str(&format!("upstream {uniq} {{\n"));
     for node in nodes {
         let host = str_of(&node, "server");
@@ -795,7 +795,7 @@ fn safe_resolver(raw: &str) -> String {
 }
 
 fn parse_allow(raw: &str) -> Vec<String> {
-    raw.split(|c: char| c == ',' || c == '\n' || c == ';')
+    raw.split([',', '\n', ';'])
         .map(|s| s.trim().to_string())
         .filter(|s| {
             !s.is_empty()

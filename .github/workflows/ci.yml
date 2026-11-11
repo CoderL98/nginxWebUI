@@ -20,7 +20,7 @@ jobs:
       - name: Test
         run: cargo test
       - name: Clippy
-        run: cargo clippy --all-targets -- -A warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   web:
     runs-on: ubuntu-latest

@@ -6,7 +6,7 @@ pub const SECRET_SETTING_KEYS: &[&str] = &["CF_Token", "CF_Account_ID", "GCORE_K
 pub const SECRET_CERT_KEYS: &[&str] = &["cfToken", "cfAccountId", "gcoreKey", "GCORE_Key"];
 
 pub fn is_secret_setting(key: &str) -> bool {
-    SECRET_SETTING_KEYS.iter().any(|k| *k == key)
+    SECRET_SETTING_KEYS.contains(&key)
 }
 
 pub fn is_placeholder_secret(value: &str) -> bool {

@@ -731,7 +731,7 @@ mod tests {
 
     #[test]
     fn job_refuses_a_second_start() {
-        let _ = job_finish(true, "");
+        job_finish(true, "");
         try_begin("apply", "cert-1").expect("first job starts");
         let busy = try_begin("renew", "cert-2").expect_err("second job is rejected");
         assert!(busy.running);

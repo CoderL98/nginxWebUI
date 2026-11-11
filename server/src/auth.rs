@@ -84,6 +84,7 @@ pub struct Session {
     pub admin_name: String,
     pub code: String,
     pub expires: u64,
+    #[allow(dead_code)]
     created: u64,
     seq: u64,
 }
