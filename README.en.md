@@ -2,7 +2,7 @@
 
 A small Rust process (no JVM, no separate database server) that hosts a SvelteKit static UI and talks to the machine’s `nginx` and `acme.sh`. Site files go to Debian-style `sites-available` / `sites-enabled`; certificates land in `/etc/nginx/ssl`.
 
-This is a simplified rewrite of the original Java/Solon nginxWebUI. See [DIFF.md](DIFF.md) for what was intentionally left out (remote cluster, SSO, mail alerts, extra DNS plugins).
+This is a simplified rewrite of the original Java/Solon nginxWebUI. See [DIFF.md](DIFF.md) for what was intentionally left out (SSO, mail alerts, extra DNS plugins). Multi-machine management uses an outbound-agent registry ([docs/remote-registry.md](docs/remote-registry.md)); agents need no inbound ports.
 
 ## Run
 

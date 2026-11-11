@@ -21,8 +21,13 @@ SvelteKit 静态前端 + Rust 后端 + SQLite。图形界面只改配置并调�
 | 日志尾部 | 有 |
 | SQLite | 有（进程内 rusqlite，无独立数据库服务） |
 | HTTP / 基础参数 / 上游 / stream | 保留在 advanced，不再生成整份 nginx.conf |
-| 远程集群 / SSO / 邮件告警 | 无 |
+| 多机管理 | 有（出站 agent 注册中心，见 [docs/remote-registry.md](docs/remote-registry.md)） |
+| SSO / 邮件告警 | 无 |
 | MySQL / PostgreSQL | 无（仅 SQLite） |
+
+## 多机（注册中心）
+
+面板可作为注册中心，被控端运行出站 `nginxwebui-agent`，无需开放入站端口。本机仍是默认节点。说明见 [docs/remote-registry.md](docs/remote-registry.md)。多机模式下面板需要能被 agent 访问（建议 HTTPS 反代）。
 
 ## 目录
 

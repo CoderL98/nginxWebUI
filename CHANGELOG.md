@@ -11,6 +11,10 @@
 - Login and captcha are rate-limited; secret settings are masked; `conf/replace` refuses a foreign main config.
 - `reloadCmd` is an allow-list; `runCmd` accepts only enumerated actions.
 
+### Added
+
+- Outbound-agent registry: remote nodes dial the panel with HTTP long polling. No inbound ports on agents. See `docs/remote-registry.md`.
+
 ### Changed
 
 - SQLite persistence uses row-level upsert on the existing `records` table and reuses the connection.
