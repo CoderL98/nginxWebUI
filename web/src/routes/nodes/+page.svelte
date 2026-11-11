@@ -19,6 +19,12 @@
   let renaming = $state('');
   let renameValue = $state('');
   let timer = null;
+  let syncSource = $state('local');
+  let syncSites = $state([]);
+  let selectedSites = $state({});
+  let selectedTargets = $state({});
+  let syncPreview = $state(null);
+  let syncResults = $state(null);
 
   function statusLabel(status) {
     if (status === 'online') return $tt('nodeOnline');
@@ -84,6 +90,7 @@
   onMount(() => {
     load();
     loadConfig();
+    loadSyncSites();
     // keep online/offline current without a manual refresh
     timer = setInterval(load, 10000);
   });
@@ -136,7 +143,12 @@
     try {
       const r = await api.node.token(row.id, panelUrl.trim());
       if (r.success) {
-        issued = { ...row, ...(r.obj || {}), rotated: row.joined };
+        issued = {
+          ...row,
+          ...(r.obj || {}),
+          rotated: row.joined && row.status !== 'revoked',
+          rejoined: row.status === 'revoked'
+        };
       } else {
         error = msg(r);
       }
@@ -188,6 +200,89 @@
       if (!r.success) error = msg(r);
       if (issued && issued.id === row.id) issued = null;
       await load();
+    } catch {
+      error = $tt('failed');
+    }
+    busy = false;
+  }
+
+
+  function syncableTargets() {
+    return rows.filter((r) => r.kind !== 'local' ? r.status === 'online' && r.id !== syncSource : syncSource !== 'local' && r.id === 'local');
+  }
+
+  async function loadSyncSites() {
+    syncPreview = null;
+    syncResults = null;
+    try {
+      const r = await api.node.syncList(syncSource);
+      if (r.success === false) {
+        error = msg(r);
+        syncSites = [];
+        return;
+      }
+      syncSites = (r.obj || {}).sites || [];
+      selectedSites = {};
+    } catch {
+      error = $tt('failed');
+    }
+  }
+
+  function pickedSiteIds() {
+    return Object.keys(selectedSites).filter((id) => selectedSites[id]);
+  }
+
+  function pickedTargets() {
+    return Object.keys(selectedTargets).filter((id) => selectedTargets[id]);
+  }
+
+  async function doPreview() {
+    error = '';
+    note = '';
+    syncResults = null;
+    const siteIds = pickedSiteIds();
+    if (!siteIds.length) {
+      error = $tt('siteRequired');
+      return;
+    }
+    busy = true;
+    try {
+      const r = await api.node.syncPreview({ source: syncSource, siteIds });
+      if (r.success) {
+        syncPreview = r.obj || {};
+      } else {
+        error = msg(r);
+      }
+    } catch {
+      error = $tt('failed');
+    }
+    busy = false;
+  }
+
+  async function doSync() {
+    error = '';
+    note = '';
+    const siteIds = pickedSiteIds();
+    const targets = pickedTargets();
+    if (!siteIds.length) {
+      error = $tt('siteRequired');
+      return;
+    }
+    if (!targets.length) {
+      error = $tt('targetRequired');
+      return;
+    }
+    if (!confirm($tt('confirmSync'))) return;
+    busy = true;
+    try {
+      const r = await api.node.sync({ source: syncSource, siteIds, targets });
+      if (r.success) {
+        syncResults = (r.obj || {}).results || [];
+        syncPreview = (r.obj || {}).preview || syncPreview;
+        note = $tt('syncCopied');
+      } else {
+        error = msg(r);
+      }
     } catch {
       error = $tt('failed');
     }
@@ -254,7 +349,9 @@
         <p class="text-destructive text-xs" role="alert">{$tt(urlWarning())}</p>
       {/if}
       <p class="text-muted-foreground text-xs">{$tt('installModeHint')}</p>
-      {#if issued.rotated}
+      {#if issued.rejoined}
+        <p class="text-muted-foreground text-xs">{$tt('rejoinHint')}</p>
+      {:else if issued.rotated}
         <p class="text-muted-foreground text-xs">{$tt('tokenRotateHint')}</p>
       {/if}
     </Card.Content>
@@ -263,6 +360,77 @@
     </Card.Footer>
   </Card.Root>
 {/if}
+
+<Card.Root class="mb-4">
+  <Card.Header>
+    <Card.Title>{$tt('syncSites')}</Card.Title>
+    <Card.Description>{$tt('syncHint')} {$tt('syncNoFailover')}</Card.Description>
+  </Card.Header>
+  <Card.Content class="grid gap-3">
+    <div class="grid gap-1.5 sm:max-w-sm">
+      <Label for="sync-source">{$tt('syncSource')}</Label>
+      <select id="sync-source" class="border-input bg-background h-9 rounded-md border px-2 text-sm" bind:value={syncSource} onchange={loadSyncSites}>
+        {#each rows as row}
+          <option value={row.id}>{row.kind === 'local' ? $tt('currentNode') + ' (local)' : row.name}</option>
+        {/each}
+      </select>
+    </div>
+    <fieldset class="grid gap-1.5">
+      <legend class="text-sm font-medium">{$tt('site')}</legend>
+      {#if syncSites.length}
+        <div class="grid gap-1">
+          {#each syncSites as site}
+            <label class="flex items-center gap-2 text-sm">
+              <input type="checkbox" bind:checked={selectedSites[site.id]} />
+              <span>{site.domain || site.id}{site.certName ? ` · ${site.certName}` : ''}</span>
+            </label>
+          {/each}
+        </div>
+      {:else}
+        <p class="text-muted-foreground text-xs">{$tt('empty')}</p>
+      {/if}
+    </fieldset>
+    <fieldset class="grid gap-1.5">
+      <legend class="text-sm font-medium">{$tt('syncTargets')}</legend>
+      {#if syncableTargets().length}
+        <div class="grid gap-1">
+          {#each syncableTargets() as row}
+            <label class="flex items-center gap-2 text-sm">
+              <input type="checkbox" bind:checked={selectedTargets[row.id]} />
+              <span>{row.kind === 'local' ? $tt('currentNode') : row.name}</span>
+            </label>
+          {/each}
+        </div>
+      {:else}
+        <p class="text-muted-foreground text-xs">{$tt('noOnlineTarget')}</p>
+      {/if}
+    </fieldset>
+    {#if syncPreview}
+      <div class="bg-muted rounded-md p-3 text-xs">
+        <p>{$tt('syncPreviewBtn')}: {(syncPreview.sites || []).map((s) => s.domain).join(', ') || '-'}</p>
+        {#if syncPreview.dnsCreds && syncPreview.dnsCreds.willCopy}
+          <p>{$tt('willCopyDns')}</p>
+        {/if}
+        {#each syncPreview.warnings || [] as w}
+          <p class="text-destructive">{$tt(w) !== w ? $tt(w) : w}</p>
+        {/each}
+      </div>
+    {/if}
+    {#if syncResults}
+      <ul class="grid gap-1 text-sm">
+        {#each syncResults as r}
+          <li class={r.success ? '' : 'text-destructive'}>
+            {r.target}: {r.success ? $tt('syncCopied') + (r.sites != null ? ` (${r.sites})` : '') : (r.msg && $tt(r.msg) !== r.msg ? $tt(r.msg) : r.msg || $tt('failed'))}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </Card.Content>
+  <Card.Footer class="flex flex-wrap gap-2">
+    <Button variant="outline" onclick={doPreview} disabled={busy}>{$tt('syncPreviewBtn')}</Button>
+    <Button onclick={doSync} disabled={busy}>{$tt('syncRun')}</Button>
+  </Card.Footer>
+</Card.Root>
 
 <div class="overflow-x-auto rounded-md border">
   <table class="w-full text-sm">
@@ -302,7 +470,9 @@
             {#if row.kind !== 'local'}
               <div class="flex flex-wrap justify-end gap-2">
                 <Button variant="outline" size="sm" disabled={busy} aria-label={`${$tt('renameNode')} ${row.name}`} onclick={() => startRename(row)}>{$tt('renameNode')}</Button>
-                {#if row.status !== 'revoked'}
+                {#if row.status === 'revoked'}
+                  <Button variant="outline" size="sm" disabled={busy} aria-label={`${$tt('rejoinNode')} ${row.name}`} onclick={() => token(row)}>{$tt('rejoinNode')}</Button>
+                {:else}
                   <Button variant="outline" size="sm" disabled={busy} aria-label={`${$tt('newToken')} ${row.name}`} onclick={() => token(row)}>{$tt('newToken')}</Button>
                   <Button variant="outline" size="sm" disabled={busy} aria-label={`${$tt('revokeNode')} ${row.name}`} onclick={() => revoke(row)}>{$tt('revokeNode')}</Button>
                 {/if}

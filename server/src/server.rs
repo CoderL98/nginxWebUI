@@ -25,6 +25,8 @@ struct Options {
     config_path: Option<PathBuf>,
     trusted_proxies: Vec<crate::net::IpNet>,
     agent_threads: usize,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
 }
 
 const DEFAULT_AGENT_THREADS: usize = 32;
@@ -80,6 +82,8 @@ fn parse_args() -> Options {
         println!(
             "  --trusted-proxies=L  受信反代地址/网段（逗号分隔），仅这些来源的 X-Forwarded-* 生效"
         );
+        println!("  --tls-cert=FILE      面板 HTTPS 证书（PEM）；与 --tls-key 同时设置");
+        println!("  --tls-key=FILE       面板 HTTPS 私钥（PEM）");
         println!();
         println!("优先顺序：命令行 > 环境变量 > 配置文件 > 默认值");
         std::process::exit(0);
@@ -96,6 +100,8 @@ fn parse_args() -> Options {
         config_path: None,
         trusted_proxies: Vec::new(),
         agent_threads: DEFAULT_AGENT_THREADS,
+        tls_cert: None,
+        tls_key: None,
     };
 
     let cli_config = crate::config::cli_config_path(&args);
@@ -128,6 +134,12 @@ fn parse_args() -> Options {
                 }
                 if let Some(n) = file.agent_threads {
                     options.agent_threads = n.clamp(1, 1024);
+                }
+                if file.tls_cert.is_some() {
+                    options.tls_cert = file.tls_cert;
+                }
+                if file.tls_key.is_some() {
+                    options.tls_key = file.tls_key;
                 }
                 options.config_path = Some(path);
             }
@@ -184,6 +196,12 @@ fn parse_args() -> Options {
         .and_then(|s| s.trim().parse::<usize>().ok())
     {
         options.agent_threads = n.clamp(1, 1024);
+    }
+    if let Some(path) = env_path("NGINXWEBUI_TLS_CERT") {
+        options.tls_cert = Some(path);
+    }
+    if let Some(path) = env_path("NGINXWEBUI_TLS_KEY") {
+        options.tls_key = Some(path);
     }
 
     let mut index = 0;
@@ -247,6 +265,20 @@ fn parse_args() -> Options {
                         .parse()
                         .unwrap_or(DEFAULT_AGENT_THREADS)
                         .clamp(1, 1024);
+                }
+            }
+            "--tls-cert" => {
+                if let Some(value) = take(inline) {
+                    if !value.trim().is_empty() {
+                        options.tls_cert = Some(PathBuf::from(value.trim()));
+                    }
+                }
+            }
+            "--tls-key" => {
+                if let Some(value) = take(inline) {
+                    if !value.trim().is_empty() {
+                        options.tls_key = Some(PathBuf::from(value.trim()));
+                    }
                 }
             }
             "--threads" => {
@@ -653,8 +685,48 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn load_ssl_config(options: &Options) -> Option<tiny_http::SslConfig> {
+    match (&options.tls_cert, &options.tls_key) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!("tls_cert and tls_key must be set together (config, NGINXWEBUI_TLS_CERT / NGINXWEBUI_TLS_KEY, or --tls-cert / --tls-key)");
+            std::process::exit(1);
+        }
+        (Some(cert), Some(key)) => {
+            let certificate = std::fs::read(cert).unwrap_or_else(|err| {
+                eprintln!("cannot read tls_cert {}: {err}", cert.display());
+                std::process::exit(1);
+            });
+            let private_key = std::fs::read(key).unwrap_or_else(|err| {
+                eprintln!("cannot read tls_key {}: {err}", key.display());
+                std::process::exit(1);
+            });
+            if certificate.is_empty() || private_key.is_empty() {
+                eprintln!("tls_cert / tls_key files are empty");
+                std::process::exit(1);
+            }
+            Some(tiny_http::SslConfig {
+                certificate,
+                private_key,
+            })
+        }
+    }
+}
+
+fn bind_listener(
+    address: &str,
+    tls: Option<tiny_http::SslConfig>,
+) -> Result<tiny_http::Server, String> {
+    let result = if let Some(config) = tls {
+        tiny_http::Server::https(address, config)
+    } else {
+        tiny_http::Server::http(address)
+    };
+    result.map_err(|err| err.to_string())
+}
+
 pub fn run() {
-    let options = parse_args();
+    let mut options = parse_args();
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -692,9 +764,20 @@ pub fn run() {
     }
     println!("  home      : {}", home.display());
     println!("  web pages : {}", web_dir.display());
-    println!("  address   : http://{}:{}", options.bind, options.port);
+    let tls = load_ssl_config(&options);
+    if tls.is_some() {
+        options.secure_cookie = true;
+    }
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    println!("  address   : {scheme}://{}:{}", options.bind, options.port);
     if options.bind == "0.0.0.0" || options.bind == "::" {
-        println!("  warning   : listening on all interfaces; do not expose this port on the public internet without HTTPS");
+        if tls.is_some() {
+            println!(
+                "  warning   : listening on all interfaces with built-in TLS; a reverse proxy is still the usual production choice"
+            );
+        } else {
+            println!("  warning   : listening on all interfaces; do not expose this port on the public internet without HTTPS");
+        }
     }
     println!("  sqlite    : {}", store.db_path.display());
     println!(
@@ -738,11 +821,11 @@ pub fn run() {
     crate::api::spawn_acme_cron(app.clone());
 
     let address = format!("{}:{}", options.bind, options.port);
-    let server = match tiny_http::Server::http(&address) {
+    let server = match bind_listener(&address, tls) {
         Ok(server) => Arc::new(server),
         Err(err) => {
             crate::applog::error(format!("cannot listen on {address}: {err}"));
-            eprintln!("cannot listen on {}: {}", address, err);
+            eprintln!("cannot listen on {address}: {err}");
             std::process::exit(1);
         }
     };

@@ -33,7 +33,7 @@
     { href: '/nodes', key: 'nodes', scope: 'panel' },
     { href: '/deny-allow', key: 'denyAllow', scope: 'local' },
     { href: '/bak', key: 'bak', scope: 'panel' },
-    { href: '/about', key: 'settings', scope: 'panel' }
+    { href: '/about', key: 'settings', scope: 'node' }
   ];
   const advanced = [
     { href: '/upstream', key: 'upstream', scope: 'local' },

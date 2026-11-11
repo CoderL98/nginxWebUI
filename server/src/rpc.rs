@@ -9,7 +9,8 @@
 //!
 //! Anything not in [`ROUTES`] is rejected on both sides. Panel-only areas
 //! (settings, admins, backups, export, www uploads, upstream/stream, htpasswd,
-//! installers, raw `conf/write|replace`, `runCmd`) are deliberately absent.
+//! raw `conf/write|replace`, `runCmd`) are deliberately absent. nginx/acme.sh
+//! install is allowlisted (same confirm / autoInstall-off defaults as the panel).
 
 use crate::api::{Ctx, Req};
 use crate::store::str_of;
@@ -72,6 +73,9 @@ pub const ROUTES: &[Route] = &[
     r("cert.dns", "cert", "dns", "GET", false),
     r("cert.dnsSave", "cert", "dnsSave", "POST", true),
     r("install.status", "install", "status", "GET", false),
+    r("install.nginx", "install", "nginx", "POST", true),
+    r("install.acme", "install", "acme", "POST", true),
+    r("install.auto", "install", "auto", "POST", true),
 ];
 
 /// Older method names (agent ≤ 1.0 / panel ≤ 1.0) accepted by the agent.
@@ -260,6 +264,27 @@ mod tests {
     }
 
     #[test]
+    fn install_actions_are_mapped() {
+        let req = admin_req("install", "nginx", &[], json!({}));
+        let (method, _) = map_admin("install", "nginx", &req).unwrap();
+        assert_eq!(method, "install.nginx");
+        let (method, _) = map_admin("install", "acme", &req).unwrap();
+        assert_eq!(method, "install.acme");
+        let (method, _) = map_admin("install", "status", &req).unwrap();
+        assert_eq!(method, "install.status");
+        let (method, params) = map_admin(
+            "install",
+            "auto",
+            &admin_req("install", "auto", &[], json!({ "enable": false })),
+        )
+        .unwrap();
+        assert_eq!(method, "install.auto");
+        assert_eq!(params["body"]["enable"], false);
+        assert!(is_mutating("install.nginx"));
+        assert!(!is_mutating("install.status"));
+    }
+
+    #[test]
     fn panel_only_areas_are_not_mapped() {
         let req = admin_req("x", "y", &[], json!({}));
         for (kind, action) in [
@@ -269,8 +294,6 @@ mod tests {
             ("conf", "saveCmd"),
             ("www", "upload"),
             ("upstream", "save"),
-            ("install", "nginx"),
-            ("install", "acme"),
             ("password", "save"),
         ] {
             assert!(map_admin(kind, action, &req).is_none(), "{kind}/{action}");

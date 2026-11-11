@@ -19,7 +19,10 @@ pub mod seed;
 mod server;
 pub mod site;
 pub mod store;
+pub mod sync;
 pub mod sysinfo;
+pub mod tls;
+pub mod upgrade;
 pub mod www;
 
 use std::sync::OnceLock;

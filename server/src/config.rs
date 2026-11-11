@@ -16,6 +16,8 @@ pub struct FileValues {
     pub secure_cookie: Option<bool>,
     pub trusted_proxies: Option<String>,
     pub agent_threads: Option<usize>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
     pub bin: Option<PathBuf>,
     pub log: Option<PathBuf>,
     pub pid: Option<PathBuf>,
@@ -90,6 +92,12 @@ pub fn parse(text: &str, base: &Path) -> Result<FileValues, String> {
                         .parse()
                         .map_err(|_| format!("line {}: invalid agent_threads", index + 1))?,
                 );
+            }
+            "tls_cert" | "tls.cert" | "ssl_cert" => {
+                values.tls_cert = Some(resolve(base, &value));
+            }
+            "tls_key" | "tls.key" | "ssl_key" => {
+                values.tls_key = Some(resolve(base, &value));
             }
             "bin" => values.bin = Some(resolve(base, &value)),
             "log" => values.log = Some(resolve(base, &value)),
@@ -235,6 +243,23 @@ reload_cmd = nginx -s reload
         );
         assert_eq!(values.agent_threads, Some(64));
         assert!(parse("trusted_proxies = nope\n", Path::new("/tmp")).is_err());
+    }
+
+    #[test]
+    fn parses_tls_paths() {
+        let values = parse(
+            "tls_cert = certs/panel.crt\ntls_key = certs/panel.key\n",
+            Path::new("/etc"),
+        )
+        .unwrap();
+        assert_eq!(
+            values.tls_cert.as_deref(),
+            Some(Path::new("/etc/certs/panel.crt"))
+        );
+        assert_eq!(
+            values.tls_key.as_deref(),
+            Some(Path::new("/etc/certs/panel.key"))
+        );
     }
 
     #[test]

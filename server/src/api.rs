@@ -330,6 +330,9 @@ pub fn dispatch_local(ctx: &Arc<Ctx>, kind: &str, action: &str, req: &Req) -> Re
         ("cert", _) => cert(ctx, action, req),
         ("www", _) => www(ctx, action, req),
         ("install", _) => install(ctx, action, req),
+        ("node", "sync") | ("node", "syncPreview") | ("node", "syncList") => {
+            crate::sync::handle(ctx, action, req)
+        }
         ("node", _) => node_admin(ctx, action, req),
         _ => simple_table(ctx, kind, action, req),
     }
@@ -353,7 +356,11 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let result = if id.is_empty() {
                 crate::registry::create_node(&mut store.db, &name).and_then(|row| {
                     let nid = crate::store::str_of(&row, "id");
-                    let (token, expires) = crate::registry::issue_join_token(&mut store.db, &nid)?;
+                    let (token, expires) = crate::registry::issue_join_token_with_hub(
+                        &mut store.db,
+                        Some(&ctx.hub),
+                        &nid,
+                    )?;
                     Ok((row, Some((token, expires))))
                 })
             } else {
@@ -393,7 +400,7 @@ fn node_admin(ctx: &Ctx, action: &str, req: &Req) -> Reply {
             let body = body(req);
             let id = field(&body, "id");
             let mut store = ctx.store.lock().unwrap();
-            match crate::registry::issue_join_token(&mut store.db, &id) {
+            match crate::registry::issue_join_token_with_hub(&mut store.db, Some(&ctx.hub), &id) {
                 Ok((token, expires)) => {
                     record_operate(&mut store, &actor(ctx, req), "node.token", &id, true, "");
                     if let Err(reply) = persist(&store) {
@@ -2741,7 +2748,7 @@ fn install(ctx: &Ctx, action: &str, req: &Req) -> Reply {
         }
         "auto" => {
             let body = body(req);
-            let enable = bool_of(&body, "enable", true);
+            let enable = bool_of(&body, "enable", false);
             let mut store = ctx.store.lock().unwrap();
             store
                 .db

@@ -158,6 +158,20 @@ impl Hub {
         self.inner.lock().unwrap().revoked.contains(node_id)
     }
 
+    /// Clear the in-memory revoked flag so a new join token can be used.
+    /// Does not restore a previously issued credential.
+    pub fn unrevoke(&self, node_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.revoked.remove(node_id);
+        inner.last_seen.remove(node_id);
+        inner.conflicts.remove(node_id);
+        inner.instances.remove(node_id);
+        inner.queues.remove(node_id);
+        if let Some(waiter) = inner.waiters.remove(node_id) {
+            let _ = waiter.tx.send(Wake::Superseded);
+        }
+    }
+
     /// Long-poll for one job.
     pub fn wait_job(&self, node_id: &str, timeout: Duration) -> Option<JobWire> {
         match self.poll(node_id, timeout) {
@@ -431,19 +445,37 @@ pub fn strip_secrets(row: &mut Value) {
 }
 
 pub fn issue_join_token(db: &mut Db, node_id: &str) -> Result<(String, u64), String> {
+    issue_join_token_with_hub(db, None, node_id)
+}
+
+/// Issue a one-time join token. For a revoked (or previously joined) device
+/// this clears the revoked flag and any leftover credential hash so a new
+/// `join` can succeed without deleting the row.
+pub fn issue_join_token_with_hub(
+    db: &mut Db,
+    hub: Option<&Hub>,
+    node_id: &str,
+) -> Result<(String, u64), String> {
     let Some(mut row) = db.get("node", node_id) else {
         return Err("not found".into());
     };
-    if bool_flag(&row, "revoked") {
-        return Err("nodeRevoked".into());
-    }
+    let was_revoked = bool_flag(&row, "revoked");
     let token = new_secret("nwj_");
     let expires = now_ms().saturating_add(JOIN_TTL_MS);
     if let Value::Object(map) = &mut row {
         map.insert("joinTokenHash".into(), hash_secret(&token).into());
         map.insert("joinExpires".into(), expires.to_string().into());
+        if was_revoked {
+            map.insert("revoked".into(), false.into());
+            map.insert("credHash".into(), "".into());
+        }
     }
     db.upsert("node", row);
+    if was_revoked {
+        if let Some(hub) = hub {
+            hub.unrevoke(node_id);
+        }
+    }
     Ok((token, expires))
 }
 
@@ -668,7 +700,13 @@ pub fn handle_agent(ctx: &Ctx, req: &Req) -> Reply {
                             }
                         }
                     }
-                    ok(json!({ "nodeId": id, "ok": true }))
+                    let os = str_of(&body, "os");
+                    let arch = str_of(&body, "arch");
+                    ok(json!({
+                        "nodeId": id,
+                        "ok": true,
+                        "agent": advertised_agent(&ctx.exe_dir, &os, &arch),
+                    }))
                 }
                 "poll" => {
                     let body = parse_body(req);
@@ -803,35 +841,149 @@ pub fn install_script(req: &Req) -> Reply {
     }
 }
 
+pub fn normalize_os(os: &str) -> String {
+    match os.trim().to_ascii_lowercase().as_str() {
+        "linux" => "linux".into(),
+        "darwin" | "macos" => "macos".into(),
+        "windows" | "win32" | "win" => "windows".into(),
+        other => other.to_string(),
+    }
+}
+
+pub fn normalize_arch(arch: &str) -> String {
+    match arch.trim().to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" | "x64" => "x86_64".into(),
+        "aarch64" | "arm64" => "aarch64".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Layout: `agents/{os}-{arch}/nginxwebui-agent`, then
+/// `{exe_dir}/nginxwebui-agent` for the panel's own os/arch.
+pub fn agent_binary_path(
+    exe_dir: &std::path::Path,
+    os: &str,
+    arch: &str,
+) -> Option<std::path::PathBuf> {
+    let os = normalize_os(os);
+    let arch = normalize_arch(arch);
+    let current_os = normalize_os(std::env::consts::OS);
+    let current_arch = normalize_arch(std::env::consts::ARCH);
+    if !os.is_empty() && !arch.is_empty() {
+        let pinned = exe_dir
+            .join("agents")
+            .join(format!("{os}-{arch}"))
+            .join("nginxwebui-agent");
+        if pinned.is_file() {
+            return Some(pinned);
+        }
+    }
+    let matches_current =
+        (os.is_empty() || os == current_os) && (arch.is_empty() || arch == current_arch);
+    if matches_current {
+        let fallback = exe_dir.join("nginxwebui-agent");
+        if fallback.is_file() {
+            return Some(fallback);
+        }
+        let pinned = exe_dir
+            .join("agents")
+            .join(format!("{current_os}-{current_arch}"))
+            .join("nginxwebui-agent");
+        if pinned.is_file() {
+            return Some(pinned);
+        }
+    }
+    None
+}
+
+pub fn agent_sha256(path: &std::path::Path) -> Option<String> {
+    crate::upgrade::sha256_file(path)
+}
+
+pub fn advertised_agent(exe_dir: &std::path::Path, os: &str, arch: &str) -> Value {
+    let os_n = if os.trim().is_empty() {
+        normalize_os(std::env::consts::OS)
+    } else {
+        normalize_os(os)
+    };
+    let arch_n = if arch.trim().is_empty() {
+        normalize_arch(std::env::consts::ARCH)
+    } else {
+        normalize_arch(arch)
+    };
+    let mut obj = json!({
+        "version": crate::VERSION,
+        "os": os_n,
+        "arch": arch_n,
+    });
+    if let Some(path) = agent_binary_path(exe_dir, &os_n, &arch_n) {
+        if let Some(sum) = agent_sha256(&path) {
+            obj["sha256"] = json!(sum);
+        }
+        obj["size"] = json!(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0));
+    }
+    obj
+}
+
 pub fn download_agent(ctx: &Ctx, req: &Req) -> Reply {
     let os = req.query.get("os").cloned().unwrap_or_default();
     let arch = req.query.get("arch").cloned().unwrap_or_default();
-    let current_os = std::env::consts::OS;
-    let current_arch = std::env::consts::ARCH;
-    if !os.is_empty() && os != current_os || !arch.is_empty() && arch != current_arch {
+    let os_n = normalize_os(&os);
+    let arch_n = normalize_arch(&arch);
+    if os_n == "windows" {
+        return Reply {
+            status: 404,
+            content_type: "text/plain; charset=utf-8".into(),
+            body: b"Windows is not a supported managed nginx/acme node; run the agent on Linux."
+                .to_vec(),
+            set_cookie: None,
+            extra_headers: Vec::new(),
+        };
+    }
+    let meta = req
+        .query
+        .get("meta")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if meta {
+        return ok(advertised_agent(&ctx.exe_dir, &os_n, &arch_n));
+    }
+    let Some(path) = agent_binary_path(&ctx.exe_dir, &os_n, &arch_n) else {
+        let current_os = std::env::consts::OS;
+        let current_arch = std::env::consts::ARCH;
+        let label = if os.is_empty() && arch.is_empty() {
+            format!("{current_os}/{current_arch}")
+        } else {
+            format!("{os_n}/{arch_n}")
+        };
         return Reply {
             status: 404,
             content_type: "text/plain; charset=utf-8".into(),
             body: format!(
-                "no agent binary for {os}/{arch}; this panel built {current_os}/{current_arch}"
+                "no agent binary for {label}. Place it at agents/{os_n}-{arch_n}/nginxwebui-agent (or next to the panel for {current_os}/{current_arch})."
             )
             .into_bytes(),
             set_cookie: None,
             extra_headers: Vec::new(),
         };
-    }
-    let path = ctx.exe_dir.join("nginxwebui-agent");
+    };
     match std::fs::read(&path) {
-        Ok(bytes) => Reply {
-            status: 200,
-            content_type: "application/octet-stream".into(),
-            body: bytes,
-            set_cookie: None,
-            extra_headers: vec![(
-                "Content-Disposition".into(),
-                "attachment; filename=nginxwebui-agent".into(),
-            )],
-        },
+        Ok(bytes) => {
+            let sum = crate::upgrade::sha256_hex(&bytes);
+            Reply {
+                status: 200,
+                content_type: "application/octet-stream".into(),
+                body: bytes,
+                set_cookie: None,
+                extra_headers: vec![
+                    (
+                        "Content-Disposition".into(),
+                        "attachment; filename=nginxwebui-agent".into(),
+                    ),
+                    ("X-Checksum-Sha256".into(), sum),
+                ],
+            }
+        }
         Err(_) => Reply {
             status: 404,
             content_type: "text/plain; charset=utf-8".into(),
@@ -1093,6 +1245,42 @@ mod tests {
     }
 
     #[test]
+    fn revoked_node_can_rejoin_after_new_token() {
+        let mut db = Db::new();
+        let hub = Hub::new();
+        let node = create_node(&mut db, "edge-rejoin").unwrap();
+        let id = str_of(&node, "id");
+        let (token, _) = issue_join_token(&mut db, &id).unwrap();
+        let (_, old_cred) = join_with_token(
+            &mut db,
+            &token,
+            &json!({ "hostname": "b", "os": "linux", "version": "1" }),
+        )
+        .unwrap();
+        revoke_node(&mut db, &hub, &id).unwrap();
+        assert!(hub.is_revoked(&id));
+        // a new one-time token clears revoked state so the same device can join again
+        let (token2, _) = issue_join_token_with_hub(&mut db, Some(&hub), &id).unwrap();
+        let row = db.get("node", &id).unwrap();
+        assert!(!bool_flag(&row, "revoked"));
+        assert!(str_of(&row, "credHash").is_empty());
+        assert!(!hub.is_revoked(&id));
+        assert!(node_by_credential(&db, &old_cred).is_none());
+        let (saved, new_cred) = join_with_token(
+            &mut db,
+            &token2,
+            &json!({ "hostname": "b2", "os": "linux", "version": "2" }),
+        )
+        .unwrap();
+        assert_eq!(str_of(&saved, "hostname"), "b2");
+        assert!(node_by_credential(&db, &new_cred).is_some());
+        assert_eq!(
+            join_with_token(&mut db, &token2, &json!({})).unwrap_err(),
+            "badToken"
+        );
+    }
+
+    #[test]
     fn poll_receives_job_and_returns_result() {
         let hub = Hub::new();
         let node_id = "n1";
@@ -1124,5 +1312,24 @@ mod tests {
         assert!(view.get("joinTokenHash").is_none());
         assert!(view.get("credHash").is_none());
         assert_eq!(view["status"], "pending");
+    }
+
+    #[test]
+    fn download_serves_agents_dir_then_fallback() {
+        let dir = std::env::temp_dir().join(format!(
+            "nginxwebui-agents-{}-{}",
+            std::process::id(),
+            crate::store::new_id()
+        ));
+        let other = dir.join("agents").join("linux-aarch64");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("nginxwebui-agent"), b"aarch-agent").unwrap();
+        std::fs::write(dir.join("nginxwebui-agent"), b"native-agent").unwrap();
+        let aarch = agent_binary_path(&dir, "linux", "aarch64").unwrap();
+        assert_eq!(std::fs::read(&aarch).unwrap(), b"aarch-agent");
+        let native = agent_binary_path(&dir, std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        assert_eq!(std::fs::read(&native).unwrap(), b"native-agent");
+        assert!(agent_binary_path(&dir, "linux", "riscv64").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

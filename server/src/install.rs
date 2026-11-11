@@ -1,6 +1,7 @@
 //! Install nginx and acme.sh when they are missing.
-//! Linux uses the distro package manager and the official acme.sh installer.
-//! Windows reports that those tools must be installed by hand.
+//! Linux uses the distro package manager and a *pinned* acme.sh GitHub
+//! archive (see `ACME_SH_*` and `script/acme.sh.pin`). Windows reports that
+//! those tools must be installed by hand.
 
 use crate::acme;
 use crate::nginx;
@@ -16,6 +17,12 @@ ssl_session_timeout 1d;
 ssl_session_cache shared:SSL:10m;
 ssl_session_tickets off;
 "#;
+
+/// Pinned acme.sh release. Keep in sync with `script/acme.sh.pin`.
+pub const ACME_SH_VERSION: &str = "3.1.6";
+pub const ACME_SH_URL: &str =
+    "https://github.com/acmesh-official/acme.sh/archive/refs/tags/3.1.6.tar.gz";
+pub const ACME_SH_SHA256: &str = "0d3f9000ac44a6331314742a88c475f79134e24fc991997883652adc59efc486";
 
 pub fn auto_install_enabled(db: &Db) -> bool {
     let v = db.setting("autoInstall");
@@ -61,6 +68,7 @@ pub fn status(db: &Db) -> Value {
         },
         "acme": acme::summarize(db),
         "canInstall": can_install(),
+        "acmeShVersion": ACME_SH_VERSION,
     })
 }
 
@@ -159,25 +167,10 @@ pub fn install_acme(db: &mut Db) -> Result<String, String> {
     let home = acme_home_target(db);
     let _ = std::fs::create_dir_all(&home);
 
-    let script = format!(
-        "curl -fsSL https://get.acme.sh | sh -s -- --home {} -m {}",
-        sh_single(&home.display().to_string()),
-        sh_single(&email)
-    );
-    let (ok, out) = run_user_shell(&script);
-    let mut log = out;
+    let (ok, out) = install_acme_from_pin(&home, &email);
+    let log = out;
     if !ok {
-        let fallback = format!(
-            "wget -O - https://get.acme.sh | sh -s -- --home {} -m {}",
-            sh_single(&home.display().to_string()),
-            sh_single(&email)
-        );
-        let (ok2, out2) = run_user_shell(&fallback);
-        log.push('\n');
-        log.push_str(&out2);
-        if !ok2 {
-            return Err(format!("acme.sh install failed\n{}", log));
-        }
+        return Err(format!("acme.sh install failed\n{}", log));
     }
 
     let bin = home.join("acme.sh");
@@ -339,18 +332,6 @@ fn run_env_cmd(program: &str, args: &[&str], env: &[(&str, &str)]) -> (bool, Str
     }
 }
 
-fn run_user_shell(script: &str) -> (bool, String) {
-    #[cfg(unix)]
-    {
-        run_env_cmd("sh", &["-c", script], &[])
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = script;
-        (false, "installLinuxOnly".into())
-    }
-}
-
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = Path::new(name);
     if path.is_file() {
@@ -373,6 +354,120 @@ pub fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Download the pinned acme.sh tag, verify SHA-256, extract, and run
+/// `./acme.sh --install` from that tree. Never pipes a moving URL to sh.
+pub fn install_acme_from_pin(home: &Path, email: &str) -> (bool, String) {
+    let work = std::env::temp_dir().join(format!(
+        "nginxwebui-acme-{}-{}",
+        std::process::id(),
+        crate::store::new_id()
+    ));
+    if let Err(err) = std::fs::create_dir_all(&work) {
+        return (false, format!("cannot create temp dir: {err}"));
+    }
+    let archive = work.join("acme.sh.tar.gz");
+    let (fetched, fetch_log) = download_file(ACME_SH_URL, &archive);
+    if !fetched {
+        let _ = std::fs::remove_dir_all(&work);
+        return (false, fetch_log);
+    }
+    let bytes = match std::fs::read(&archive) {
+        Ok(b) => b,
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&work);
+            return (false, format!("cannot read archive: {err}"));
+        }
+    };
+    if let Err(err) = verify_sha256(&bytes, ACME_SH_SHA256) {
+        let _ = std::fs::remove_dir_all(&work);
+        return (false, format!("acme.sh archive hash mismatch: {err}"));
+    }
+    let (extracted, extract_log) = run_cmd(
+        "tar",
+        &[
+            "-xzf",
+            &archive.display().to_string(),
+            "-C",
+            &work.display().to_string(),
+        ],
+    );
+    if !extracted {
+        let _ = std::fs::remove_dir_all(&work);
+        return (false, format!("cannot extract acme.sh\n{extract_log}"));
+    }
+    let script = work
+        .join(format!("acme.sh-{ACME_SH_VERSION}"))
+        .join("acme.sh");
+    if !script.is_file() {
+        let _ = std::fs::remove_dir_all(&work);
+        return (
+            false,
+            format!("pinned archive did not contain {}", script.display()),
+        );
+    }
+    let _ = std::fs::create_dir_all(home);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755));
+    }
+    let (ok, out) = run_cmd(
+        &script.display().to_string(),
+        &[
+            "--install",
+            "--home",
+            &home.display().to_string(),
+            "-m",
+            email,
+        ],
+    );
+    let mut log = fetch_log;
+    log.push('\n');
+    log.push_str(&extract_log);
+    log.push('\n');
+    log.push_str(&out);
+    log.push_str(&format!("\ninstalled acme.sh {ACME_SH_VERSION}\n"));
+    let _ = std::fs::remove_dir_all(&work);
+    (ok, log)
+}
+
+pub fn verify_sha256(bytes: &[u8], expected_hex: &str) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let got = Sha256::digest(bytes);
+    let want = parse_hex32(expected_hex)?;
+    if got.as_slice() != want.as_slice() {
+        return Err(format!(
+            "expected {expected_hex}, got {}",
+            crate::tls::fingerprint_hex(&got)
+        ));
+    }
+    Ok(())
+}
+
+fn parse_hex32(hex: &str) -> Result<[u8; 32], String> {
+    crate::tls::parse_fingerprint(hex)
+}
+
+fn download_file(url: &str, dest: &Path) -> (bool, String) {
+    if let Some(curl) = which("curl") {
+        return run_cmd(
+            &curl.display().to_string(),
+            &["-fsSL", "-o", &dest.display().to_string(), url],
+        );
+    }
+    if let Some(wget) = which("wget") {
+        return run_cmd(
+            &wget.display().to_string(),
+            &["-q", "-O", &dest.display().to_string(), url],
+        );
+    }
+    (
+        false,
+        "need curl or wget to download the pinned acme.sh archive".into(),
+    )
+}
+
+#[cfg(test)]
 fn sh_single(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -396,5 +491,28 @@ mod tests {
         assert!(auto_install_enabled(&db));
         db.set_setting("autoInstall", "false");
         assert!(!auto_install_enabled(&db));
+    }
+
+    #[test]
+    fn rejects_acme_archive_on_hash_mismatch() {
+        let err = verify_sha256(b"not-the-archive", ACME_SH_SHA256).unwrap_err();
+        assert!(err.contains("expected"), "{err}");
+    }
+
+    #[test]
+    fn accepts_matching_sha256() {
+        use sha2::{Digest, Sha256};
+        let data = b"nginxwebui-acme-pin-test";
+        let hex = crate::tls::fingerprint_hex(&Sha256::digest(data));
+        verify_sha256(data, &hex).unwrap();
+    }
+
+    #[test]
+    fn pin_constants_match_script_file() {
+        let text = include_str!("../../script/acme.sh.pin");
+        assert!(text.contains(ACME_SH_VERSION), "version");
+        assert!(text.contains(ACME_SH_SHA256), "sha256");
+        assert!(text.contains(ACME_SH_URL), "url");
+        assert_eq!(ACME_SH_SHA256.len(), 64);
     }
 }

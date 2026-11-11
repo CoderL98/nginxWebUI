@@ -19,6 +19,7 @@ struct AgentConfig {
     credential: String,
     ca_file: String,
     fingerprint: String,
+    no_upgrade: bool,
     home: PathBuf,
 }
 
@@ -38,6 +39,8 @@ impl AgentConfig {
             credential: str_of(&value, "credential"),
             ca_file: str_of(&value, "ca"),
             fingerprint: str_of(&value, "fingerprint"),
+            no_upgrade: value.get("upgrade").and_then(|v| v.as_bool()) == Some(false)
+                || str_of(&value, "upgrade") == "false",
             home: home.to_path_buf(),
         })
     }
@@ -52,6 +55,7 @@ impl AgentConfig {
             "credential": self.credential,
             "ca": self.ca_file,
             "fingerprint": self.fingerprint,
+            "upgrade": !self.no_upgrade,
         });
         let path = Self::path(&self.home);
         let tmp = self.home.join(".agent.json.tmp");
@@ -100,6 +104,14 @@ fn restrict(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .map(|s| matches!(s.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 fn default_home() -> PathBuf {
     if let Ok(dir) = std::env::var("NGINXWEBUI_AGENT_HOME") {
         if !dir.trim().is_empty() {
@@ -125,6 +137,7 @@ fn parse_args() -> Result<(String, AgentConfig), String> {
         credential: String::new(),
         ca_file: String::new(),
         fingerprint: String::new(),
+        no_upgrade: false,
         home: default_home(),
     };
     let mut token = String::new();
@@ -159,6 +172,10 @@ fn parse_args() -> Result<(String, AgentConfig), String> {
                 cfg.fingerprint = args.get(i + 1).cloned().unwrap_or_default();
                 i += 2;
             }
+            "--no-upgrade" => {
+                cfg.no_upgrade = true;
+                i += 1;
+            }
             other => return Err(format!("unknown arg: {other}")),
         }
     }
@@ -177,50 +194,19 @@ fn print_help() {
     println!("  join --url https://panel.example --token <join-token>");
     println!("  run  [--url https://panel.example]");
     println!("  --home DIR          config/data directory");
-    println!("  --tls-ca FILE       extra CA certificate (PEM)");
-    println!("  --tls-fingerprint   recorded only; not enforced (see docs/remote-registry.md)");
+    println!("  --tls-ca FILE       trust this PEM CA (in addition to webpki roots)");
+    println!("  --tls-fingerprint   pin SHA-256 of the panel leaf cert (hex, optional colons)");
+    println!("  --no-upgrade        do not auto-download a newer agent from the panel");
     println!();
     println!("environment:");
     println!("  NGINXWEBUI_AGENT_HOME        config/data directory");
     println!("  NGINXWEBUI_AGENT_CREDENTIAL  credential to use instead of agent.json");
+    println!("  NGINXWEBUI_AGENT_NO_UPGRADE  set to 1 to disable auto-upgrade");
     println!("  NGINXWEBUI_RELOAD_CMD        reload command default (allow-listed values only)");
 }
 
 fn build_agent(cfg: &AgentConfig) -> Result<ureq::Agent, String> {
-    if cfg.url.starts_with("http://") && !is_loopback(&cfg.url) {
-        eprintln!(
-            "warning: {} is plain http; the credential and every job travel unencrypted. Use HTTPS.",
-            cfg.url
-        );
-    }
-    if !cfg.ca_file.is_empty() {
-        eprintln!(
-            "warning: --tls-ca is recorded for operators; rustls uses the built-in/root store. Place the custom CA in the system trust store or terminate TLS at a reverse proxy the agent already trusts."
-        );
-        let _ = std::fs::read(&cfg.ca_file)
-            .map_err(|err| format!("cannot read {}: {err}", cfg.ca_file))?;
-    }
-    if !cfg.fingerprint.is_empty() {
-        eprintln!(
-            "warning: --tls-fingerprint cannot be enforced by this HTTP client; pin a CA at the reverse proxy or system trust store. Default TLS verification still applies."
-        );
-    }
-    Ok(ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(40))
-        .timeout_write(Duration::from_secs(15))
-        .build())
-}
-
-fn is_loopback(url: &str) -> bool {
-    let host = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split(['/', '?'])
-        .next()
-        .unwrap_or("");
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    host == "localhost" || host.starts_with("127.") || host == "[::1]"
+    crate::tls::build_ureq_agent(&cfg.ca_file, &cfg.fingerprint, &cfg.url)
 }
 
 fn post_json(
@@ -267,6 +253,7 @@ fn do_join(agent: &ureq::Agent, cfg: &mut AgentConfig) -> Result<(), String> {
             "token": cfg.credential,
             "hostname": hostname,
             "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
             "version": crate::VERSION,
         }),
     )?;
@@ -345,13 +332,17 @@ fn do_run(agent: &ureq::Agent, cfg: &AgentConfig) -> Result<(), String> {
         let hello_body = json!({
             "hostname": hostname(),
             "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
             "version": crate::VERSION,
         });
-        if let Err(err) = post_json(agent, &hello, &cfg.credential, hello_body) {
-            eprintln!("hello failed: {err}");
-            std::thread::sleep(Duration::from_secs(backoff));
-            backoff = (backoff * 2).min(30);
-            continue;
+        match post_json(agent, &hello, &cfg.credential, hello_body) {
+            Err(err) => {
+                eprintln!("hello failed: {err}");
+                std::thread::sleep(Duration::from_secs(backoff));
+                backoff = (backoff * 2).min(30);
+                continue;
+            }
+            Ok(hello_reply) => maybe_upgrade(agent, cfg, &hello_reply),
         }
         backoff = 1;
         match post_json(
@@ -388,6 +379,68 @@ fn do_run(agent: &ureq::Agent, cfg: &AgentConfig) -> Result<(), String> {
                 backoff = (backoff * 2).min(30);
             }
         }
+    }
+}
+
+fn maybe_upgrade(agent: &ureq::Agent, cfg: &AgentConfig, hello: &Value) {
+    if cfg.no_upgrade {
+        return;
+    }
+    let advertised = hello
+        .get("obj")
+        .and_then(|o| o.get("agent"))
+        .cloned()
+        .or_else(|| hello.get("agent").cloned())
+        .unwrap_or(Value::Null);
+    let current_hash = crate::upgrade::current_binary_sha256();
+    match crate::upgrade::decide(
+        true,
+        &cfg.url,
+        crate::VERSION,
+        current_hash.as_deref(),
+        &advertised,
+    ) {
+        crate::upgrade::Decision::Need {
+            version,
+            sha256,
+            url,
+        } => {
+            eprintln!("upgrading agent to {version} from the panel...");
+            match crate::upgrade::download(agent, &url) {
+                Ok(bytes) => {
+                    if let Err(err) = crate::upgrade::verify_bytes(&bytes, &sha256) {
+                        eprintln!("upgrade refused: {err}");
+                        return;
+                    }
+                    let dest = match std::env::current_exe() {
+                        Ok(p) => p,
+                        Err(err) => {
+                            eprintln!("upgrade: cannot locate current binary: {err}");
+                            return;
+                        }
+                    };
+                    if let Err(err) = crate::upgrade::replace_binary(&dest, &bytes) {
+                        eprintln!("upgrade install failed: {err}");
+                        return;
+                    }
+                    eprintln!("upgrade installed; re-executing");
+                    if let Err(err) = crate::upgrade::reexec(&dest) {
+                        eprintln!("{err}");
+                    }
+                }
+                Err(err) => eprintln!("{err}"),
+            }
+        }
+        crate::upgrade::Decision::SkipInsecureTransport => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "agent auto-upgrade skipped: panel URL is not verified TLS or loopback http (use --no-upgrade to hide this)"
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -430,7 +483,13 @@ pub fn run() -> Result<(), String> {
             if cfg.fingerprint.is_empty() {
                 cfg.fingerprint = saved.fingerprint;
             }
+            if saved.no_upgrade {
+                cfg.no_upgrade = true;
+            }
         }
+    }
+    if env_flag("NGINXWEBUI_AGENT_NO_UPGRADE") {
+        cfg.no_upgrade = true;
     }
     if let Ok(cred) = std::env::var("NGINXWEBUI_AGENT_CREDENTIAL") {
         if cmd != "join" && !cred.trim().is_empty() {
@@ -470,6 +529,7 @@ mod tests {
             credential: "nwk_secret".into(),
             ca_file: String::new(),
             fingerprint: String::new(),
+            no_upgrade: false,
             home: home.clone(),
         };
         cfg.save().unwrap();
@@ -491,8 +551,8 @@ mod tests {
 
     #[test]
     fn loopback_detection() {
-        assert!(is_loopback("http://127.0.0.1:8080"));
-        assert!(is_loopback("http://localhost/x"));
-        assert!(!is_loopback("http://10.0.0.2:8080"));
+        assert!(crate::tls::is_loopback_url("http://127.0.0.1:8080"));
+        assert!(crate::tls::is_loopback_url("http://localhost/x"));
+        assert!(!crate::tls::is_loopback_url("http://10.0.0.2:8080"));
     }
 }

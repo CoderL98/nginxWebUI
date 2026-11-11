@@ -183,7 +183,10 @@ export const api = {
     config: () => get('/adminPage/node/config'),
     saveConfig: (panelUrl) => post('/adminPage/node/config', { panelUrl }),
     revoke: (id) => post('/adminPage/node/revoke', { id }),
-    remove: (id) => post('/adminPage/node/del', { id })
+    remove: (id) => post('/adminPage/node/del', { id }),
+    syncList: (source) => post('/adminPage/node/syncList', { source }),
+    syncPreview: (body) => post('/adminPage/node/syncPreview', body),
+    sync: (body) => post('/adminPage/node/sync', body)
   },
   setting: {
     get: (key) => get('/adminPage/setting/get', { key }),

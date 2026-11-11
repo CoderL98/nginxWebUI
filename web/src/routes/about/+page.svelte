@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { api } from '$lib/api';
+  import { api, isRemote } from '$lib/api';
   import { tt } from '$lib/i18n';
   import { Button } from '$lib/components/ui/button/index.js';
   import { Input } from '$lib/components/ui/input/index.js';
@@ -35,11 +35,13 @@
   });
   let installLog = $state('');
   let secretsSet = $state({ CF_Token: false, CF_Account_ID: false, GCORE_Key: false });
+  let remote = $state(false);
   let oldPass = $state('');
   let newPass = $state('');
   let newPass2 = $state('');
 
   onMount(async () => {
+    remote = isRemote();
     const i = await api.login.info();
     info = i.obj || {};
     const m = await api.monitor();
@@ -47,6 +49,25 @@
     acme = (m.obj || {}).acme || {};
     const c = await api.conf.show();
     const conf = c.obj || {};
+    if (remote) {
+      form = {
+        ...form,
+        nginxPath: conf.nginxPath || form.nginxPath,
+        nginxDir: conf.nginxDir || form.nginxDir,
+        nginxExe: conf.nginxExe || 'nginx',
+        reloadCmd: conf.reloadCmd || form.reloadCmd,
+        sitesAvailable: conf.sitesAvailable || form.sitesAvailable,
+        sitesEnabled: conf.sitesEnabled || form.sitesEnabled,
+        sslDir: conf.sslDir || form.sslDir,
+        sslParams: conf.sslParams || form.sslParams,
+        webRoot: conf.webRoot || form.webRoot,
+        acmeSh: acme.path || form.acmeSh,
+        acmeHome: acme.home || form.acmeHome,
+        acmeEmail: acme.email || '',
+        autoInstall: flagOn(monitor.autoInstall, false)
+      };
+      return;
+    }
     const getSecret = async (key) => {
       const obj = (await api.setting.get(key)).obj || {};
       return { set: !!obj.set, value: obj.set ? '' : (obj.value || '') };
@@ -97,6 +118,12 @@
   async function save() {
     busy = true;
     message = '';
+    if (remote) {
+      const r = await api.install.auto(flagOn(form.autoInstall, false));
+      message = r.success ? $tt('saved') : ($tt(r.msg) !== r.msg ? $tt(r.msg) : (r.msg || $tt('failed')));
+      busy = false;
+      return;
+    }
     const snap = $state.snapshot(form);
     const payload = { ...snap, autoInstall: flagOn(snap.autoInstall, false) ? 'true' : 'false' };
     if (!String(payload.CF_Token || '').trim()) delete payload.CF_Token;
@@ -132,7 +159,7 @@
 
 <h1 class="mb-1 text-lg font-semibold">{$tt('settings')}</h1>
 <p class="text-muted-foreground mb-4 text-sm">
-  {$tt('settingsIntro')}
+  {remote ? $tt('remoteInstallHint') : $tt('settingsIntro')}
 </p>
 
 {#if message}
@@ -232,6 +259,11 @@
       <Switch bind:checked={form.autoInstall} />
       {$tt('autoInstall')}
     </label>
+    {#if remote}
+      <div class="sm:col-span-2">
+        <Button onclick={save} disabled={busy}>{$tt('save')}</Button>
+      </div>
+    {/if}
     {#if monitor.nginxFound === false}
       <div class="sm:col-span-2">
         {#if monitor.canInstall}
@@ -248,6 +280,7 @@
   <pre class="code mt-4">{installLog}</pre>
 {/if}
 
+{#if !remote}
 <Card.Root class="mt-4">
   <Card.Header>
     <Card.Title>{$tt('dnsCreds')}</Card.Title>
@@ -297,3 +330,4 @@
     <Button onclick={changePassword} disabled={busy}>{$tt('changePass')}</Button>
   </Card.Footer>
 </Card.Root>
+{/if}

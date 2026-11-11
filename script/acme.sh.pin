@@ -1,0 +1,9 @@
+# Pinned acme.sh release used by install.rs, the Docker image, and remote
+# install. To bump: pick a tag from https://github.com/acmesh-official/acme.sh/releases
+# (prefer a signed tag, 3.1.6+), download the archive, sha256sum it, and
+# update VERSION / URL / SHA256 here *and* the constants in server/src/install.rs
+# if you change them independently. The installer verifies the hash before
+# extract; never pipe a moving URL to sh.
+ACME_SH_VERSION=3.1.6
+ACME_SH_URL=https://github.com/acmesh-official/acme.sh/archive/refs/tags/3.1.6.tar.gz
+ACME_SH_SHA256=0d3f9000ac44a6331314742a88c475f79134e24fc991997883652adc59efc486
