@@ -10,6 +10,8 @@
   let rows = $state([]);
   let shown = $state(null);
   let error = $state('');
+  let message = $state('');
+  let busy = $state(false);
 
   async function load() {
     try {
@@ -27,6 +29,21 @@
     shown = r.obj || null;
   }
 
+  async function restore(row) {
+    if (!confirm($tt('confirmRestore'))) return;
+    busy = true;
+    error = '';
+    message = '';
+    const r = await api.bak.restore(row.id);
+    if (r.success) {
+      message = $tt('restored') + (r.obj && r.obj.output ? '\n' + r.obj.output : '');
+      load();
+    } else {
+      error = r.msg || $tt('failed');
+    }
+    busy = false;
+  }
+
   function when(row) {
     const t = String(row.time || '');
     const n = Number(t);
@@ -36,10 +53,14 @@
 </script>
 
 <h1 class="mb-1 text-lg font-semibold">{$tt('bak')}</h1>
-<p class="text-muted-foreground mb-4 text-sm">每次写入前自动保留最近 20 份 nginx.conf。</p>
+<p class="text-muted-foreground mb-4 text-sm">{$tt('bakHint')}</p>
 
 {#if error}
   <Alert.Root variant="destructive" class="mb-3"><Alert.Title>{error}</Alert.Title></Alert.Root>
+{/if}
+
+{#if message}
+  <Alert.Root class="mb-3"><Alert.Title class="whitespace-pre-wrap">{message}</Alert.Title></Alert.Root>
 {/if}
 
 <Card.Root class="overflow-hidden py-0">
@@ -58,6 +79,7 @@
           <Table.Cell class="text-muted-foreground">{row.size}</Table.Cell>
           <Table.Cell class="text-right">
             <Button variant="ghost" size="sm" onclick={() => open(row)}>{$tt('edit')}</Button>
+            <Button variant="outline" size="sm" disabled={busy} onclick={() => restore(row)}>{$tt('restore')}</Button>
           </Table.Cell>
         </Table.Row>
       {:else}

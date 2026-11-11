@@ -31,9 +31,13 @@
     CF_Token: '',
     CF_Account_ID: '',
     GCORE_Key: '',
-    autoInstall: true
+    autoInstall: false
   });
   let installLog = $state('');
+  let secretsSet = $state({ CF_Token: false, CF_Account_ID: false, GCORE_Key: false });
+  let oldPass = $state('');
+  let newPass = $state('');
+  let newPass2 = $state('');
 
   onMount(async () => {
     const i = await api.login.info();
@@ -43,6 +47,14 @@
     acme = (m.obj || {}).acme || {};
     const c = await api.conf.show();
     const conf = c.obj || {};
+    const getSecret = async (key) => {
+      const obj = (await api.setting.get(key)).obj || {};
+      return { set: !!obj.set, value: obj.set ? '' : (obj.value || '') };
+    };
+    const cf = await getSecret('CF_Token');
+    const account = await getSecret('CF_Account_ID');
+    const gcore = await getSecret('GCORE_Key');
+    secretsSet = { CF_Token: cf.set, CF_Account_ID: account.set, GCORE_Key: gcore.set };
     const get = async (key) => ((await api.setting.get(key)).obj || {}).value || '';
     form = {
       nginxPath: conf.nginxPath || form.nginxPath,
@@ -57,14 +69,15 @@
       acmeSh: acme.path || (await get('acmeSh')),
       acmeHome: acme.home || (await get('acmeHome')),
       acmeEmail: acme.email || '',
-      CF_Token: await get('CF_Token'),
-      CF_Account_ID: await get('CF_Account_ID'),
-      GCORE_Key: await get('GCORE_Key'),
-      autoInstall: flagOn(monitor.autoInstall, true)
+      CF_Token: '',
+      CF_Account_ID: '',
+      GCORE_Key: '',
+      autoInstall: flagOn(monitor.autoInstall, false)
     };
   });
 
   async function install(kind) {
+    if (!confirm($tt('confirmInstall'))) return;
     busy = true;
     message = $tt('installing');
     installLog = '';
@@ -85,16 +98,41 @@
     busy = true;
     message = '';
     const snap = $state.snapshot(form);
-    const r = await api.conf.saveCmd({ ...snap, autoInstall: flagOn(snap.autoInstall, true) ? 'true' : 'false' });
-    await api.install.auto(flagOn(form.autoInstall, true));
+    const payload = { ...snap, autoInstall: flagOn(snap.autoInstall, false) ? 'true' : 'false' };
+    if (!String(payload.CF_Token || '').trim()) delete payload.CF_Token;
+    if (!String(payload.CF_Account_ID || '').trim()) delete payload.CF_Account_ID;
+    if (!String(payload.GCORE_Key || '').trim()) delete payload.GCORE_Key;
+    const r = await api.conf.saveCmd(payload);
+    await api.install.auto(flagOn(form.autoInstall, false));
     message = r.success ? $tt('saved') : $tt('failed');
+    busy = false;
+  }
+
+  async function changePassword() {
+    message = '';
+    if (newPass.length < 6) {
+      message = $tt('passTooShort');
+      return;
+    }
+    if (newPass !== newPass2) {
+      message = $tt('passMismatch');
+      return;
+    }
+    busy = true;
+    const r = await api.login.changePass(oldPass, newPass);
+    message = r.success ? $tt('passChanged') : (r.msg === 'oldPassError' ? $tt('oldPassError') : r.msg || $tt('failed'));
+    if (r.success) {
+      oldPass = '';
+      newPass = '';
+      newPass2 = '';
+    }
     busy = false;
   }
 </script>
 
 <h1 class="mb-1 text-lg font-semibold">{$tt('settings')}</h1>
 <p class="text-muted-foreground mb-4 text-sm">
-  对齐服务器脚本：sites-available、/etc/nginx/ssl、acme.sh DNS、systemctl reload。凭据只保存在本机 SQLite。
+  {$tt('settingsIntro')}
 </p>
 
 {#if message}
@@ -213,19 +251,43 @@
   </Card.Header>
   <Card.Content class="grid gap-3 sm:grid-cols-2">
     <div class="grid gap-1.5">
-      <Label>CF_Token</Label>
-      <Input type="password" bind:value={form.CF_Token} autocomplete="off" />
+      <Label>CF_Token {secretsSet.CF_Token ? '(' + $tt('secretSet') + ')' : ''}</Label>
+      <Input type="password" bind:value={form.CF_Token} autocomplete="off" placeholder={secretsSet.CF_Token ? $tt('secretKeep') : ''} />
     </div>
     <div class="grid gap-1.5">
-      <Label>CF_Account_ID</Label>
-      <Input bind:value={form.CF_Account_ID} />
+      <Label>CF_Account_ID {secretsSet.CF_Account_ID ? '(' + $tt('secretSet') + ')' : ''}</Label>
+      <Input bind:value={form.CF_Account_ID} autocomplete="off" placeholder={secretsSet.CF_Account_ID ? $tt('secretKeep') : ''} />
     </div>
     <div class="grid gap-1.5 sm:col-span-2">
-      <Label>GCORE_Key</Label>
-      <Input type="password" bind:value={form.GCORE_Key} autocomplete="off" />
+      <Label>GCORE_Key {secretsSet.GCORE_Key ? '(' + $tt('secretSet') + ')' : ''}</Label>
+      <Input type="password" bind:value={form.GCORE_Key} autocomplete="off" placeholder={secretsSet.GCORE_Key ? $tt('secretKeep') : ''} />
     </div>
   </Card.Content>
   <Card.Footer>
     <Button onclick={save} disabled={busy}>{$tt('save')}</Button>
+  </Card.Footer>
+</Card.Root>
+
+<Card.Root class="mt-4">
+  <Card.Header>
+    <Card.Title>{$tt('changePass')}</Card.Title>
+    <Card.Description>{$tt('changePassHint')}</Card.Description>
+  </Card.Header>
+  <Card.Content class="grid gap-3 sm:grid-cols-3">
+    <div class="grid gap-1.5">
+      <Label>{$tt('oldPass')}</Label>
+      <Input type="password" bind:value={oldPass} autocomplete="current-password" />
+    </div>
+    <div class="grid gap-1.5">
+      <Label>{$tt('newPass')}</Label>
+      <Input type="password" bind:value={newPass} autocomplete="new-password" />
+    </div>
+    <div class="grid gap-1.5">
+      <Label>{$tt('newPass2')}</Label>
+      <Input type="password" bind:value={newPass2} autocomplete="new-password" />
+    </div>
+  </Card.Content>
+  <Card.Footer>
+    <Button onclick={changePassword} disabled={busy}>{$tt('changePass')}</Button>
   </Card.Footer>
 </Card.Root>

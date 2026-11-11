@@ -23,6 +23,9 @@
     { href: '/cert', key: 'cert' },
     { href: '/conf', key: 'conf' },
     { href: '/log', key: 'log' },
+    { href: '/password', key: 'password' },
+    { href: '/deny-allow', key: 'denyAllow' },
+    { href: '/bak', key: 'bak' },
     { href: '/about', key: 'settings' }
   ];
 
@@ -89,6 +92,7 @@
           </a>
         {/each}
         <div class="text-muted-foreground mt-3 px-3 text-[11px] uppercase">advanced</div>
+        <p class="text-muted-foreground px-3 pb-1 text-[11px] leading-snug">{$tt('siteVsAdvanced')}</p>
         <a href="/upstream" data-sveltekit-reload class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/upstream' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('upstream')}</a>
         <a href="/stream" data-sveltekit-reload class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/stream' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('stream')}</a>
         <a href="/http" data-sveltekit-reload class="hover:bg-muted rounded-md px-3 py-1.5 text-sm {active === '/http' ? 'bg-muted font-medium' : 'text-muted-foreground'}">{$tt('http')}</a>

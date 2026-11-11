@@ -78,6 +78,9 @@
 <p class="text-muted-foreground mb-4 text-sm">
   {$tt('compatHint')}
 </p>
+<p class="text-muted-foreground mb-4 text-sm">
+  {$tt('siteVsAdvanced')}
+</p>
 
 {#if error}
   <Alert.Root variant="destructive" class="mb-3"><Alert.Title>{error}</Alert.Title></Alert.Root>

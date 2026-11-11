@@ -12,6 +12,7 @@
   let name = $state('');
   let pass = $state('');
   let code = $state('');
+  let initToken = $state('');
   let message = $state('');
   let busy = $state(false);
   let nonce = $state(Date.now());
@@ -20,6 +21,9 @@
     if (why === 'codeError') return $tt('needCode');
     if (why === 'adminError') return $tt('wrong');
     if (why === 'nameTooShort') return $tt('needName');
+    if (why === 'initTokenError') return $tt('initTokenError');
+    if (why === 'tooManyAttempts') return $tt('tooManyAttempts');
+    if (why === 'adminExists') return $tt('adminExists');
     return why || $tt('failed');
   }
 
@@ -33,14 +37,18 @@
       message = $tt('needPass');
       return;
     }
-    if (!needInit && !code.trim()) {
+    if (!code.trim()) {
       message = $tt('needCode');
+      return;
+    }
+    if (needInit && !initToken.trim()) {
+      message = $tt('needInitToken');
       return;
     }
     busy = true;
     try {
       const r = needInit
-        ? await api.login.addAdmin(name.trim(), pass)
+        ? await api.login.addAdmin(name.trim(), pass, code.trim(), initToken.trim())
         : await api.login.signIn(name.trim(), pass, code.trim());
       if (r.success) {
         location.reload();
@@ -73,6 +81,7 @@
       {/if}
       {#if needInit}
         <Alert.Root><Alert.Title>{$tt('firstRun')}</Alert.Title></Alert.Root>
+        <p class="text-muted-foreground text-xs">{$tt('initTokenHint')}</p>
       {/if}
       <div class="grid gap-1.5">
         <Label>{$tt('name')}</Label>
@@ -87,26 +96,35 @@
           onkeydown={(e) => e.key === 'Enter' && signIn()}
         />
       </div>
-      {#if !needInit}
+      {#if needInit}
         <div class="grid gap-1.5">
-          <Label>{$tt('code')}</Label>
-          <div class="flex items-center gap-2">
-            <Input
-              bind:value={code}
-              maxlength={4}
-              class="flex-1"
-              onkeydown={(e) => e.key === 'Enter' && signIn()}
-            />
-            <button type="button" onclick={() => (nonce = Date.now())} class="shrink-0">
-              <img
-                class="border-input h-10 w-[120px] rounded-md border bg-muted"
-                src={'/adminPage/login/getCode?t=' + nonce}
-                alt={$tt('code')}
-              />
-            </button>
-          </div>
+          <Label>{$tt('initToken')}</Label>
+          <Input
+            bind:value={initToken}
+            autocomplete="off"
+            onkeydown={(e) => e.key === 'Enter' && signIn()}
+          />
         </div>
       {/if}
+      <div class="grid gap-1.5">
+        <Label>{$tt('code')}</Label>
+        <div class="flex items-center gap-2">
+          <Input
+            bind:value={code}
+            maxlength={8}
+            class="flex-1"
+            autocomplete="off"
+            onkeydown={(e) => e.key === 'Enter' && signIn()}
+          />
+          <button type="button" onclick={() => (nonce = Date.now())} class="shrink-0">
+            <img
+              class="border-input h-10 w-[168px] rounded-md border bg-muted"
+              src={'/adminPage/login/getCode?t=' + nonce}
+              alt={$tt('code')}
+            />
+          </button>
+        </div>
+      </div>
     </Card.Content>
     <Card.Footer>
       <Button class="w-full" onclick={signIn} disabled={busy}>

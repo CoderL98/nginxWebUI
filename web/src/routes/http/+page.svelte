@@ -17,4 +17,5 @@
 
 <h1 class="mb-1 text-lg font-semibold">{$tt('http')}</h1>
 <p class="text-muted-foreground mb-4 text-sm">http block — gzip、超时、client_max_body_size</p>
+<p class="text-muted-foreground mb-4 text-sm">{$tt('siteVsAdvanced')}</p>
 <Crud {columns} {fields} load={() => api.http.list()} save={(row) => api.http.save(row)} remove={(id) => api.http.remove(id)} blank={{ name: '', value: '', descr: '' }} />

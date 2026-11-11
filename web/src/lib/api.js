@@ -57,7 +57,8 @@ export const api = {
     info: () => get('/adminPage/login/info'),
     code: () => get('/adminPage/login/getCode'),
     signIn: (name, pass, code) => post('/adminPage/login/login', { name, pass, code }),
-    addAdmin: (name, pass) => post('/adminPage/login/addAdmin', { name, pass }),
+    addAdmin: (name, pass, code, initToken) =>
+      post('/adminPage/login/addAdmin', { name, pass, code, initToken }),
     changePass: (oldPass, newPass) => post('/adminPage/login/changePass', { oldPass, newPass }),
     logout: () => post('/adminPage/login/loginOut', {})
   },
@@ -131,7 +132,8 @@ export const api = {
   },
   bak: {
     list: () => get('/adminPage/bak/list'),
-    detail: (id) => get('/adminPage/bak/detail', { id })
+    detail: (id) => get('/adminPage/bak/detail', { id }),
+    restore: (id) => post('/adminPage/bak/restore', { id })
   },
   log: {
     names: () => get('/adminPage/log/names'),
